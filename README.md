@@ -2,7 +2,7 @@
 
 Matrix Relay Hub is a standalone inventory for a shared, Matrix-centered bridge deployment. External networks connect through separately operated Matrix application services. The inventory checker detects conflicting identifiers and endpoint assignments before an operator configures those services.
 
-**Status:** The checker does not run bridges, provision rooms, forward messages or verify connectivity. Cross-platform forwarding and migration require the existing bridge software and integration tests.
+**Status:** The checker does not run bridges, provision rooms, forward messages or verify connectivity. The [Compose scaffold](deploy/README.md) runs independently configured bridge software; cross-platform forwarding and migration require integration tests.
 
 ## Check an inventory
 

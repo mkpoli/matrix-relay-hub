@@ -1,0 +1,44 @@
+services:
+  discord:
+    image: dock.mau.dev/mautrix/discord@sha256:065405ca2f961b2687ca577c4eb65592c139d641342a9611d98b5394f30cf84a # v0.7.7
+    profiles: [discord]
+    networks:
+      matrix:
+        aliases: ["${DISCORD_NETWORK_ALIAS:-matrix-relay-discord}"]
+    volumes:
+      - type: bind
+        source: ${DISCORD_DATA_DIR:-/var/empty/matrix-relay-hub/discord}
+        target: /data
+        bind:
+          create_host_path: false
+
+  telegram:
+    image: dock.mau.dev/mautrix/telegram@sha256:ed3f3b39289fae425a875311d8875729271c24f88ba03209bd1bfbaf31e6c78f # v26.10
+    profiles: [telegram]
+    networks:
+      matrix:
+        aliases: ["${TELEGRAM_NETWORK_ALIAS:-matrix-relay-telegram}"]
+    volumes:
+      - type: bind
+        source: ${TELEGRAM_DATA_DIR:-/var/empty/matrix-relay-hub/telegram}
+        target: /data
+        bind:
+          create_host_path: false
+
+  irc:
+    image: matrixdotorg/matrix-appservice-irc@sha256:c571a02af827c5bc623a5ad3551d6107318a241b182f80bacbee4a0a7b3df1f7 # 4.0.1
+    profiles: [irc]
+    networks:
+      matrix:
+        aliases: ["${IRC_NETWORK_ALIAS:-matrix-relay-irc}"]
+    volumes:
+      - type: bind
+        source: ${IRC_DATA_DIR:-/var/empty/matrix-relay-hub/irc}
+        target: /data
+        bind:
+          create_host_path: false
+
+networks:
+  matrix:
+    external: true
+    name: ${MATRIX_NETWORK:?Set MATRIX_NETWORK to the existing shared Docker network name}

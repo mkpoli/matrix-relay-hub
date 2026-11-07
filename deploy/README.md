@@ -1,0 +1,78 @@
+# Bridge deployment scaffold
+
+Each profile runs one bridge on an existing Docker network shared with an external Matrix homeserver. The homeserver must support application services, and its administrator must register each bridge. The scaffold publishes no ports and does not manage the homeserver or network. The IRC image is amd64-only.
+
+## Prepare
+
+Choose a pre-existing Docker network reachable by the homeserver with outbound DNS and network access to the external platforms and any external databases. Set its name and choose separate private directories outside the checkout, for example:
+
+```sh
+umask 077
+install -d -m 700 "$HOME/matrix-bridge-data/discord" "$HOME/matrix-bridge-data/telegram" "$HOME/matrix-bridge-data/irc"
+export DISCORD_DATA_DIR="$HOME/matrix-bridge-data/discord"
+export TELEGRAM_DATA_DIR="$HOME/matrix-bridge-data/telegram"
+export IRC_DATA_DIR="$HOME/matrix-bridge-data/irc"
+export MATRIX_NETWORK='your-existing-network'
+```
+
+Set only the directories for bridges you operate. The fallback paths under `/var/empty/matrix-relay-hub` are placeholders; leave them absent and set the appropriate variable before starting a profile. Compose will refuse a missing bind source rather than create it. Keep data directories private and back them up securely; they contain credentials, registration tokens and persistent bridge state. With rootful Docker, Discord's initialization can create root-owned files; on later startup the image changes `/data` ownership to UID 1337. Plan a private administrator-controlled editing and backup method for your Docker UID mapping. Avoid copying credentials into an unprotected location.
+
+## Configure and register
+
+Use the version-specific configuration references and setup guides:
+
+- Discord v0.7.7: [sample configuration](https://github.com/mautrix/discord/blob/v0.7.7/example-config.yaml), [authentication](https://docs.mau.fi/bridges/go/discord/authentication.html).
+- Telegram v26.10: [sample configuration](https://docs.mau.fi/configs/mautrix-telegram/v26.10.html), [authentication](https://docs.mau.fi/bridges/go/telegram/authentication.html).
+- IRC 4.0.1: [sample configuration](https://github.com/matrix-org/matrix-appservice-irc/blob/4.0.1/config.sample.yaml), [bridge setup](https://github.com/matrix-org/matrix-appservice-irc/blob/4.0.1/docs/bridge_setup.md), [image startup script](https://github.com/matrix-org/matrix-appservice-irc/blob/4.0.1/docker/start.sh). The image expects `/data/config.yaml` and `/data/appservice-registration-irc.yaml`.
+
+For Discord and Telegram, follow the [mautrix Docker setup](https://docs.mau.fi/bridges/general/docker-setup.html) for initialization and registration generation. Initial startup may create config files and generate tokens. The profiles do not automatically restart; configure a restart policy only after initialization and registration are complete. Review the version's config before connecting to real rooms; do not print or commit configuration, tokens or registration files. IRC requires a configured registration file as described in its setup guide. Follow the relevant guide for credentials, storage, permissions and relay settings. Put file-based databases, keys and other persistent files under `/data`, or use a separately managed persistent database dedicated to that bridge.
+
+Configure the homeserver URL as reachable from the bridge, and the appservice URL as reachable from the homeserver over the shared network. `localhost` inside a container refers to that container. Use the configured internal port and a unique network alias for each appservice URL. Defaults are `matrix-relay-discord`, `matrix-relay-telegram` and `matrix-relay-irc`; set `DISCORD_NETWORK_ALIAS`, `TELEGRAM_NETWORK_ALIAS` or `IRC_NETWORK_ALIAS` to change them. Docker does not enforce alias uniqueness, so check the shared network for collisions. Ensure appservice IDs and namespaces do not collide. Give the registration file to the homeserver administrator through a secure channel and follow [appservice registration](https://docs.mau.fi/bridges/general/registering-appservices.html). Synapse needs access to the file inside its container and a restart after registration changes. Follow your homeserver's own restart or reload procedure; update both sides when registration-related settings change.
+
+## Operate
+
+From the repository root, after configuration and registration, select any combination of profiles:
+
+```sh
+docker compose -f deploy/compose.yaml --profile discord up -d
+docker compose -f deploy/compose.yaml --profile telegram --profile irc up -d
+```
+
+Each command affects the selected services; include all desired profiles when reconciling the full set. After starting a bridge, check its state, then verify registration, authentication and message delivery using the [integration checks](../docs/verification.md). Compose process status alone does not establish bridge readiness. For example:
+
+```sh
+docker compose -f deploy/compose.yaml --profile discord ps --all
+```
+
+Inspect service logs privately when diagnosing failures; they may contain credentials or message content. To apply changed Compose settings or an image digest, use `up -d` again; `restart` alone does not recreate containers. Restart the relevant bridge after changes to its configuration. Keep one instance per bridge and state store, and never run the old and replacement instance concurrently. For a cutover, stop and verify the old instance using its original host and orchestrator, securely back up its state, update registration if required, then start the replacement. The following command stops only the Discord service in this Compose project:
+
+```sh
+docker compose -f deploy/compose.yaml --profile discord stop discord
+```
+
+Stopping preserves the data and homeserver registration; remove or disable the registration through the homeserver's own procedure if retiring the bridge. Avoid `down -v` or manual deletion without a verified backup.
+
+## Offline Compose verification
+
+These commands only render and validate Compose configuration; they do not require the directories or network to exist and do not pull images or start containers. Run from the repository root:
+
+```sh
+(
+  export MATRIX_NETWORK=offline-test
+  export DISCORD_DATA_DIR=/tmp/matrix-bridge-test/discord
+  export TELEGRAM_DATA_DIR=/tmp/matrix-bridge-test/telegram
+  export IRC_DATA_DIR=/tmp/matrix-bridge-test/irc
+  for profile in discord telegram irc; do
+    docker compose -f deploy/compose.yaml --profile "$profile" config --quiet || exit
+  done
+  docker compose -f deploy/compose.yaml --profile discord --profile telegram --profile irc config --quiet
+)
+```
+
+The offline configuration tests run with `python3 -m unittest discover -s deploy -p test_compose.py -v`. They skip when Docker Compose is unavailable.
+
+## Security and limits
+
+A shared external network is not an isolation boundary: other network members can reach listening services. Restrict network membership and access, safeguard bridge credentials, and review encryption, retention, room membership and access controls. Obtain explicit consent from participants before relaying messages and review each bridge's relay mode and platform terms. Telegram v26.10 defaults to relay disabled and can kick Matrix users who lack a remote login when no relay is set; review these settings before connecting rooms. Obtain IRC network operator permission and check connection limits: the bridge may create an IRC client per Matrix user.
+
+These profiles and actual platform interactions have not been tested in production. QQ and other bridges can be supplied in operator-authored Compose files attached to the same existing network; assess their images, permissions, storage and compatibility separately.

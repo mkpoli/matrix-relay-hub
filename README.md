@@ -20,7 +20,11 @@ The checker validates the schema, checks room-ID shape and detects duplicate com
 
 ```sh
 PYTHONPATH=src python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s deploy -p 'test_compose*.py' -v
+python3 -m unittest discover -s irc-lab -p 'test_*.py' -v
 ```
+
+The two labs run real containers and are not part of the unit suite.
 
 - [Architecture and bridge candidates](docs/architecture.md)
 - [Deployment](docs/deployment.md)

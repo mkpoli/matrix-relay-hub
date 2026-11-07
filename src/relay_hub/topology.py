@@ -97,9 +97,9 @@ def validate_topology(data: Any) -> list[str]:
             if room_id is not None:
                 # Check the recognizable Matrix room ID shape, not server validity.
                 local, separator, server = room_id.partition(":")
-                if (not local.startswith("!") or len(local) < 2
-                        or (separator and not server)
-                        or any(c.isspace() or ord(c) < 32 for c in room_id)):
+                if (not local.startswith("!") or (not separator and len(local) < 2)
+                        or (separator and (not server or any(c.isspace() for c in server)))
+                        or "\0" in room_id):
                     errors.append(f"{path}.room_id: expected a Matrix room ID starting with !")
                 unique(room_ids, room_id, f"{path}.room_id")
             endpoints = community.get("endpoints")
@@ -136,6 +136,8 @@ def load_topology(path: str | Path) -> dict[str, Any]:
     except OSError as exc:
         code = errno.errorcode.get(exc.errno, "OS_ERROR")
         raise ValidationError([f"file: cannot read ({code})"]) from None
+    except ValueError:
+        raise ValidationError(["file: invalid path"]) from None
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:

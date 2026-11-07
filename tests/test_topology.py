@@ -120,12 +120,13 @@ class ValidatorTests(unittest.TestCase):
         self.assertTrue(any("unknown plugin id" in e for e in validate_topology(data)))
 
     def test_room_id_shape(self):
-        for bad in ("#alias:example.org", "local:example.org", "!:example.org", "!room:", "!", "!room:bad host"):
+        for bad in ("#alias:example.org", "local:example.org", "!room:", "!", "!room:bad host", "!a\0b:example.org"):
             with self.subTest(bad=bad):
                 data = valid_topology()
                 data["communities"][0]["room_id"] = bad
                 self.assertIn("expected a Matrix room ID", str(validate_topology(data)))
-        for room_id in ("!room:[::1]:8448", "!Nhcu5BS-UMnFX7hBVfVSoXiD7OgH6iRT-xyIuqDnpYQ"):
+        for room_id in ("!room:[::1]:8448", "!Nhcu5BS-UMnFX7hBVfVSoXiD7OgH6iRT-xyIuqDnpYQ",
+                        "!a b:example.org", "!a\nb:example.org", "!:example.org"):
             with self.subTest(room_id=room_id):
                 data = valid_topology()
                 data["communities"][0]["room_id"] = room_id
@@ -197,6 +198,9 @@ class FileAndCLITests(unittest.TestCase):
                 self.assertNotIn("Traceback", result.stderr)
             with self.assertRaises(ValidationError):
                 load_topology(Path(temp))
+            with self.assertRaises(ValidationError) as caught:
+                load_topology("invalid\0SECRET")
+            self.assertNotIn("SECRET", str(caught.exception))
 
     def test_cli_usage(self):
         for args in ((), ("check",), ("unknown",)):

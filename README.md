@@ -25,6 +25,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - [Architecture and bridge candidates](docs/architecture.md)
 - [Deployment](docs/deployment.md)
 - [Matrix application-service lab](lab/README.md)
+- [Matrix–IRC forwarding proof](irc-lab/README.md)
 - [Integration verification](docs/verification.md)
 - [Migration checklist](docs/migration.md)
 

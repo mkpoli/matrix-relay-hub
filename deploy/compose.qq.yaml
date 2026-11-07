@@ -1,0 +1,14 @@
+services:
+  qq:
+    image: ${QQ_BRIDGE_IMAGE:?Build the QQ bridge image as described in deploy/README.md}
+    profiles: [qq]
+    user: "${QQ_UID:?Set QQ_UID to the data directory owner}:${QQ_GID:?Set QQ_GID to the data directory group}"
+    networks:
+      matrix:
+        aliases: ["${QQ_NETWORK_ALIAS:-matrix-relay-qq}"]
+    volumes:
+      - type: bind
+        source: ${QQ_DATA_DIR:-/var/empty/matrix-relay-hub/qq}
+        target: /data
+        bind:
+          create_host_path: false

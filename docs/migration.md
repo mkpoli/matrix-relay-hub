@@ -8,6 +8,10 @@ Record the current homeserver, rooms, external endpoint IDs, bridge versions, re
 
 Document which events each route carries and its known delivery limits. For QQ, verify the account's eligibility, incoming event coverage and outbound permissions against current platform policy before planning a cutover. Decide whether history should remain in place; the inventory does not provide backfill.
 
+## Defect checks
+
+Check known defects in the software being replaced before rehearsing the cutover. The QQ bridge stores a Matrix transaction ID before parsing the request body; a malformed delivery followed by a valid retry returned `400` and then `200`, with no events queued. Its README states a 5 MB media limit while the code rejects uploads above 3.5 MB. Fix and retest such defects before moving routes.
+
 ## Rehearsal
 
 1. Restore a coordinated backup into an isolated test environment without production bridge credentials or network access to production endpoints.

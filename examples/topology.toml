@@ -1,0 +1,54 @@
+# Static inventory only: this does not provision, route, check connectivity,
+# enforce isolation, or establish a security boundary. Bridges operate
+# independently; each receives its own configuration outside this inventory.
+# Root keys are plugins and communities, both arrays (empty arrays are allowed).
+# Every field shown is required. Strings must be nonblank; keys are strict.
+# All identifiers and references below are fictional.
+
+[[plugins]]
+id = "example-discord"
+kind = "discord" # Freeform, not a plugin registry or a connectivity claim.
+namespace = "discord.example.invalid"
+config_ref = "secret://example/discord" # Opaque; never opened by the validator.
+
+[[plugins]]
+id = "example-telegram"
+kind = "telegram"
+namespace = "telegram.example.invalid"
+config_ref = "secret://example/telegram"
+
+[[plugins]]
+id = "example-irc"
+kind = "irc"
+namespace = "irc.example.invalid"
+config_ref = "/example/irc.toml"
+
+[[plugins]]
+id = "example-qq"
+kind = "qq"
+namespace = "qq.example.invalid"
+config_ref = "secret://example/qq"
+
+[[communities]]
+id = "example-garden"
+room_id = "!example-garden:example.invalid" # Explicit and unique Matrix room ID.
+
+[[communities.endpoints]]
+plugin = "example-discord" # Must match a plugin id; at most one per community.
+remote_id = "example-discord-channel" # Unique for this plugin across communities.
+
+[[communities.endpoints]]
+plugin = "example-telegram"
+remote_id = "example-telegram-chat"
+
+[[communities]]
+id = "example-workshop"
+room_id = "!example-workshop:example.invalid"
+
+[[communities.endpoints]]
+plugin = "example-irc"
+remote_id = "example-irc-channel"
+
+[[communities.endpoints]]
+plugin = "example-qq"
+remote_id = "example-qq-group"

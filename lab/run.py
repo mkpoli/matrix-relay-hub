@@ -145,7 +145,7 @@ try:
     print('Each service has only its own tokens and script as read-only mounts', flush=True)
     start('synapse', '-v', f'{data}:/data', '-v', f'{LAB / "check.py"}:/check.py:ro', IMAGE)
     print('Checking real Matrix event delivery and bounded echoes', flush=True)
-    result = docker('exec', PREFIX + '-synapse', 'python', '/check.py', timeout=360)
+    result = docker('exec', PREFIX + '-synapse', 'python', '-I', '/check.py', timeout=360)
     print(result, flush=True)
 except (Exception, KeyboardInterrupt) as error:
     print(f'LAB FAILED: {error}', file=sys.stderr, flush=True)

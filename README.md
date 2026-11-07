@@ -23,6 +23,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 - [Architecture and bridge candidates](docs/architecture.md)
+- [Deployment](docs/deployment.md)
 - [Integration verification](docs/verification.md)
 - [Migration checklist](docs/migration.md)
 

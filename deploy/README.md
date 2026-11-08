@@ -77,7 +77,7 @@ Copy the bridge's `deploy/registration.example.yaml`, replace the tokens and dom
 docker compose -f deploy/compose.yaml -f deploy/compose.qq.yaml --profile qq up -d
 ```
 
-The bot must be added to the QQ group with message receiving and active posting enabled. [Tencent's send documentation](https://raw.githubusercontent.com/tencent-connect/bot-docs/main/docs/develop/api-v2/server-inter/message/send-receive/send.md) says proactive push ended on 21 April 2025, so Matrix-to-QQ delivery depends on current account permissions and may be rejected; test in a sandbox group first. The bridge does not support encrypted Matrix rooms and replaces media over 3.5 MB with a notice. It also records Matrix transaction IDs before parsing payloads, so a failed parse can drop the retry; the [migration checklist](../docs/migration.md) describes the check.
+The bot must be added to the QQ group with message receiving and active posting enabled. [Tencent's send documentation](https://raw.githubusercontent.com/tencent-connect/bot-docs/main/docs/develop/api-v2/server-inter/message/send-receive/send.md) says proactive push ended on 21 April 2025, so Matrix-to-QQ delivery depends on current account permissions and may be rejected; test in a sandbox group first. The bridge does not support encrypted Matrix rooms and replaces media over 3.5 MB with a notice. Check its transaction handling before use: older revisions consumed a Matrix transaction before parsing its body, so a malformed delivery dropped the retry; the [migration checklist](../docs/migration.md) describes the check.
 
 ## Operate
 

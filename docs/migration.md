@@ -10,7 +10,7 @@ Document which events each route carries and its known delivery limits. For QQ, 
 
 ## Defect checks
 
-Check known defects in the software being replaced before rehearsing the cutover. The QQ bridge stores a Matrix transaction ID before parsing the request body; a malformed delivery followed by a valid retry returned `400` and then `200`, with no events queued. Its README states a 5 MB media limit while the code rejects uploads above 3.5 MB. Fix and retest such defects before moving routes.
+Check known defects in the software being replaced before rehearsing the cutover. An earlier QQ bridge revision stored a Matrix transaction ID before parsing the request body: a malformed delivery followed by a valid retry returned `400` and then `200`, with no events queued. The same revision's README states a 5 MB media limit while the code rejects uploads above 3.5 MB. Verify the deployed revision and retest before moving routes.
 
 ## Rehearsal
 

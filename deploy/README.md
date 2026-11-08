@@ -30,6 +30,21 @@ Use the version-specific configuration references and setup guides:
 
 For Discord and Telegram, follow the [mautrix Docker setup](https://docs.mau.fi/bridges/general/docker-setup.html) for initialization and registration generation. Initial startup may create config files and generate tokens. Replace the generated `example.com` domain and set the homeserver address before the next run; the images exit 0 even when registration generation fails for missing settings, so check that `registration.yaml` exists before registering the bridge. The profiles do not automatically restart; configure a restart policy only after initialization and registration are complete. Review the version's config before connecting to real rooms; do not print or commit configuration, tokens or registration files. IRC requires a configured registration file as described in its setup guide. Follow the relevant guide for credentials, storage, permissions and relay settings. Put file-based databases, keys and other persistent files under `/data`, or use a separately managed persistent database dedicated to that bridge.
 
+### IRC registration
+
+The IRC image needs `/data/config.yaml` and `/data/appservice-registration-irc.yaml` before it starts. Copy the tag's sample config into the data directory, set `homeserver.url`, `homeserver.domain` and the server under `ircService.servers`, then generate the registration without network access:
+
+```sh
+curl -fsS https://raw.githubusercontent.com/matrix-org/matrix-appservice-irc/4.0.1/config.sample.yaml -o "$IRC_DATA_DIR/config.yaml"
+# edit config.yaml
+docker run --rm --network none --user "$(id -u):$(id -g)" -v "$IRC_DATA_DIR:/data" \
+  --entrypoint node matrixdotorg/matrix-appservice-irc@sha256:c571a02af827c5bc623a5ad3551d6107318a241b182f80bacbee4a0a7b3df1f7 \
+  app.js -r -f /data/appservice-registration-irc.yaml \
+  -u http://matrix-relay-irc:8090 -c /data/config.yaml
+```
+
+`-u` is the address the homeserver uses to reach the bridge. The bot localpart defaults to `appservice-irc`; `-l <localpart>` changes it.
+
 Configure the homeserver URL as reachable from the bridge, and the appservice URL as reachable from the homeserver over the shared network. `localhost` inside a container refers to that container. Use the configured internal port and a unique network alias for each appservice URL. Defaults are `matrix-relay-discord`, `matrix-relay-telegram`, `matrix-relay-irc` and `matrix-relay-qq`; set `DISCORD_NETWORK_ALIAS`, `TELEGRAM_NETWORK_ALIAS`, `IRC_NETWORK_ALIAS` or `QQ_NETWORK_ALIAS` to change them. Docker does not enforce alias uniqueness, so check the shared network for collisions. Ensure appservice IDs and namespaces do not collide. Give the registration file to the homeserver administrator through a secure channel and follow [appservice registration](https://docs.mau.fi/bridges/general/registering-appservices.html). Synapse needs access to the file inside its container and a restart after registration changes. Follow your homeserver's own restart or reload procedure; update both sides when registration-related settings change.
 
 ### QQ (official bot)

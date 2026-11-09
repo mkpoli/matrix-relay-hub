@@ -12,7 +12,7 @@ import sys
 
 import aiohttp
 
-from . import config
+from . import backfill, config, media
 from .matrix import AppService, MatrixClient
 from .qq import QQClient
 from .relay import Relay
@@ -29,11 +29,33 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="run the bridge")
     run.add_argument("--config", required=True)
 
+    replay = sub.add_parser(
+        "backfill", help="send room history to the QQ group in batches, once"
+    )
+    replay.add_argument("--config", required=True)
+    replay.add_argument(
+        "--dry-run", action="store_true", help="print the batches without sending"
+    )
+    replay.add_argument(
+        "--delay", type=float, default=2.0, help="seconds between batches"
+    )
+
+    pictures = sub.add_parser(
+        "media", help="resend room images that QQ saw only as a placeholder"
+    )
+    pictures.add_argument("--config", required=True)
+    pictures.add_argument(
+        "--dry-run", action="store_true", help="list the images without sending"
+    )
+    pictures.add_argument(
+        "--delay", type=float, default=3.0, help="seconds between images"
+    )
+
     simulate = sub.add_parser(
         "simulate", help="inject a fake QQ message to test the Matrix side"
     )
     simulate.add_argument("--config", required=True)
-    simulate.add_argument("--group", required=True)
+    simulate.add_argument("--group", default=None)
     simulate.add_argument("--name", default="Test User")
     simulate.add_argument("--member", default=None)
     simulate.add_argument("--text", required=True)
@@ -75,21 +97,58 @@ async def run(cfg: config.Config) -> None:
         store.close()
 
 
+async def replay(cfg: config.Config, args: argparse.Namespace) -> int:
+    async with aiohttp.ClientSession() as session:
+        store = Store(cfg.state_path)
+        matrix = MatrixClient(cfg.matrix, session)
+        qq = QQClient(cfg.qq, session)
+        try:
+            return await backfill.run(
+                cfg,
+                store,
+                matrix,
+                qq,
+                dry_run=args.dry_run,
+                delay=args.delay,
+            )
+        finally:
+            await qq.close()
+            store.close()
+
+
+async def resend_media(cfg: config.Config, args: argparse.Namespace) -> int:
+    async with aiohttp.ClientSession() as session:
+        store = Store(cfg.state_path)
+        matrix = MatrixClient(cfg.matrix, session)
+        qq = QQClient(cfg.qq, session)
+        try:
+            return await media.run(
+                cfg,
+                store,
+                matrix,
+                qq,
+                dry_run=args.dry_run,
+                delay=args.delay,
+            )
+        finally:
+            await qq.close()
+            store.close()
+
+
 async def simulate(cfg: config.Config, args: argparse.Namespace) -> None:
+    if args.group and args.group != cfg.qq.group:
+        raise SystemExit(f"group {args.group} is not the bridged group {cfg.qq.group}")
+    group = args.group or cfg.qq.group
     async with aiohttp.ClientSession() as session:
         store = Store(cfg.state_path)
         matrix = MatrixClient(cfg.matrix, session)
         qq = QQClient(cfg.qq, session)
         relay = Relay(cfg, store, matrix, qq)
         await relay.start()
-        if not store.room_for_group(args.group):
-            raise SystemExit(
-                f"group {args.group} is not bound; check [[bridge]] entries"
-            )
         member = args.member or hashlib.sha256(args.name.encode()).hexdigest()[
             :32
         ].upper()
-        await relay.inject_qq_message(args.group, member, args.name, args.text)
+        await relay.inject_qq_message(group, member, args.name, args.text)
         await asyncio.sleep(2)
         await relay.stop()
         store.close()
@@ -109,6 +168,10 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(2) from exc
     if args.command == "run":
         asyncio.run(run(cfg))
+    elif args.command == "backfill":
+        raise SystemExit(asyncio.run(replay(cfg, args)))
+    elif args.command == "media":
+        raise SystemExit(asyncio.run(resend_media(cfg, args)))
     else:
         asyncio.run(simulate(cfg, args))
 

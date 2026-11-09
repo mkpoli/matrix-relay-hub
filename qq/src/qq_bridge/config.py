@@ -31,6 +31,8 @@ class MatrixConfig:
 class QQConfig:
     app_id: str
     app_secret: str
+    group: str
+    incoming: str
     api_base: str = "https://api.bot.qq.com"
     intents: int = 1 << 25
 
@@ -40,17 +42,18 @@ class QQConfig:
 
 
 @dataclass(frozen=True)
-class BridgeConfig:
-    room: str
-    code: str
-    group: str | None = None
+class RoomConfig:
+    """A Matrix room mirrored into the QQ group, named by its label there."""
+
+    alias: str
+    label: str
 
 
 @dataclass(frozen=True)
 class Config:
     matrix: MatrixConfig
     qq: QQConfig
-    bridges: tuple[BridgeConfig, ...]
+    rooms: tuple[RoomConfig, ...]
     ignore_senders: tuple[str, ...]
     ignore_notices: bool
     state_path: Path
@@ -88,37 +91,42 @@ def load(path: str | Path) -> Config:
     if not matrix.bot_mxid.startswith("@"):
         raise ConfigError("matrix.bot_mxid must be a full user id")
 
-    qq_raw = raw.get("qq", {})
+    qq_raw = raw.get("qq")
     if not isinstance(qq_raw, dict):
-        raise ConfigError("[qq] must be a table")
+        raise ConfigError("missing [qq] section")
     qq = QQConfig(
         app_id=qq_raw.get("app_id", ""),
         app_secret=qq_raw.get("app_secret", ""),
+        group=_require(qq_raw, "group", "qq"),
+        incoming=_require(qq_raw, "incoming", "qq"),
         api_base=qq_raw.get("api_base", "https://api.bot.qq.com").rstrip("/"),
         intents=int(qq_raw.get("intents", 1 << 25)),
     )
+    if not qq.incoming.startswith("#"):
+        raise ConfigError("qq.incoming must be a room alias")
 
-    bridges_raw = raw.get("bridge")
-    if not isinstance(bridges_raw, list) or not bridges_raw:
-        raise ConfigError("at least one [[bridge]] entry is required")
-    bridges: list[BridgeConfig] = []
-    seen_codes: set[str] = set()
-    seen_rooms: set[str] = set()
-    for index, entry in enumerate(bridges_raw):
+    rooms_raw = raw.get("room")
+    if not isinstance(rooms_raw, list) or not rooms_raw:
+        raise ConfigError("at least one [[room]] entry is required")
+    rooms: list[RoomConfig] = []
+    seen_aliases: set[str] = set()
+    seen_labels: set[str] = set()
+    for index, entry in enumerate(rooms_raw):
         if not isinstance(entry, dict):
-            raise ConfigError(f"bridge[{index}] must be a table")
-        room = _require(entry, "room", f"bridge[{index}]")
-        code = _require(entry, "code", f"bridge[{index}]")
-        group = entry.get("group") or None
-        if not room.startswith("#"):
-            raise ConfigError(f"bridge[{index}].room must be a room alias")
-        if code in seen_codes:
-            raise ConfigError(f"duplicate bridge code {code!r}")
-        if room in seen_rooms:
-            raise ConfigError(f"duplicate bridge room {room!r}")
-        seen_codes.add(code)
-        seen_rooms.add(room)
-        bridges.append(BridgeConfig(room=room, code=code, group=group))
+            raise ConfigError(f"room[{index}] must be a table")
+        alias = _require(entry, "alias", f"room[{index}]")
+        label = _require(entry, "label", f"room[{index}]")
+        if not alias.startswith("#"):
+            raise ConfigError(f"room[{index}].alias must be a room alias")
+        if alias in seen_aliases:
+            raise ConfigError(f"duplicate room alias {alias!r}")
+        if label in seen_labels:
+            raise ConfigError(f"duplicate room label {label!r}")
+        seen_aliases.add(alias)
+        seen_labels.add(label)
+        rooms.append(RoomConfig(alias=alias, label=label))
+    if qq.incoming not in seen_aliases:
+        raise ConfigError("qq.incoming must name one of the [[room]] aliases")
 
     ignore_raw = raw.get("ignore_senders", [])
     if not isinstance(ignore_raw, list) or not all(isinstance(x, str) for x in ignore_raw):
@@ -130,7 +138,7 @@ def load(path: str | Path) -> Config:
     return Config(
         matrix=matrix,
         qq=qq,
-        bridges=tuple(bridges),
+        rooms=tuple(rooms),
         ignore_senders=tuple(ignore_raw),
         ignore_notices=bool(raw.get("ignore_notices", True)),
         state_path=state_path,

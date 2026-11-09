@@ -13,13 +13,15 @@ listen_port = 29335
 [qq]
 app_id = "CHANGE"
 app_secret = "CHANGE"
+group = "GROUP_OPENID"
+incoming = "#qq-test:example.org"
 
-# One entry per Matrix room. `group` is optional: leave it out and send
-# `!qq bind <code>` in the QQ group instead.
-[[bridge]]
-room = "#qq-test:example.org"
-code = "test"
+# Each room is mirrored into the group. The incoming room receives QQ
+# messages; labels prefix messages when more than one room is listed.
+[[room]]
+alias = "#qq-test:example.org"
+label = "test"
 
-[[bridge]]
-room = "#welcome:example.org"
-code = "welcome"
+[[room]]
+alias = "#welcome:example.org"
+label = "welcome"

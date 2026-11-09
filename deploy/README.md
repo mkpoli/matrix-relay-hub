@@ -63,7 +63,7 @@ export QQ_DATA_DIR="$HOME/matrix-bridge-data/qq"
 export QQ_UID="$(id -u)" QQ_GID="$(id -g)"
 ```
 
-Copy `qq/deploy/config.example.toml` to `$QQ_DATA_DIR/config.toml` and set the homeserver, tokens, bot user ID and bridge rooms. The bridge reads `/data/config.toml` and listens on port 29335; keep `listen_host = "0.0.0.0"` so the homeserver can reach it over the shared network. Copy `qq/deploy/registration.example.yaml` to `$QQ_DATA_DIR/registration.yaml`, replace the tokens and domain, and keep `url: http://matrix-relay-qq:29335` unless you change the alias. Set `QQ_NETWORK_ALIAS` if that name is taken.
+Copy `qq/deploy/config.example.toml` to `$QQ_DATA_DIR/config.toml` and set the homeserver, tokens, bot user ID, the QQ group openid and the mirrored rooms. `qq.incoming` names the room that receives QQ messages; labels prefix messages when several rooms share the group. The bridge reads `/data/config.toml` and listens on port 29335; keep `listen_host = "0.0.0.0"` so the homeserver can reach it over the shared network. Copy `qq/deploy/registration.example.yaml` to `$QQ_DATA_DIR/registration.yaml`, replace the tokens and domain, and keep `url: http://matrix-relay-qq:29335` unless you change the alias. Set `QQ_NETWORK_ALIAS` if that name is taken.
 
 The bot must be added to the QQ group with message receiving and active posting enabled. [Tencent's send documentation](https://raw.githubusercontent.com/tencent-connect/bot-docs/main/docs/develop/api-v2/server-inter/message/send-receive/send.md) says proactive push ended on 21 April 2025, so Matrix-to-QQ delivery depends on current account permissions and may be rejected; test in a sandbox group first. The bridge does not support encrypted Matrix rooms and replaces media over 3.5 MB with a notice.
 

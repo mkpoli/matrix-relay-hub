@@ -80,6 +80,37 @@ class MatrixClient:
             json_body={},
         )
 
+    async def messages(
+        self,
+        room_id: str,
+        user_id: str,
+        *,
+        from_token: str | None = None,
+        limit: int = 100,
+    ) -> dict:
+        """One page of room history, newest first, as the given user."""
+        params = {"dir": "b", "limit": limit}
+        if from_token:
+            params["from"] = from_token
+        return await self.request(
+            "GET",
+            f"/_matrix/client/v3/rooms/{_q(room_id)}/messages",
+            user_id=user_id,
+            params=params,
+        )
+
+    async def iter_history(self, room_id: str, user_id: str):
+        """Every event in a room, newest first."""
+        token = None
+        while True:
+            page = await self.messages(room_id, user_id, from_token=token, limit=200)
+            events = page.get("chunk") or []
+            for event in events:
+                yield event
+            token = page.get("end")
+            if not events or not token:
+                return
+
     async def register_user(self, localpart: str, displayname: str) -> str:
         try:
             data = await self.request(

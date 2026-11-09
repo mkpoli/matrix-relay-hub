@@ -66,18 +66,13 @@ def test_strip_leading_mentions():
     assert strip_leading_mentions("!qq id") == "!qq id"
 
 
-def test_edit_target():
-    from qq_bridge.relay import edit_target
+def test_is_edit():
+    from qq_bridge.relay import is_edit
 
-    assert (
-        edit_target({"m.relates_to": {"rel_type": "m.replace", "event_id": "$orig"}})
-        == "$orig"
-    )
-    assert edit_target({"m.new_content": {"body": "new"}}) is None
-    assert edit_target({"body": "hello"}) is None
-    assert (
-        edit_target({"body": "hi", "m.relates_to": {"rel_type": "m.thread"}}) is None
-    )
+    assert is_edit({"m.new_content": {"body": "new"}}) is True
+    assert is_edit({"m.relates_to": {"rel_type": "m.replace", "event_id": "$orig"}}) is True
+    assert is_edit({"body": "hello"}) is False
+    assert is_edit({"body": "hi", "m.relates_to": {"rel_type": "m.thread"}}) is False
 
 
 def test_face_markup_becomes_emoji():

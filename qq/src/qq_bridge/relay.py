@@ -1,4 +1,4 @@
-"""Relay logic between QQ groups and Matrix rooms."""
+"""Relay logic between the QQ group and the Matrix rooms it mirrors."""
 
 from __future__ import annotations
 
@@ -30,8 +30,6 @@ log = logging.getLogger(__name__)
 MAX_MEDIA_DOWNLOAD = 40 * 1024 * 1024
 # QQ takes at most 5 MB of binary per direct upload; base64 inflates by a third.
 MAX_QQ_UPLOAD = 3_500_000
-# QQ refuses to recall a group message more than two minutes after it was sent.
-RECALL_WINDOW = 120
 
 QQ_FILE_TYPES = {"m.image": 1, "m.video": 2, "m.audio": 3, "m.file": 4}
 
@@ -41,12 +39,11 @@ FACE_MIRRORS = (
 )
 
 
-def edit_target(content: dict) -> str | None:
-    """The event a Matrix edit replaces, or None for ordinary content."""
-    relates = content.get("m.relates_to") or {}
-    if relates.get("rel_type") != "m.replace":
-        return None
-    return relates.get("event_id") or None
+def is_edit(content: dict) -> bool:
+    """Matrix sends edits as ordinary messages carrying m.new_content."""
+    if "m.new_content" in content:
+        return True
+    return (content.get("m.relates_to") or {}).get("rel_type") == "m.replace"
 
 
 class Relay:
@@ -65,12 +62,16 @@ class Relay:
         self.bot_mxid = cfg.matrix.bot_mxid
         self.incoming: asyncio.Queue[dict] = asyncio.Queue()
         self._rooms: dict[str, str] = {}
+        self._labels: dict[str, str] = {}
+        self._incoming: str | None = None
+        # One label per room keeps a group of several rooms readable; a single
+        # room needs no prefix.
+        self._tagged = len(cfg.rooms) > 1
         self._ghosts: dict[str, str] = {}
         self._avatar: str | None = None
         self._avatars: set[str] = set()
         self._joined: set[tuple[str, str]] = set()
         self._names: dict[tuple[str, str], tuple[str, float]] = {}
-        self._unbound: set[str] = set()
         self._queue: asyncio.Queue[dict] = asyncio.Queue()
         self._global = RateLimiter(60)
         self._group_limiters: dict[str, RateLimiter] = {}
@@ -79,11 +80,11 @@ class Relay:
     async def start(self) -> None:
         await self._ensure_bot()
         await self._ensure_avatar()
-        for bridge in self.cfg.bridges:
+        for room in self.cfg.rooms:
             try:
-                await self._resolve_bridge(bridge)
+                await self._resolve_room(room)
             except Exception as exc:
-                log.warning("cannot set up %s yet: %s", bridge.room, exc)
+                log.warning("cannot set up %s yet: %s", room.alias, exc)
         self._tasks = [
             asyncio.create_task(self._consume_matrix()),
             asyncio.create_task(self._send_loop()),
@@ -119,32 +120,31 @@ class Relay:
             log.warning("cannot install the bridge avatar: %s", exc)
             self._avatar = None
 
-    async def _resolve_bridge(self, bridge) -> None:
-        room_id = await self.matrix.resolve_alias(bridge.room)
-        self._rooms[bridge.room] = room_id
-        if bridge.group:
-            self.store.bind(room_id, bridge.group, bridge.code)
-        else:
-            self.store.set_code(room_id, bridge.code)
+    async def _resolve_room(self, room) -> None:
+        room_id = await self.matrix.resolve_alias(room.alias)
+        self._rooms[room.alias] = room_id
+        self._labels[room_id] = room.label
+        if room.alias == self.cfg.qq.incoming:
+            self._incoming = room_id
         try:
             await self.matrix.join(room_id, self.bot_mxid)
         except MatrixError as exc:
-            log.warning("cannot join %s as %s: %s", bridge.room, self.bot_mxid, exc)
+            log.warning("cannot join %s as %s: %s", room.alias, self.bot_mxid, exc)
         if await self.matrix.is_encrypted(room_id):
             log.warning(
                 "%s is encrypted; QQ messages can be written but not read",
-                bridge.room,
+                room.alias,
             )
-        log.info("bridging %s (%s) with code %s", bridge.room, room_id, bridge.code)
+        log.info("mirroring %s (%s) as [%s]", room.alias, room_id, room.label)
 
     async def _retry_rooms(self) -> None:
         while True:
             await asyncio.sleep(60)
-            for bridge in self.cfg.bridges:
-                if bridge.room in self._rooms:
+            for room in self.cfg.rooms:
+                if room.alias in self._rooms:
                     continue
                 try:
-                    await self._resolve_bridge(bridge)
+                    await self._resolve_room(room)
                 except Exception:
                     pass
 
@@ -170,31 +170,25 @@ class Relay:
         if event_type == "m.room.redaction":
             await self._redact(event)
             return
-        if event_type == "m.reaction":
-            await self._reaction(event)
-            return
         if event_type != "m.room.message":
             return
         if self._ignored(sender):
             return
-        group = self.store.group_for_room(room_id)
-        if not group:
+        label = self._labels.get(room_id)
+        if label is None:
             return
         content = event.get("content") or {}
-        replace_id = edit_target(content)
-        if replace_id:
-            content = content.get("m.new_content") or {}
-            if not content:
-                log.debug("ignoring an edit without m.new_content in %s", room_id)
-                return
-            event_id = replace_id
-        elif "m.new_content" in content:
-            log.debug("ignoring an edit without a target in %s", room_id)
+        if is_edit(content):
+            log.debug("ignoring an edit in %s", room_id)
             return
-        else:
-            event_id = event.get("event_id", "")
         msgtype = content.get("msgtype")
-        if msgtype == "m.notice" and self.cfg.ignore_notices:
+        event_id = event.get("event_id", "")
+        if self.cfg.ignore_notices and msgtype == "m.notice":
+            return
+        if event_id and (
+            self.store.qq_for_event(event_id) or self.store.relayed_qq(event_id)
+        ):
+            log.debug("ignoring an event already carried to QQ: %s", event_id)
             return
 
         if msgtype in ("m.text", "m.emote"):
@@ -202,32 +196,35 @@ class Relay:
             if not body.strip():
                 return
             name = await self._display_name(room_id, sender)
-            text = f"* {name} {body}" if msgtype == "m.emote" else f"{name}: {body}"
-            reference = self._reply_reference(event) if not replace_id else None
+            tag = f"[{label}] " if self._tagged else ""
+            text = (
+                f"{tag}* {name} {body}"
+                if msgtype == "m.emote"
+                else f"{tag}{name}: {body}"
+            )
+            reference = self._reply_reference(event)
             for index, part in enumerate(chunk(text)):
-                job = {
-                    "kind": "text",
-                    "group": group,
+                self._queue.put_nowait(
+                    {
+                        "kind": "text",
+                        "group": self.cfg.qq.group,
+                        "room": room_id,
+                        "event_id": event_id,
+                        "text": part,
+                        "reference": reference if index == 0 else None,
+                    }
+                )
+        elif msgtype in QQ_FILE_TYPES:
+            self._queue.put_nowait(
+                {
+                    "kind": "media",
+                    "group": self.cfg.qq.group,
                     "room": room_id,
                     "event_id": event_id,
-                    "text": part,
-                    "reference": reference if index == 0 else None,
+                    "sender": sender,
+                    "content": content,
                 }
-                if index == 0 and replace_id:
-                    job["edit_of"] = replace_id
-                self._queue.put_nowait(job)
-        elif msgtype in QQ_FILE_TYPES:
-            job = {
-                "kind": "media",
-                "group": group,
-                "room": room_id,
-                "event_id": event_id,
-                "sender": sender,
-                "content": content,
-            }
-            if replace_id:
-                job["edit_of"] = replace_id
-            self._queue.put_nowait(job)
+            )
 
     def _ignored(self, sender: str) -> bool:
         if sender == self.bot_mxid or sender.startswith("@qq_"):
@@ -242,7 +239,12 @@ class Relay:
         target = (relates.get("m.in_reply_to") or {}).get("event_id")
         if not target:
             return None
-        return self.store.reference_for_event(target)
+        row = self.store.conn.execute(
+            "SELECT qq_id, ref_idx FROM messages WHERE event_id = ?", (target,)
+        ).fetchone()
+        if not row:
+            return None
+        return row["ref_idx"] or row["qq_id"]
 
     async def _display_name(self, room_id: str, user_id: str) -> str:
         key = (room_id, user_id)
@@ -263,45 +265,13 @@ class Relay:
         target = event.get("redacts") or (event.get("content") or {}).get("redacts")
         if not target:
             return
-        for row in self.store.messages_for_event(target):
-            if not row["qq_id"]:
-                continue
-            try:
-                await self.qq.delete_group_message(row["group_openid"], row["qq_id"])
-            except QQError as exc:
-                log.info("cannot recall QQ message %s: %s", row["qq_id"], exc)
-            else:
-                self.store.remove_message(row["qq_id"])
-
-    async def _reaction(self, event: dict) -> None:
-        """QQ's bot API has no group reactions, so post the emoji as a reply."""
-        room_id = event.get("room_id")
-        sender = event.get("sender")
-        if self._ignored(sender):
+        row = self.store.qq_for_event(target)
+        if not row:
             return
-        group = self.store.group_for_room(room_id)
-        if not group:
-            return
-        relates = (event.get("content") or {}).get("m.relates_to") or {}
-        target = relates.get("event_id")
-        key = relates.get("key")
-        event_id = event.get("event_id", "")
-        if relates.get("rel_type") != "m.annotation" or not target or not key:
-            return
-        if not event_id:
-            return
-        name = await self._display_name(room_id, sender)
-        self._queue.put_nowait(
-            {
-                "kind": "text",
-                "group": group,
-                "room": room_id,
-                "event_id": event_id,
-                "text": f"{name}: {key}",
-                "reference": None,
-                "react_to": target,
-            }
-        )
+        try:
+            await self.qq.delete_group_message(row["group_openid"], row["qq_id"])
+        except QQError as exc:
+            log.info("cannot recall QQ message %s: %s", row["qq_id"], exc)
 
     # -- outbound queue ---------------------------------------------------
 
@@ -325,62 +295,25 @@ class Relay:
             return False
         return True
 
-    async def _replace_previous(self, group: str, event_id: str) -> str | None:
-        """Recall the QQ copies of a Matrix message and return a quote target.
-
-        Messages past QQ's recall window stay up and get quoted by the
-        replacement instead.
-        """
-        reference: str | None = None
-        now = time.time()
-        for row in reversed(self.store.messages_for_event(event_id)):
-            qq_id = row["qq_id"]
-            if not qq_id:
-                continue
-            if now - row["ts"] <= RECALL_WINDOW:
-                try:
-                    await self.qq.delete_group_message(group, qq_id)
-                except QQError as exc:
-                    log.info("cannot recall QQ message %s: %s", qq_id, exc)
-                else:
-                    self.store.remove_message(qq_id)
-                    continue
-            if reference is None:
-                reference = row["ref_idx"] or qq_id
-        return reference
-
     async def _send_text(self, job: dict) -> None:
-        group = job["group"]
-        reference = job.get("reference")
-        if job.get("react_to"):
-            reference = self.store.reference_for_event(job["react_to"])
-            if not reference:
-                log.debug("dropping a reaction to unbridged %s", job["react_to"])
-                return
-        if not await self._wait_limits(group):
+        if not await self._wait_limits(job["group"]):
             return
-        if job.get("edit_of"):
-            reference = await self._replace_previous(group, job["edit_of"])
-        for attempt in range(4):
+        for attempt in range(3):
             try:
                 response = await self.qq.send_group_text(
-                    group,
+                    job["group"],
                     job["text"],
-                    reference=reference,
+                    reference=job.get("reference"),
                     msg_id=job.get("msg_id"),
                 )
             except QQError as exc:
-                if reference and not exc.rate_limited:
-                    log.info("cannot quote %s, sending without it: %s", reference, exc)
-                    reference = None
-                    continue
                 if exc.rate_limited and attempt < 2:
                     await asyncio.sleep(3 * (attempt + 1))
                     continue
-                log.warning("cannot send to %s: %s", group, exc)
+                log.warning("cannot send to %s: %s", job["group"], exc)
                 return
-            self._remember_sent(group, job["room"], job["event_id"], response)
-            log.info("sent to QQ group %s: %s", group, response.get("id"))
+            self._remember_sent(job["group"], job["room"], job["event_id"], response)
+            log.info("sent to QQ group %s: %s", job["group"], response.get("id"))
             return
 
     async def _send_media(self, job: dict) -> None:
@@ -396,16 +329,15 @@ class Relay:
             return
         if len(data) > MAX_QQ_UPLOAD:
             name = await self._display_name(job["room"], job["sender"])
-            notice = {
-                "group": job["group"],
-                "room": job["room"],
-                "event_id": job["event_id"],
-                "text": f"{name}: [{msgtype[2:]} too large for QQ]",
-                "reference": None,
-            }
-            if job.get("edit_of"):
-                notice["edit_of"] = job["edit_of"]
-            await self._send_text(notice)
+            await self._send_text(
+                {
+                    "group": job["group"],
+                    "room": job["room"],
+                    "event_id": job["event_id"],
+                    "text": f"{name}: [{msgtype[2:]} too large for QQ]",
+                    "reference": None,
+                }
+            )
             return
         file_type = QQ_FILE_TYPES.get(msgtype, 4)
         filename = str(content.get("body") or f"file{file_type}")
@@ -415,42 +347,15 @@ class Relay:
             file_info = await self.qq.upload_group_media(
                 job["group"], data, filename, file_type
             )
+            response = await self.qq.send_group_media(job["group"], file_info)
         except QQError as exc:
             log.warning(
-                "cannot upload media for %s: %s (trace %s)",
+                "cannot send media to %s: %s (trace %s)",
                 job["group"],
                 exc,
                 exc.trace_id,
             )
             return
-        reference = None
-        if job.get("edit_of"):
-            reference = await self._replace_previous(job["group"], job["edit_of"])
-        try:
-            response = await self.qq.send_group_media(
-                job["group"], file_info, reference=reference
-            )
-        except QQError as exc:
-            if reference and not exc.rate_limited:
-                log.info("cannot quote %s, sending media without it: %s", reference, exc)
-                try:
-                    response = await self.qq.send_group_media(job["group"], file_info)
-                except QQError as inner:
-                    log.warning(
-                        "cannot send media to %s: %s (trace %s)",
-                        job["group"],
-                        inner,
-                        inner.trace_id,
-                    )
-                    return
-            else:
-                log.warning(
-                    "cannot send media to %s: %s (trace %s)",
-                    job["group"],
-                    exc,
-                    exc.trace_id,
-                )
-                return
         self._remember_sent(job["group"], job["room"], job["event_id"], response)
         log.info("sent media to QQ group %s: %s", job["group"], response.get("id"))
 
@@ -489,6 +394,9 @@ class Relay:
         author = data.get("author") or {}
         if not group or author.get("bot"):
             return
+        if group != self.cfg.qq.group:
+            log.info("ignoring QQ group %s, which is not the bridged group", group)
+            return
         member_id = author.get("member_openid") or author.get("id")
         if not member_id:
             return
@@ -499,14 +407,13 @@ class Relay:
         if command_text.startswith("!qq"):
             await self._command(group, command_text, str(data.get("id") or "") or None)
             return
-        room_id = self.store.room_for_group(group)
-        if not room_id:
-            if group not in self._unbound:
-                self._unbound.add(group)
-                log.info(
-                    "QQ group %s is not bound to a room; send !qq bind <code> there",
-                    group,
-                )
+        room_id = self._incoming
+        if room_id is None:
+            log.warning(
+                "QQ message for %s cannot be posted: %s is not resolved",
+                group,
+                self.cfg.qq.incoming,
+            )
             return
         ghost = await self._ghost(group, room_id, member_id, name)
         qq_id = str(data.get("id") or "")
@@ -682,18 +589,6 @@ class Relay:
         command = parts[1] if len(parts) > 1 else ""
         if command == "id":
             self._reply(group, f"group_openid: {group}", msg_id)
-        elif command == "bind" and len(parts) > 2:
-            code = parts[2]
-            if self.store.room_for_group(group):
-                self._reply(group, "this group is already bound", msg_id)
-                return
-            room_id = self.store.room_for_code(code)
-            if not room_id:
-                self._reply(group, f"unknown code: {code}", msg_id)
-                return
-            self.store.bind(room_id, group, code)
-            log.info("bound QQ group %s to %s", group, room_id)
-            self._reply(group, "bound", msg_id)
         elif command == "status":
             self._reply(group, "qq-bridge is running", msg_id)
 

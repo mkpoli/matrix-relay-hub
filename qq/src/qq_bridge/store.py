@@ -1,4 +1,4 @@
-"""SQLite state: room bindings, member names, message ids, transaction ids."""
+"""SQLite state: member names, message ids, replayed events, transaction ids."""
 
 from __future__ import annotations
 
@@ -7,13 +7,6 @@ import time
 from pathlib import Path
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS bindings (
-    room_id TEXT PRIMARY KEY,
-    group_openid TEXT UNIQUE,
-    code TEXT
-);
-CREATE INDEX IF NOT EXISTS bindings_group ON bindings(group_openid);
-
 CREATE TABLE IF NOT EXISTS members (
     group_openid TEXT NOT NULL,
     member_openid TEXT NOT NULL,
@@ -34,6 +27,14 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_event ON messages(event_id);
 CREATE INDEX IF NOT EXISTS messages_ref ON messages(group_openid, ref_idx);
+
+CREATE TABLE IF NOT EXISTS relayed (
+    event_id TEXT PRIMARY KEY,
+    qq_id TEXT,
+    group_openid TEXT,
+    room_id TEXT,
+    ts INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS transactions (
     txn_id TEXT PRIMARY KEY,
@@ -56,56 +57,12 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
+        # Bindings moved into the configuration; a state file from the single-room
+        # layout keeps its reply map under a table this version never reads.
+        self.conn.execute("DROP TABLE IF EXISTS bindings")
 
     def close(self) -> None:
         self.conn.close()
-
-    # -- bindings ---------------------------------------------------------
-
-    def bind(self, room_id: str, group_openid: str, code: str | None = None) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO bindings(room_id, group_openid, code) VALUES(?, ?, ?)
-            ON CONFLICT(room_id) DO UPDATE SET
-                group_openid = excluded.group_openid,
-                code = COALESCE(excluded.code, bindings.code)
-            """,
-            (room_id, group_openid, code),
-        )
-
-    def set_code(self, room_id: str, code: str) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO bindings(room_id, group_openid, code) VALUES(?, NULL, ?)
-            ON CONFLICT(room_id) DO UPDATE SET code = excluded.code
-            """,
-            (room_id, code),
-        )
-
-    def room_for_group(self, group_openid: str) -> str | None:
-        row = self.conn.execute(
-            "SELECT room_id FROM bindings WHERE group_openid = ?", (group_openid,)
-        ).fetchone()
-        return row["room_id"] if row else None
-
-    def group_for_room(self, room_id: str) -> str | None:
-        row = self.conn.execute(
-            "SELECT group_openid FROM bindings WHERE room_id = ?", (room_id,)
-        ).fetchone()
-        return row["group_openid"] if row and row["group_openid"] else None
-
-    def room_for_code(self, code: str) -> str | None:
-        row = self.conn.execute(
-            "SELECT room_id FROM bindings WHERE code = ? AND group_openid IS NULL", (code,)
-        ).fetchone()
-        return row["room_id"] if row else None
-
-    def all_bindings(self) -> list[sqlite3.Row]:
-        return list(
-            self.conn.execute(
-                "SELECT room_id, group_openid, code FROM bindings ORDER BY room_id"
-            )
-        )
 
     # -- members ----------------------------------------------------------
 
@@ -166,29 +123,35 @@ class Store:
         ).fetchone()
         return row["event_id"] if row else None
 
-    def messages_for_event(self, event_id: str) -> list[sqlite3.Row]:
-        """Every QQ copy the bridge sent for one Matrix event, oldest first."""
-        return list(
-            self.conn.execute(
-                "SELECT * FROM messages WHERE event_id = ? AND direction = 'matrix' "
-                "ORDER BY ts, rowid",
-                (event_id,),
-            )
-        )
-
-    def reference_for_event(self, event_id: str) -> str | None:
-        """The QQ id to quote when replying to the latest copy of an event."""
-        row = self.conn.execute(
-            "SELECT ref_idx, qq_id FROM messages WHERE event_id = ? "
-            "ORDER BY ts DESC, rowid DESC LIMIT 1",
+    def qq_for_event(self, event_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM messages WHERE event_id = ? AND direction = 'matrix'",
             (event_id,),
         ).fetchone()
-        if not row:
-            return None
-        return row["ref_idx"] or row["qq_id"]
 
-    def remove_message(self, qq_id: str) -> None:
-        self.conn.execute("DELETE FROM messages WHERE qq_id = ?", (qq_id,))
+    # -- replayed history -------------------------------------------------
+
+    def mark_relayed(
+        self, event_id: str, qq_id: str, group_openid: str, room_id: str
+    ) -> None:
+        """Record an event carried to QQ inside a batch message."""
+        self.conn.execute(
+            """
+            INSERT INTO relayed(event_id, qq_id, group_openid, room_id, ts)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO NOTHING
+            """,
+            (event_id, qq_id, group_openid, room_id, int(time.time())),
+        )
+
+    def relayed_qq(self, event_id: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT qq_id FROM relayed WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        return row["qq_id"] if row else None
+
+    def relayed_count(self) -> int:
+        return self.conn.execute("SELECT count(*) FROM relayed").fetchone()[0]
 
     # -- faces ------------------------------------------------------------
 

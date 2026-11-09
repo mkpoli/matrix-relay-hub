@@ -49,10 +49,10 @@ Configure the homeserver URL as reachable from the bridge, and the appservice UR
 
 ### QQ (official bot)
 
-Build the QQ bridge image from its own checkout. The checkout must contain `src/qq_bridge/`:
+Build the QQ bridge image from a checkout of the bridge, which is maintained separately and not included here. The checkout must contain `src/qq_bridge/`:
 
 ```sh
-export QQ_BRIDGE_SOURCE="$HOME/matrix-qq-bridge"   # your checkout
+export QQ_BRIDGE_SOURCE="$HOME/qq-bridge"   # your checkout, not included here
 docker build -f deploy/qq/Dockerfile -t matrix-relay-hub/qq-bridge:local "$QQ_BRIDGE_SOURCE"
 ```
 
@@ -86,7 +86,7 @@ room = "#welcome:example.org"
 code = "welcome"
 ```
 
-Copy the bridge's `deploy/registration.example.yaml`, replace the tokens and domain, and set `url: http://matrix-relay-qq:29335`. Set `QQ_NETWORK_ALIAS` if that name is taken. Start the overlay together with the base file:
+Copy the registration example from that checkout, replace the tokens and domain, and set `url: http://matrix-relay-qq:29335`. Set `QQ_NETWORK_ALIAS` if that name is taken. Start the overlay together with the base file:
 
 ```sh
 docker compose -f deploy/compose.yaml -f deploy/compose.qq.yaml --profile qq up -d

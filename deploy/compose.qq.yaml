@@ -1,7 +1,10 @@
 services:
   qq:
-    image: ${QQ_BRIDGE_IMAGE:?Build the QQ bridge image as described in deploy/README.md}
     profiles: [qq]
+    image: ${QQ_BRIDGE_IMAGE:-matrix-relay-hub/qq-bridge:local}
+    build:
+      context: ..
+      dockerfile: deploy/qq/Dockerfile
     user: "${QQ_UID:?Set QQ_UID to the data directory owner}:${QQ_GID:?Set QQ_GID to the data directory group}"
     networks:
       matrix:

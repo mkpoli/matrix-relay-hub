@@ -1,0 +1,16 @@
+id: qq
+# The homeserver reaches the bridge at this address. Change it when the
+# network alias differs.
+url: http://matrix-relay-qq:29335
+as_token: CHANGE
+hs_token: CHANGE
+sender_localpart: qqbot
+rate_limited: false
+namespaces:
+  users:
+    - regex: "^@qqbot:example\\.org$"
+      exclusive: true
+    - regex: "^@qq_.*:example\\.org$"
+      exclusive: true
+  aliases: []
+  rooms: []

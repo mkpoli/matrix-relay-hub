@@ -49,50 +49,23 @@ Configure the homeserver URL as reachable from the bridge, and the appservice UR
 
 ### QQ (official bot)
 
-Build the QQ bridge image from a checkout of the bridge, which is maintained separately and not included here. The checkout must contain `src/qq_bridge/`:
+The bridge source is in `qq/`. Build its image from the repository root:
 
 ```sh
-export QQ_BRIDGE_SOURCE="$HOME/qq-bridge"   # your checkout, not included here
-docker build -f deploy/qq/Dockerfile -t matrix-relay-hub/qq-bridge:local "$QQ_BRIDGE_SOURCE"
+docker build -f deploy/qq/Dockerfile -t matrix-relay-hub/qq-bridge:local .
 ```
 
-Create its data directory and set the image plus the host user that owns the directory:
+Create its data directory and set the host user that owns it. The overlay uses the local image by default:
 
 ```sh
 install -d -m 700 "$HOME/matrix-bridge-data/qq"
 export QQ_DATA_DIR="$HOME/matrix-bridge-data/qq"
-export QQ_BRIDGE_IMAGE=matrix-relay-hub/qq-bridge:local
 export QQ_UID="$(id -u)" QQ_GID="$(id -g)"
 ```
 
-Write `config.toml` and `registration.yaml` there. The bridge reads `/data/config.toml`; the homeserver needs the registration. Point the bridge at the homeserver over the shared network and make its listener reachable by its alias:
+Copy `qq/deploy/config.example.toml` to `$QQ_DATA_DIR/config.toml` and set the homeserver, tokens, bot user ID and bridge rooms. The bridge reads `/data/config.toml` and listens on port 29335; keep `listen_host = "0.0.0.0"` so the homeserver can reach it over the shared network. Copy `qq/deploy/registration.example.yaml` to `$QQ_DATA_DIR/registration.yaml`, replace the tokens and domain, and keep `url: http://matrix-relay-qq:29335` unless you change the alias. Set `QQ_NETWORK_ALIAS` if that name is taken.
 
-```toml
-[matrix]
-homeserver = "http://your-homeserver:8008"
-domain = "example.org"
-as_token = "..."
-hs_token = "..."
-bot_mxid = "@qqbot:example.org"
-listen_host = "0.0.0.0"
-listen_port = 29335
-
-[qq]
-app_id = "..."
-app_secret = "..."
-
-[[bridge]]
-room = "#welcome:example.org"
-code = "welcome"
-```
-
-Copy the registration example from that checkout, replace the tokens and domain, and set `url: http://matrix-relay-qq:29335`. Set `QQ_NETWORK_ALIAS` if that name is taken. Start the overlay together with the base file:
-
-```sh
-docker compose -f deploy/compose.yaml -f deploy/compose.qq.yaml --profile qq up -d
-```
-
-The bot must be added to the QQ group with message receiving and active posting enabled. [Tencent's send documentation](https://raw.githubusercontent.com/tencent-connect/bot-docs/main/docs/develop/api-v2/server-inter/message/send-receive/send.md) says proactive push ended on 21 April 2025, so Matrix-to-QQ delivery depends on current account permissions and may be rejected; test in a sandbox group first. The bridge does not support encrypted Matrix rooms and replaces media over 3.5 MB with a notice. Check its transaction handling before use: older revisions consumed a Matrix transaction before parsing its body, so a malformed delivery dropped the retry; the [migration checklist](../docs/migration.md) describes the check.
+The bot must be added to the QQ group with message receiving and active posting enabled. [Tencent's send documentation](https://raw.githubusercontent.com/tencent-connect/bot-docs/main/docs/develop/api-v2/server-inter/message/send-receive/send.md) says proactive push ended on 21 April 2025, so Matrix-to-QQ delivery depends on current account permissions and may be rejected; test in a sandbox group first. The bridge does not support encrypted Matrix rooms and replaces media over 3.5 MB with a notice.
 
 ## Operate
 
@@ -128,7 +101,6 @@ These commands only render and validate Compose configuration; they do not requi
   export DISCORD_DATA_DIR=/tmp/matrix-bridge-test/discord
   export TELEGRAM_DATA_DIR=/tmp/matrix-bridge-test/telegram
   export IRC_DATA_DIR=/tmp/matrix-bridge-test/irc
-  export QQ_BRIDGE_IMAGE=matrix-relay-hub/qq-bridge:offline-test
   export QQ_DATA_DIR=/tmp/matrix-bridge-test/qq
   export QQ_UID=1000
   export QQ_GID=1000
@@ -146,4 +118,4 @@ The offline configuration tests run with `python3 -m unittest discover -s deploy
 
 A shared external network is not an isolation boundary: other network members can reach listening services. Restrict network membership and access, safeguard bridge credentials, and review encryption, retention, room membership and access controls. Obtain explicit consent from participants before relaying messages and review each bridge's relay mode and platform terms. Telegram v26.10 defaults to relay disabled and can kick Matrix users who lack a remote login when no relay is set; review these settings before connecting rooms. Obtain IRC network operator permission and check connection limits: the bridge may create an IRC client per Matrix user.
 
-These profiles and actual platform interactions have not been tested in production. The QQ image is built from a working tree, so record the source commit you built. Other bridges can be supplied in operator-authored Compose files attached to the same existing network; assess their images, permissions, storage and compatibility separately.
+These profiles and actual platform interactions have not been tested in production. Other bridges can be supplied in operator-authored Compose files attached to the same existing network; assess their images, permissions, storage and compatibility separately.

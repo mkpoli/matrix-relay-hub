@@ -23,7 +23,6 @@ def compose_env():
         "DOCKER_CONFIG": "/nonexistent",
         "COMPOSE_DISABLE_ENV_FILE": "1",
         "MATRIX_NETWORK": NETWORK,
-        "QQ_BRIDGE_IMAGE": IMAGE,
         "QQ_DATA_DIR": DATA_DIR,
         "QQ_UID": "1000",
         "QQ_GID": "1000",
@@ -68,7 +67,9 @@ class QQOverlayTests(unittest.TestCase):
         config = self.config(["qq"])
         self.assertEqual(set(config["services"]), {"qq"})
         service = config["services"]["qq"]
-        self.assertEqual(service["image"], IMAGE)
+        self.assertEqual(service["image"], "matrix-relay-hub/qq-bridge:local")
+        self.assertEqual(Path(service["build"]["context"]).resolve(), ROOT)
+        self.assertEqual(service["build"]["dockerfile"], "deploy/qq/Dockerfile")
         self.assertEqual(service["user"], "1000:1000")
         self.assertEqual(set(service["networks"]), {"matrix"})
         self.assertEqual(service["networks"]["matrix"]["aliases"], ["matrix-relay-qq"])
@@ -85,16 +86,14 @@ class QQOverlayTests(unittest.TestCase):
         self.assertEqual(config["networks"]["matrix"]["name"], NETWORK)
         self.assertIs(config["networks"]["matrix"]["external"], True)
 
+    def test_custom_image_name(self):
+        env = dict(compose_env(), QQ_BRIDGE_IMAGE=IMAGE)
+        config = self.config(["qq"], env=env)
+        self.assertEqual(config["services"]["qq"]["image"], IMAGE)
+
     def test_qq_with_base_profiles(self):
         config = self.config(["discord", "qq"])
         self.assertEqual(set(config["services"]), {"discord", "qq"})
-
-    def test_image_is_required(self):
-        env = compose_env()
-        del env["QQ_BRIDGE_IMAGE"]
-        result = compose("--profile", "qq", "config", env=env)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("QQ_BRIDGE_IMAGE", result.stderr)
 
     def test_data_owner_is_required(self):
         env = compose_env()

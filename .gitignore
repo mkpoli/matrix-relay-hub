@@ -6,3 +6,4 @@ build/
 dist/
 lab/.run-*/
 irc-lab/.run-*/
+.pytest_cache/

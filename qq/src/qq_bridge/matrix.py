@@ -310,10 +310,11 @@ class AppService:
             isinstance(event, dict) for event in events
         ):
             return web.json_response({"errcode": "M_BAD_JSON"}, status=400)
-        if self.store.seen_transaction(txn_id):
+        seqs = self.store.accept_transaction(txn_id, events)
+        if seqs is None:
             return web.json_response({})
-        for event in events:
-            self.queue.put_nowait(event)
+        for seq, event in zip(seqs, events):
+            self.queue.put_nowait((seq, event))
         log.debug("transaction %s: %d events", txn_id, len(events))
         return web.json_response({})
 

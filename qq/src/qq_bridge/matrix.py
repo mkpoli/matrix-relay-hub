@@ -25,6 +25,24 @@ class MatrixError(Exception):
         self.body = body
 
 
+class MediaTooLarge(MatrixError):
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__(413, f"media over {max_bytes} bytes")
+
+
+async def _read_capped(response: aiohttp.ClientResponse, max_bytes: int | None) -> bytes:
+    if max_bytes is None:
+        return await response.read()
+    if (response.content_length or 0) > max_bytes:
+        raise MediaTooLarge(max_bytes)
+    data = bytearray()
+    async for piece in response.content.iter_chunked(1 << 16):
+        data += piece
+        if len(data) > max_bytes:
+            raise MediaTooLarge(max_bytes)
+    return bytes(data)
+
+
 def _q(value: str) -> str:
     return quote(value, safe="")
 
@@ -174,26 +192,24 @@ class MatrixClient:
                 raise MatrixError(response.status, text)
             return json.loads(text)["content_uri"]
 
-    async def download(self, mxc: str) -> bytes:
+    async def download(self, mxc: str, max_bytes: int | None = None) -> bytes:
+        """Fetch media; more than `max_bytes` raises MediaTooLarge unread."""
         if not mxc.startswith("mxc://"):
             raise ValueError(f"not an mxc uri: {mxc!r}")
         server, media_id = mxc[len("mxc://") :].split("/", 1)
         headers = {"Authorization": f"Bearer {self.cfg.as_token}"}
-        url = (
-            f"{self.base}/_matrix/client/v1/media/download/{_q(server)}/{_q(media_id)}"
+        urls = (
+            f"{self.base}/_matrix/client/v1/media/download/{_q(server)}/{_q(media_id)}",
+            f"{self.base}/_matrix/media/v3/download/{_q(server)}/{_q(media_id)}",
         )
-        async with self.session.get(url, headers=headers) as response:
-            if response.status == 404:
-                url = (
-                    f"{self.base}/_matrix/media/v3/download/{_q(server)}/{_q(media_id)}"
-                )
-                async with self.session.get(url, headers=headers) as legacy:
-                    if legacy.status >= 400:
-                        raise MatrixError(legacy.status, await legacy.text())
-                    return await legacy.read()
-            if response.status >= 400:
-                raise MatrixError(response.status, await response.text())
-            return await response.read()
+        for index, url in enumerate(urls):
+            async with self.session.get(url, headers=headers) as response:
+                if response.status == 404 and index == 0:
+                    continue
+                if response.status >= 400:
+                    raise MatrixError(response.status, await response.text())
+                return await _read_capped(response, max_bytes)
+        raise MatrixError(404, "media not found")
 
     async def member(self, room_id: str, user_id: str) -> dict | None:
         try:

@@ -65,3 +65,32 @@ def test_replayed_transaction_is_queued_once(tmp_path):
     assert (first.status, second.status) == (200, 200)
     assert queue.qsize() == 1
     store.close()
+
+
+class FakeContent:
+    def __init__(self, pieces):
+        self.pieces = pieces
+
+    async def iter_chunked(self, size):
+        for piece in self.pieces:
+            yield piece
+
+
+class FakeResponse:
+    def __init__(self, pieces, content_length=None):
+        self.content = FakeContent(pieces)
+        self.content_length = content_length
+
+    async def read(self):
+        return b"".join(self.content.pieces)
+
+
+def test_download_cap_stops_reading_past_the_limit():
+    import pytest
+    from qq_bridge.matrix import MediaTooLarge, _read_capped
+
+    assert asyncio.run(_read_capped(FakeResponse([b"ab", b"cd"]), 4)) == b"abcd"
+    with pytest.raises(MediaTooLarge):
+        asyncio.run(_read_capped(FakeResponse([b"ab", b"cd", b"e"]), 4))
+    with pytest.raises(MediaTooLarge):
+        asyncio.run(_read_capped(FakeResponse([], content_length=5), 4))

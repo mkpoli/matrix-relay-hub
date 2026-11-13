@@ -158,6 +158,8 @@ def test_media_is_queued(tmp_path):
     asyncio.run(relay.handle_matrix_event(event))
     job = relay._queue.get_nowait()
     assert job["kind"] == "media"
+    assert relay._images.get_nowait() is job
+    assert relay._videos.empty()
     assert job["content"]["url"] == "mxc://example.org/photo"
     store.close()
 
@@ -194,4 +196,91 @@ def test_send_records_the_message_and_skips_repeats(tmp_path):
     assert store.qq_for_event("$e")["qq_id"] == "Q1"
     asyncio.run(relay.handle_matrix_event(text_event()))
     assert relay._queue.empty()
+    store.close()
+
+
+
+def _run_media(relay, content, prepared, qq=None):
+    """Queue one media event, settle its preparation, and send it."""
+
+    async def go():
+        relay._enqueue_media(
+            {
+                "kind": "media",
+                "group": "G",
+                "room": ROOM,
+                "event_id": "$img",
+                "sender": "@alice:example.org",
+                "content": content,
+            }
+        )
+        job = relay._queue.get_nowait()
+        lane = relay._videos if content.get("msgtype") == "m.video" else relay._images
+        lane.get_nowait()
+        job["ready"].set_result(prepared)
+        await relay._send_media(job)
+        assert job["sent"].is_set()
+
+    asyncio.run(go())
+
+
+def test_media_that_cannot_fit_becomes_a_notice(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay.matrix = FakeMatrix()
+    _run_media(relay, {"msgtype": "m.video", "url": "mxc://x/y"}, "too long for QQ")
+    assert qq.sent[-1][1] == "Alice: [video too long for QQ]"
+    store.close()
+
+
+def test_refused_format_is_reencoded_once(tmp_path):
+    from qq_bridge.fit import Prepared
+    from qq_bridge.qq import QQError
+
+    class RefusingQQ(FakeQQ):
+        async def upload_group_media(self, group, data, filename, file_type):
+            raise QQError(40034002, "富媒体文件格式不支持")
+
+    relay, store = make_relay(tmp_path, RefusingQQ())
+
+    async def go():
+        relay._enqueue_media(
+            {"kind": "media", "group": "G", "room": ROOM, "event_id": "$img",
+             "sender": "@alice:example.org", "content": {"msgtype": "m.image"}}
+        )
+        job = relay._queue.get_nowait()
+        relay._images.get_nowait()
+        job["ready"].set_result(Prepared(b"x", "a.heic", 1))
+        await relay._send_media(job)
+        retry = relay._queue.get_nowait()
+        assert retry["force"] is True
+        assert relay._images.get_nowait() is retry
+        retry["ready"].set_result(Prepared(b"x", "a.jpg", 1))
+        await relay._send_media(retry)
+        assert relay._queue.empty()
+
+    asyncio.run(go())
+    store.close()
+
+
+def test_slow_media_lets_later_messages_pass(tmp_path, monkeypatch):
+    from qq_bridge.fit import Prepared
+
+    monkeypatch.setattr("qq_bridge.relay.MEDIA_WAIT", 0.01)
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+
+    async def go():
+        relay._enqueue_media(
+            {"kind": "media", "group": "G", "room": ROOM, "event_id": "$v",
+             "sender": "@alice:example.org", "content": {"msgtype": "m.video"}}
+        )
+        job = relay._queue.get_nowait()
+        await relay._send_media(job)
+        assert relay._queue.empty() and not job["sent"].is_set()
+        job["ready"].set_result(Prepared(b"v", "v.mp4", 2))
+        await asyncio.sleep(0)
+        assert relay._queue.get_nowait() is job
+
+    asyncio.run(go())
     store.close()

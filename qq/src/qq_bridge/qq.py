@@ -18,6 +18,10 @@ log = logging.getLogger(__name__)
 RATE_LIMIT_CODES = {1100100, 304044, 304045, 304046, 304047, 304048, 304049, 304050}
 
 
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
 class QQError(Exception):
     def __init__(
         self,
@@ -134,7 +138,7 @@ class QQClient:
         payload = {
             "file_type": file_type,
             "file_name": filename,
-            "file_data": base64.b64encode(data).decode("ascii"),
+            "file_data": await asyncio.to_thread(_b64, data),
             "srv_send_msg": False,
         }
         response = await self.request(

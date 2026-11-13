@@ -20,6 +20,7 @@ from .matrix import MatrixClient, MatrixError
 from .qq import QQClient, QQError
 from .ratelimit import RateLimiter
 from .fit import Unfit, prepare
+from .relay import MAX_MATRIX_MEDIA
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -83,7 +84,7 @@ async def _send(
     content = picture.content
     url = content.get("url") or (content.get("file") or {}).get("url")
     try:
-        data = await matrix.download(str(url))
+        data = await matrix.download(str(url), MAX_MATRIX_MEDIA)
     except Exception as exc:
         log.warning("cannot download %s: %s", picture.event_id, exc)
         return False

@@ -13,7 +13,7 @@ import uuid
 from pathlib import Path
 
 from .config import Config
-from .fit import QQ_FILE_TYPES, UNREADABLE, Prepared, Unfit, prepare, sweep_temp
+from .fit import QQ_FILE_TYPES, TOO_LARGE, UNREADABLE, Prepared, Unfit, prepare, sweep_temp
 from .formatting import (
     chunk,
     extract_face_ids,
@@ -21,7 +21,7 @@ from .formatting import (
     strip_leading_mentions,
     strip_reply_fallback,
 )
-from .matrix import MatrixClient, MatrixError
+from .matrix import MatrixClient, MatrixError, MediaTooLarge
 from .qq import QQClient, QQError
 from .ratelimit import RateLimiter
 from .store import Store
@@ -29,6 +29,8 @@ from .store import Store
 log = logging.getLogger(__name__)
 
 MAX_MEDIA_DOWNLOAD = 40 * 1024 * 1024
+# Matrix media held in memory for shrinking; the homeserver takes 50 MB uploads.
+MAX_MATRIX_MEDIA = 64 * 1024 * 1024
 QQ_FORMAT_REFUSED = 40034002
 # How long the send queue waits for media before letting later messages pass.
 MEDIA_WAIT = 20.0
@@ -351,7 +353,10 @@ class Relay:
         url = content.get("url") or (content.get("file") or {}).get("url")
         if not url:
             raise Unfit(UNREADABLE)
-        data = await self.matrix.download(url)
+        try:
+            data = await self.matrix.download(url, MAX_MATRIX_MEDIA)
+        except MediaTooLarge as exc:
+            raise Unfit(TOO_LARGE) from exc
         info = content.get("info") or {}
         prepared = await prepare(
             data,

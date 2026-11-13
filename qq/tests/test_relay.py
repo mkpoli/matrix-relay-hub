@@ -37,7 +37,7 @@ class FakeMatrix:
     async def member(self, room_id, user_id):
         return {"displayname": "Alice"}
 
-    async def download(self, url):
+    async def download(self, url, max_bytes=None):
         return b"image"
 
 

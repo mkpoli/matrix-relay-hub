@@ -19,14 +19,13 @@ from .config import Config
 from .matrix import MatrixClient, MatrixError
 from .qq import QQClient, QQError
 from .ratelimit import RateLimiter
-from .relay import MAX_QQ_UPLOAD
+from .fit import Unfit, prepare
 from .store import Store
 
 log = logging.getLogger(__name__)
 
 HISTORY_TIMEZONE = ZoneInfo("Asia/Shanghai")
 PREAMBLE = "字形大圖譜 · 補發先前的圖片"
-QQ_IMAGE = 1
 
 
 @dataclass(frozen=True)
@@ -88,14 +87,21 @@ async def _send(
     except Exception as exc:
         log.warning("cannot download %s: %s", picture.event_id, exc)
         return False
-    if len(data) > MAX_QQ_UPLOAD:
-        log.warning("image %s is too large for QQ", picture.event_id)
+    info = content.get("info") or {}
+    try:
+        prepared = await prepare(
+            data,
+            "m.image",
+            str(info.get("mimetype") or ""),
+            str(content.get("filename") or content.get("body") or "image.png"),
+        )
+    except Unfit as exc:
+        log.warning("image %s: %s", picture.event_id, exc)
         return False
-    filename = str(content.get("body") or "image.png")
     for attempt in range(3):
         try:
             file_info = await qq.upload_group_media(
-                cfg.qq.group, data, filename, QQ_IMAGE
+                cfg.qq.group, prepared.data, prepared.filename, prepared.file_type
             )
             response = await qq.send_group_media(cfg.qq.group, file_info)
         except QQError as exc:

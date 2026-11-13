@@ -13,6 +13,7 @@ import uuid
 from pathlib import Path
 
 from .config import Config
+from .fit import QQ_FILE_TYPES, UNREADABLE, Prepared, Unfit, prepare, sweep_temp
 from .formatting import (
     chunk,
     extract_face_ids,
@@ -28,10 +29,9 @@ from .store import Store
 log = logging.getLogger(__name__)
 
 MAX_MEDIA_DOWNLOAD = 40 * 1024 * 1024
-# QQ takes at most 5 MB of binary per direct upload; base64 inflates by a third.
-MAX_QQ_UPLOAD = 3_500_000
-
-QQ_FILE_TYPES = {"m.image": 1, "m.video": 2, "m.audio": 3, "m.file": 4}
+QQ_FORMAT_REFUSED = 40034002
+# How long the send queue waits for media before letting later messages pass.
+MEDIA_WAIT = 20.0
 
 FACE_MIRRORS = (
     "https://face.viki.moe/png/{face_id}.png",
@@ -73,11 +73,16 @@ class Relay:
         self._joined: set[tuple[str, str]] = set()
         self._names: dict[tuple[str, str], tuple[str, float]] = {}
         self._queue: asyncio.Queue[dict] = asyncio.Queue()
+        # Media keeps its place in the send queue but is downloaded and shrunk
+        # in these lanes, so a long transcode holds up neither text nor images.
+        self._images: asyncio.Queue[dict] = asyncio.Queue()
+        self._videos: asyncio.Queue[dict] = asyncio.Queue()
         self._global = RateLimiter(60)
         self._group_limiters: dict[str, RateLimiter] = {}
         self._tasks: list[asyncio.Task] = []
 
     async def start(self) -> None:
+        await asyncio.to_thread(sweep_temp)
         await self._ensure_bot()
         await self._ensure_avatar()
         for room in self.cfg.rooms:
@@ -88,6 +93,8 @@ class Relay:
         self._tasks = [
             asyncio.create_task(self._consume_matrix()),
             asyncio.create_task(self._send_loop()),
+            asyncio.create_task(self._prepare_loop(self._images)),
+            asyncio.create_task(self._prepare_loop(self._videos)),
             asyncio.create_task(self._retry_rooms()),
         ]
 
@@ -215,7 +222,7 @@ class Relay:
                     }
                 )
         elif msgtype in QQ_FILE_TYPES:
-            self._queue.put_nowait(
+            self._enqueue_media(
                 {
                     "kind": "media",
                     "group": self.cfg.qq.group,
@@ -225,6 +232,13 @@ class Relay:
                     "content": content,
                 }
             )
+
+    def _enqueue_media(self, job: dict) -> None:
+        loop = asyncio.get_running_loop()
+        job = {**job, "ready": loop.create_future(), "sent": asyncio.Event()}
+        self._queue.put_nowait(job)
+        lane = self._videos if job["content"].get("msgtype") == "m.video" else self._images
+        lane.put_nowait(job)
 
     def _ignored(self, sender: str) -> bool:
         if sender == self.bot_mxid or sender.startswith("@qq_"):
@@ -316,39 +330,86 @@ class Relay:
             log.info("sent to QQ group %s: %s", job["group"], response.get("id"))
             return
 
-    async def _send_media(self, job: dict) -> None:
+    async def _prepare_loop(self, lane: asyncio.Queue[dict]) -> None:
+        while True:
+            job = await lane.get()
+            ready: asyncio.Future = job["ready"]
+            try:
+                result: Prepared | str = await self._prepare_media(job)
+            except Unfit as exc:
+                result = str(exc)
+            except Exception:
+                log.exception("failed to prepare media for QQ")
+                result = UNREADABLE
+            if not ready.done():
+                ready.set_result(result)
+            # One prepared file per lane at a time keeps memory bounded.
+            await job["sent"].wait()
+
+    async def _prepare_media(self, job: dict) -> Prepared:
         content = job["content"]
-        msgtype = content.get("msgtype")
         url = content.get("url") or (content.get("file") or {}).get("url")
         if not url:
+            raise Unfit(UNREADABLE)
+        data = await self.matrix.download(url)
+        info = content.get("info") or {}
+        prepared = await prepare(
+            data,
+            str(content.get("msgtype")),
+            str(info.get("mimetype") or ""),
+            str(content.get("filename") or content.get("body") or "file"),
+            force=bool(job.get("force")),
+        )
+        if len(prepared.data) != len(data):
+            log.info(
+                "shrank %s from %d to %d bytes", job["event_id"], len(data), len(prepared.data)
+            )
+        return prepared
+
+    async def _send_media(self, job: dict) -> None:
+        ready: asyncio.Future = job["ready"]
+        if not ready.done():
+            await asyncio.wait({ready}, timeout=MEDIA_WAIT)
+        if not ready.done():
+            # Let later messages pass; the media rejoins the queue once ready.
+            ready.add_done_callback(lambda _: self._queue.put_nowait(job))
             return
         try:
-            data = await self.matrix.download(url)
-        except Exception as exc:
-            log.warning("cannot download %s: %s", url, exc)
-            return
-        if len(data) > MAX_QQ_UPLOAD:
+            await self._deliver_media(job, ready.result())
+        finally:
+            job["sent"].set()
+
+    async def _deliver_media(self, job: dict, result: Prepared | str) -> None:
+        if isinstance(result, str):
             name = await self._display_name(job["room"], job["sender"])
+            kind = str(job["content"].get("msgtype", "m.file"))[2:]
             await self._send_text(
                 {
                     "group": job["group"],
                     "room": job["room"],
                     "event_id": job["event_id"],
-                    "text": f"{name}: [{msgtype[2:]} too large for QQ]",
+                    "text": f"{name}: [{kind} {result}]",
                     "reference": None,
                 }
             )
             return
-        file_type = QQ_FILE_TYPES.get(msgtype, 4)
-        filename = str(content.get("body") or f"file{file_type}")
         if not await self._wait_limits(job["group"]):
             return
         try:
             file_info = await self.qq.upload_group_media(
-                job["group"], data, filename, file_type
+                job["group"], result.data, result.filename, result.file_type
             )
             response = await self.qq.send_group_media(job["group"], file_info)
         except QQError as exc:
+            if exc.code == QQ_FORMAT_REFUSED and not job.get("force"):
+                log.info("QQ refused the format of %s; re-encoding", job["event_id"])
+                retry = {
+                    key: value
+                    for key, value in job.items()
+                    if key not in ("ready", "sent")
+                }
+                self._enqueue_media({**retry, "force": True})
+                return
             log.warning(
                 "cannot send media to %s: %s (trace %s)",
                 job["group"],

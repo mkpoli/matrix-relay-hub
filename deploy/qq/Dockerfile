@@ -6,7 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src
 
-RUN pip install --no-cache-dir aiohttp==3.14.5
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir aiohttp==3.14.5 pillow==13.0.0
 
 WORKDIR /app
 COPY --chown=10001:10001 qq/src/qq_bridge/ /app/src/qq_bridge/

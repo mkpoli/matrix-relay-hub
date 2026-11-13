@@ -3,7 +3,7 @@ name = "qq-bridge"
 version = "0.1.0"
 description = "Matrix bridge for QQ official bots"
 requires-python = ">=3.12"
-dependencies = ["aiohttp>=3.10"]
+dependencies = ["aiohttp>=3.10", "pillow>=11"]
 
 [dependency-groups]
 dev = ["pytest>=8"]

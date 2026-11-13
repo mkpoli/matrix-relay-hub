@@ -1,6 +1,7 @@
 import asyncio
 
 from qq_bridge.config import Config, MatrixConfig, QQConfig, RoomConfig
+from qq_bridge.formatting import chunk
 from qq_bridge.relay import Relay
 from qq_bridge.store import Store
 
@@ -283,4 +284,190 @@ def test_slow_media_lets_later_messages_pass(tmp_path, monkeypatch):
         assert relay._queue.get_nowait() is job
 
     asyncio.run(go())
+    store.close()
+
+
+
+def _pending(store):
+    return [row[0] for row in store.conn.execute("SELECT seq FROM pending ORDER BY seq")]
+
+
+async def _run_loops(relay, until):
+    """Run the Matrix consumer and the send loop until `until()` holds, then stop
+    them the way a shutdown does."""
+    tasks = [
+        asyncio.create_task(relay._consume_matrix()),
+        asyncio.create_task(relay._send_loop()),
+    ]
+    for _ in range(200):
+        await asyncio.sleep(0)
+        if until():
+            break
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def test_event_cut_off_by_a_restart_is_sent_afterwards(tmp_path):
+    class HangingQQ(FakeQQ):
+        async def send_group_text(self, *args, **kwargs):
+            await asyncio.Event().wait()
+
+    first, store = make_relay(tmp_path, HangingQQ())
+    (seq,) = store.accept_transaction("t1", [text_event()])
+    first.incoming.put_nowait((seq, text_event()))
+    # The send is under way when the bridge stops.
+    asyncio.run(_run_loops(first, lambda: first._queue.empty() and first._outstanding))
+    assert _pending(store) == [seq]
+
+    qq = FakeQQ()
+    second = Relay(first.cfg, store, FakeMatrix(), qq)
+    second._labels = dict(first._labels)
+
+    async def after_restart():
+        second._claim_pending(idle=0)
+        await _run_loops(second, lambda: qq.sent)
+
+    asyncio.run(after_restart())
+    assert [content for _, content, _ in qq.sent] == ["Alice: hello"]
+    assert _pending(store) == []
+    store.close()
+
+
+def test_long_text_resumes_after_the_parts_already_sent(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    event = text_event("x" * 4000)
+    (seq,) = store.accept_transaction("t1", [event])
+    store.add_message("Q0", "G", ROOM, "$e", None, "matrix")  # part 1 went out
+    relay.incoming.put_nowait((seq, event))
+    asyncio.run(_run_loops(relay, lambda: not _pending(store)))
+    parts = chunk("Alice: " + "x" * 4000)
+    assert [content for _, content, _ in qq.sent] == parts[1:]
+    assert _pending(store) == []
+    store.close()
+
+
+def test_event_already_sent_is_not_sent_again(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    (seq,) = store.accept_transaction("t1", [text_event()])
+    store.add_message("Q1", "G", ROOM, "$e", None, "matrix")
+    relay.incoming.put_nowait((seq, text_event()))
+    asyncio.run(_run_loops(relay, lambda: not _pending(store)))
+    assert qq.sent == []
+    assert _pending(store) == []
+    store.close()
+
+
+def _failing_qq(status):
+    from qq_bridge.qq import QQError
+
+    class FailingQQ(FakeQQ):
+        async def send_group_text(self, *args, **kwargs):
+            raise QQError(status, "failure", status=status)
+
+    return FailingQQ()
+
+
+def test_outage_keeps_the_event_for_retry(tmp_path):
+    relay, store = make_relay(tmp_path, _failing_qq(502))
+    (seq,) = store.accept_transaction("t1", [text_event()])
+    relay.incoming.put_nowait((seq, text_event()))
+    asyncio.run(_run_loops(relay, lambda: relay._keep and not relay._outstanding))
+    asyncio.run(_run_loops(relay, lambda: False))
+    assert _pending(store) == [seq]
+    store.close()
+
+
+def test_permanent_refusal_clears_the_event(tmp_path):
+    relay, store = make_relay(tmp_path, _failing_qq(400))
+    (seq,) = store.accept_transaction("t1", [text_event()])
+    relay.incoming.put_nowait((seq, text_event()))
+    asyncio.run(_run_loops(relay, lambda: not _pending(store)))
+    assert _pending(store) == []
+    store.close()
+
+
+def test_long_text_is_finished_after_its_last_part(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    event = text_event("x" * 4000)
+    (seq,) = store.accept_transaction("t1", [event])
+
+    async def go():
+        relay.incoming.put_nowait((seq, event))
+        consumer = asyncio.create_task(relay._consume_matrix())
+        for _ in range(10):
+            await asyncio.sleep(0)
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+        assert relay._queue.qsize() > 1
+        relay._finish(relay._queue.get_nowait())
+        assert _pending(store) == [seq]
+        while not relay._queue.empty():
+            relay._finish(relay._queue.get_nowait())
+        assert _pending(store) == []
+
+    asyncio.run(go())
+    store.close()
+
+
+def test_later_parts_wait_when_an_earlier_part_fails(tmp_path):
+    from qq_bridge.qq import QQError
+
+    class FirstFails(FakeQQ):
+        async def send_group_text(self, group, content, **kwargs):
+            if not self.sent and not getattr(self, "failed", False):
+                self.failed = True
+                raise QQError(502, "bad gateway", status=502)
+            return await super().send_group_text(group, content, **kwargs)
+
+    qq = FirstFails()
+    relay, store = make_relay(tmp_path, qq)
+    event = text_event("x" * 4000)
+    (seq,) = store.accept_transaction("t1", [event])
+    relay.incoming.put_nowait((seq, event))
+    asyncio.run(_run_loops(relay, lambda: relay._queue.empty() and not relay._outstanding))
+    assert qq.sent == [] and _pending(store) == [seq]
+
+    async def retry():
+        relay._claim_pending(idle=0)
+        await _run_loops(relay, lambda: not _pending(store))
+
+    asyncio.run(retry())
+    assert [content for _, content, _ in qq.sent] == chunk("Alice: " + "x" * 4000)
+    store.close()
+
+
+def test_failed_notice_keeps_its_event(tmp_path):
+    relay, store = make_relay(tmp_path, _failing_qq(503))
+    event = {**text_event(), "content": {"msgtype": "m.image", "body": "a.png"}}
+    (seq,) = store.accept_transaction("t1", [event])
+
+    async def go():
+        relay._current = seq
+        relay._enqueue_media({"kind": "media", "group": "G", "room": ROOM, "event_id": "$e",
+                              "sender": "@alice:example.org", "content": event["content"]})
+        relay._current = None
+        relay._outstanding.setdefault(seq, 1)
+        job = relay._queue.get_nowait()
+        job["ready"].set_result("not accepted by QQ")
+        await relay._send_media(job)
+        relay._finish(job)
+
+    asyncio.run(go())
+    assert _pending(store) == [seq]
+    store.close()
+
+
+def test_claimed_event_is_not_queued_twice(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    store.accept_transaction("t1", [text_event()])
+
+    async def go():
+        relay._claim_pending(idle=0)
+        relay._claim_pending(idle=0)
+
+    asyncio.run(go())
+    assert relay.incoming.qsize() == 1
     store.close()

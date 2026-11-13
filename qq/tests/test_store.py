@@ -27,8 +27,9 @@ def test_replayed_history_is_recorded_once(tmp_path):
 
 def test_transaction_dedup(tmp_path):
     store = Store(tmp_path / "state.sqlite3")
-    assert store.seen_transaction("t1") is False
-    assert store.seen_transaction("t1") is True
+    assert store.accept_transaction("t1", [{"event_id": "$a"}]) == [1]
+    assert store.accept_transaction("t1", [{"event_id": "$a"}]) is None
+    assert store.claim_pending(max_age=3600, max_attempts=3) == [(1, {"event_id": "$a"})]
     store.close()
 
 
@@ -37,4 +38,21 @@ def test_face_cache(tmp_path):
     assert store.face_mxc(0) is None
     store.set_face(0, "mxc://example.org/face")
     assert store.face_mxc(0) == "mxc://example.org/face"
+    store.close()
+
+
+def test_pending_events_are_claimed_until_finished_or_given_up(tmp_path):
+    store = Store(tmp_path / "s.sqlite3")
+    first, second, third = store.accept_transaction(
+        "t", [{"event_id": "$a"}, {"event_id": "$b"}, {"event_id": "$c"}]
+    )
+    store.finish_pending(first)
+    claim = lambda **kw: [seq for seq, _ in store.claim_pending(max_age=3600, max_attempts=1, **kw)]
+    assert claim(busy={third}) == [second]
+    assert claim(idle=60) == []  # third arrived just now
+    assert store.dropped_pending == 1  # second has used its one attempt
+    assert claim() == [third]
+    store.conn.execute("UPDATE pending SET ts = ts - 7200")
+    assert claim() == []
+    assert store.conn.execute("SELECT count(*) FROM pending").fetchone()[0] == 0
     store.close()

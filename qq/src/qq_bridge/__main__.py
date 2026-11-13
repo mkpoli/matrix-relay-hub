@@ -70,6 +70,7 @@ async def run(cfg: config.Config) -> None:
         relay = Relay(cfg, store, matrix, qq)
         app = AppService(cfg.matrix, store, relay.incoming)
         await relay.start()
+        relay.resume_pending()
         await app.start()
 
         qq_task: asyncio.Task | None = None

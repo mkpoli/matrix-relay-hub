@@ -1,7 +1,9 @@
-"""SQLite state: member names, message ids, replayed events, transaction ids."""
+"""SQLite state: member names, message ids, replayed events, transactions and
+Matrix events still on their way to QQ."""
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -41,6 +43,13 @@ CREATE TABLE IF NOT EXISTS transactions (
     ts INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS pending (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    event TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS faces (
     face_id INTEGER PRIMARY KEY,
     mxc TEXT NOT NULL,
@@ -55,7 +64,8 @@ class Store:
         self.conn = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
+        # FULL, so a transaction acknowledged to the homeserver survives power loss.
+        self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.executescript(SCHEMA)
         # Bindings moved into the configuration; a state file from the single-room
         # layout keeps its reply map under a table this version never reads.
@@ -123,6 +133,13 @@ class Store:
         ).fetchone()
         return row["event_id"] if row else None
 
+    def sent_count(self, event_id: str) -> int:
+        """QQ messages posted for a Matrix event (a long text posts several)."""
+        return self.conn.execute(
+            "SELECT count(*) FROM messages WHERE event_id = ? AND direction = 'matrix'",
+            (event_id,),
+        ).fetchone()[0]
+
     def qq_for_event(self, event_id: str) -> sqlite3.Row | None:
         return self.conn.execute(
             "SELECT * FROM messages WHERE event_id = ? AND direction = 'matrix'",
@@ -172,13 +189,69 @@ class Store:
 
     # -- transactions -----------------------------------------------------
 
-    def seen_transaction(self, txn_id: str) -> bool:
-        if self.conn.execute(
-            "SELECT 1 FROM transactions WHERE txn_id = ?", (txn_id,)
-        ).fetchone():
-            return True
-        self.conn.execute(
-            "INSERT INTO transactions(txn_id, ts) VALUES(?, ?)",
-            (txn_id, int(time.time())),
-        )
-        return False
+    def accept_transaction(self, txn_id: str, events: list[dict]) -> list[int] | None:
+        """Record a transaction and keep its events until they reach QQ.
+
+        Returns each event's pending id, or None for a transaction already seen.
+        Both happen in one database transaction, so a crash cannot lose events
+        the homeserver was told were delivered.
+        """
+        now = int(time.time())
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            if self.conn.execute(
+                "SELECT 1 FROM transactions WHERE txn_id = ?", (txn_id,)
+            ).fetchone():
+                self.conn.execute("COMMIT")
+                return None
+            self.conn.execute(
+                "INSERT INTO transactions(txn_id, ts) VALUES(?, ?)", (txn_id, now)
+            )
+            seqs = [
+                self.conn.execute(
+                    "INSERT INTO pending(event, ts) VALUES(?, ?)",
+                    (json.dumps(event, ensure_ascii=False), now),
+                ).lastrowid
+                for event in events
+            ]
+            self.conn.execute("COMMIT")
+        except BaseException:
+            self.conn.execute("ROLLBACK")
+            raise
+        return seqs
+
+    def claim_pending(
+        self,
+        *,
+        max_age: int,
+        max_attempts: int,
+        idle: int = 0,
+        busy: set[int] | frozenset[int] = frozenset(),
+    ) -> list[tuple[int, dict]]:
+        """Unfinished events to try again, oldest first, counting the attempt.
+
+        Rows older than `max_age` or tried `max_attempts` times are dropped;
+        rows received less than `idle` seconds ago, or in `busy`, are left alone.
+        """
+        now = int(time.time())
+        dropped = self.conn.execute(
+            "DELETE FROM pending WHERE ts < ? OR attempts >= ?",
+            (now - max_age, max_attempts),
+        ).rowcount
+        rows = [
+            row
+            for row in self.conn.execute(
+                "SELECT seq, event FROM pending WHERE ts <= ? ORDER BY seq",
+                (now - idle,),
+            )
+            if row["seq"] not in busy
+        ]
+        for row in rows:
+            self.conn.execute(
+                "UPDATE pending SET attempts = attempts + 1 WHERE seq = ?", (row["seq"],)
+            )
+        self.dropped_pending = dropped
+        return [(row["seq"], json.loads(row["event"])) for row in rows]
+
+    def finish_pending(self, seq: int) -> None:
+        self.conn.execute("DELETE FROM pending WHERE seq = ?", (seq,))

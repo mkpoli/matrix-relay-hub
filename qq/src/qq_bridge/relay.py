@@ -32,11 +32,22 @@ MAX_MEDIA_DOWNLOAD = 40 * 1024 * 1024
 QQ_FORMAT_REFUSED = 40034002
 # How long the send queue waits for media before letting later messages pass.
 MEDIA_WAIT = 20.0
+# Events not yet delivered (cut off by a restart, or refused by a QQ or network
+# failure that may pass) are tried again every PENDING_RETRY seconds, at most
+# PENDING_ATTEMPTS times and for PENDING_MAX_AGE seconds after they arrived.
+PENDING_MAX_AGE = 24 * 3600
+PENDING_ATTEMPTS = 8
+PENDING_RETRY = 15 * 60
 
 FACE_MIRRORS = (
     "https://face.viki.moe/png/{face_id}.png",
     "https://cdn.jsdelivr.net/gh/vikiboss/face@main/face/png/{face_id}.png",
 )
+
+
+def _transient(exc: QQError) -> bool:
+    """A refusal that may pass: QQ overloaded, rate limited or failing."""
+    return exc.rate_limited or (exc.status or 0) >= 500
 
 
 def is_edit(content: dict) -> bool:
@@ -60,7 +71,13 @@ class Relay:
         self.qq = qq
         self.domain = cfg.matrix.domain
         self.bot_mxid = cfg.matrix.bot_mxid
-        self.incoming: asyncio.Queue[dict] = asyncio.Queue()
+        # (pending id, event) pairs from the appservice; the id is None for
+        # events that were never stored.
+        self.incoming: asyncio.Queue[tuple[int | None, dict]] = asyncio.Queue()
+        self._current: int | None = None
+        self._outstanding: dict[int, int] = {}
+        self._keep: set[int] = set()
+        self._claimed: set[int] = set()
         self._rooms: dict[str, str] = {}
         self._labels: dict[str, str] = {}
         self._incoming: str | None = None
@@ -97,6 +114,41 @@ class Relay:
             asyncio.create_task(self._prepare_loop(self._videos)),
             asyncio.create_task(self._retry_rooms()),
         ]
+
+    def resume_pending(self) -> None:
+        """Queue the events a previous run left undelivered; only the bridge
+        itself calls this, so a CLI run beside it never sends them twice."""
+        self._claim_pending(idle=0)
+        self._tasks.append(asyncio.create_task(self._retry_pending()))
+
+    def _claim_pending(self, idle: int) -> None:
+        busy = set(self._outstanding) | self._claimed
+        if self._current is not None:
+            busy.add(self._current)
+        items = self.store.claim_pending(
+            max_age=PENDING_MAX_AGE,
+            max_attempts=PENDING_ATTEMPTS,
+            idle=idle,
+            busy=busy,
+        )
+        if self.store.dropped_pending:
+            log.warning(
+                "gave up on %d Matrix events that never reached QQ",
+                self.store.dropped_pending,
+            )
+        if items:
+            log.info("retrying %d Matrix events not yet delivered", len(items))
+        for item in items:
+            self._claimed.add(item[0])
+            self.incoming.put_nowait(item)
+
+    async def _retry_pending(self) -> None:
+        while True:
+            await asyncio.sleep(PENDING_RETRY)
+            try:
+                self._claim_pending(idle=PENDING_RETRY)
+            except Exception:
+                log.exception("cannot read the pending events")
 
     async def stop(self) -> None:
         for task in self._tasks:
@@ -159,11 +211,59 @@ class Relay:
 
     async def _consume_matrix(self) -> None:
         while True:
-            event = await self.incoming.get()
+            seq, event = await self.incoming.get()
+            if seq is not None:
+                self._claimed.discard(seq)
+                if seq in self._outstanding:
+                    # Already on its way to QQ; a second copy would send twice.
+                    continue
+            self._current = seq
+            if seq is not None:
+                self._outstanding[seq] = 0
             try:
                 await self.handle_matrix_event(event)
             except Exception:
                 log.exception("failed to relay a Matrix event")
+            finally:
+                self._current = None
+            if seq is not None and not self._outstanding.get(seq):
+                self._outstanding.pop(seq, None)
+                self._settle(seq)
+
+    def _put(self, job: dict) -> None:
+        """Queue a job for QQ, counting it against the event it came from."""
+        if self._current is not None and "pending" not in job:
+            job["pending"] = self._current
+        seq = job.get("pending")
+        if seq is not None:
+            self._outstanding[seq] = self._outstanding.get(seq, 0) + 1
+        self._queue.put_nowait(job)
+
+    def _finish(self, job: dict) -> None:
+        seq = job.get("pending")
+        if seq is None:
+            return
+        left = self._outstanding.get(seq, 1) - 1
+        if left > 0:
+            self._outstanding[seq] = left
+            return
+        self._outstanding.pop(seq, None)
+        self._settle(seq)
+
+    def _retry_later(self, job: dict | None = None) -> None:
+        """Keep the event that produced `job` (or the one being handled) for retry."""
+        seq = job.get("pending") if job is not None else self._current
+        if seq is not None:
+            self._keep.add(seq)
+
+    def _settle(self, seq: int) -> None:
+        if seq in self._keep:
+            self._keep.discard(seq)
+            return
+        try:
+            self.store.finish_pending(seq)
+        except Exception:
+            log.exception("cannot clear pending event %s", seq)
 
     async def handle_matrix_event(self, event: dict) -> None:
         room_id = event.get("room_id")
@@ -183,6 +283,9 @@ class Relay:
             return
         label = self._labels.get(room_id)
         if label is None:
+            if len(self._rooms) < len(self.cfg.rooms):
+                # A configured room may not be resolved yet; try again later.
+                self._retry_later()
             return
         content = event.get("content") or {}
         if is_edit(content):
@@ -192,8 +295,12 @@ class Relay:
         event_id = event.get("event_id", "")
         if self.cfg.ignore_notices and msgtype == "m.notice":
             return
+        # A long text posts several QQ messages; after a restart only the parts
+        # not yet posted are sent.
+        sent = self.store.sent_count(event_id) if event_id else 0
         if event_id and (
-            self.store.qq_for_event(event_id) or self.store.relayed_qq(event_id)
+            self.store.relayed_qq(event_id)
+            or (sent and msgtype not in ("m.text", "m.emote"))
         ):
             log.debug("ignoring an event already carried to QQ: %s", event_id)
             return
@@ -211,7 +318,9 @@ class Relay:
             )
             reference = self._reply_reference(event)
             for index, part in enumerate(chunk(text)):
-                self._queue.put_nowait(
+                if index < sent:
+                    continue
+                self._put(
                     {
                         "kind": "text",
                         "group": self.cfg.qq.group,
@@ -236,7 +345,7 @@ class Relay:
     def _enqueue_media(self, job: dict) -> None:
         loop = asyncio.get_running_loop()
         job = {**job, "ready": loop.create_future(), "sent": asyncio.Event()}
-        self._queue.put_nowait(job)
+        self._put(job)
         lane = self._videos if job["content"].get("msgtype") == "m.video" else self._images
         lane.put_nowait(job)
 
@@ -292,13 +401,23 @@ class Relay:
     async def _send_loop(self) -> None:
         while True:
             job = await self._queue.get()
+            if job.get("pending") in self._keep:
+                # An earlier part of this event failed; parts must reach QQ in
+                # order, so the rest waits for the event's retry.
+                self._finish(job)
+                continue
+            deferred = False
             try:
                 if job["kind"] == "text":
                     await self._send_text(job)
                 else:
-                    await self._send_media(job)
+                    deferred = await self._send_media(job)
             except Exception:
                 log.exception("failed to send to QQ")
+                self._retry_later(job)
+            # A cancelled send (shutdown) skips this, so its event is resumed.
+            if not deferred:
+                self._finish(job)
 
     async def _wait_limits(self, group: str) -> bool:
         limiter = self._group_limiters.setdefault(group, RateLimiter(20, 1000))
@@ -311,6 +430,7 @@ class Relay:
 
     async def _send_text(self, job: dict) -> None:
         if not await self._wait_limits(job["group"]):
+            self._retry_later(job)
             return
         for attempt in range(3):
             try:
@@ -325,6 +445,8 @@ class Relay:
                     await asyncio.sleep(3 * (attempt + 1))
                     continue
                 log.warning("cannot send to %s: %s", job["group"], exc)
+                if _transient(exc):
+                    self._retry_later(job)
                 return
             self._remember_sent(job["group"], job["room"], job["event_id"], response)
             log.info("sent to QQ group %s: %s", job["group"], response.get("id"))
@@ -366,18 +488,20 @@ class Relay:
             )
         return prepared
 
-    async def _send_media(self, job: dict) -> None:
+    async def _send_media(self, job: dict) -> bool:
+        """Send prepared media; True when it was put back to wait for preparation."""
         ready: asyncio.Future = job["ready"]
         if not ready.done():
             await asyncio.wait({ready}, timeout=MEDIA_WAIT)
         if not ready.done():
             # Let later messages pass; the media rejoins the queue once ready.
             ready.add_done_callback(lambda _: self._queue.put_nowait(job))
-            return
+            return True
         try:
             await self._deliver_media(job, ready.result())
         finally:
             job["sent"].set()
+        return False
 
     async def _deliver_media(self, job: dict, result: Prepared | str) -> None:
         if isinstance(result, str):
@@ -390,10 +514,12 @@ class Relay:
                     "event_id": job["event_id"],
                     "text": f"{name}: [{kind} {result}]",
                     "reference": None,
+                    "pending": job.get("pending"),
                 }
             )
             return
         if not await self._wait_limits(job["group"]):
+            self._retry_later(job)
             return
         try:
             file_info = await self.qq.upload_group_media(
@@ -416,6 +542,8 @@ class Relay:
                 exc,
                 exc.trace_id,
             )
+            if _transient(exc):
+                self._retry_later(job)
             return
         self._remember_sent(job["group"], job["room"], job["event_id"], response)
         log.info("sent media to QQ group %s: %s", job["group"], response.get("id"))

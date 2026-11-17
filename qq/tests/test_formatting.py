@@ -85,6 +85,11 @@ def test_face_markup_uses_ext_text():
     assert replace_faces(raw) == "[满头问号]"
 
 
+def test_face_name_without_brackets_gains_them():
+    raw = '<faceType=6,faceId="14",ext="eyJ0ZXh0Ijoi5pac55y856yRIn0=">'
+    assert replace_faces(raw) == "[斜眼笑]"
+
+
 def test_unknown_face_is_labelled():
     assert replace_faces('<faceType=6,faceId="999",ext="eyJ0ZXh0IjoiIn0=">') == "[表情]"
 

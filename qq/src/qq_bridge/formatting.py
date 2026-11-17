@@ -50,7 +50,8 @@ def _face_label(ext: str) -> str:
 def _face_plain(face_id: str, ext: str) -> str:
     label = _face_label(ext)
     if label:
-        return label
+        # QQ sometimes supplies the name already bracketed; keep one pair.
+        return label if label.startswith("[") and label.endswith("]") else f"[{label}]"
     try:
         number = int(face_id)
     except (TypeError, ValueError):

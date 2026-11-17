@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS faces (
     mxc TEXT NOT NULL,
     updated INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -185,6 +190,22 @@ class Store:
             ON CONFLICT(face_id) DO UPDATE SET mxc = excluded.mxc, updated = excluded.updated
             """,
             (face_id, mxc, int(time.time())),
+        )
+
+    def clear_faces(self) -> None:
+        self.conn.execute("DELETE FROM faces")
+
+    def meta(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
         )
 
     # -- transactions -----------------------------------------------------

@@ -38,6 +38,10 @@ def test_face_cache(tmp_path):
     assert store.face_mxc(0) is None
     store.set_face(0, "mxc://example.org/face")
     assert store.face_mxc(0) == "mxc://example.org/face"
+    store.set_meta("face_source", "apng")
+    assert store.meta("face_source") == "apng"
+    store.clear_faces()
+    assert store.face_mxc(0) is None
     store.close()
 
 

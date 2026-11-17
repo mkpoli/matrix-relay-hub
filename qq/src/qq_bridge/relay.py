@@ -42,10 +42,17 @@ PENDING_MAX_AGE = 24 * 3600
 PENDING_ATTEMPTS = 8
 PENDING_RETRY = 15 * 60
 
+# The animated APNG when the mirror has one, then its static PNG. The bridge
+# uploads either as image/png; clients animate APNG on their own.
 FACE_MIRRORS = (
+    "https://face.viki.moe/apng/{face_id}.png",
+    "https://cdn.jsdelivr.net/gh/vikiboss/face@main/face/apng/{face_id}.png",
     "https://face.viki.moe/png/{face_id}.png",
     "https://cdn.jsdelivr.net/gh/vikiboss/face@main/face/png/{face_id}.png",
 )
+# Cache version for the face images above; a cached mxc from an older source
+# is dropped so a stale still cannot outlive the switch to APNG.
+FACE_SOURCE = "apng"
 
 
 def _transient(exc: QQError) -> bool:
@@ -103,6 +110,9 @@ class Relay:
 
     async def start(self) -> None:
         await asyncio.to_thread(sweep_temp)
+        if self.store.meta("face_source") != FACE_SOURCE:
+            self.store.clear_faces()
+            self.store.set_meta("face_source", FACE_SOURCE)
         await self._ensure_bot()
         await self._ensure_avatar()
         for room in self.cfg.rooms:

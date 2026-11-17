@@ -66,11 +66,11 @@ def make_relay(tmp_path, qq, rooms=None):
     return relay, store
 
 
-def text_event(body="hello", **extra):
+def text_event(body="hello", sender="@alice:example.org", **extra):
     content = {"msgtype": "m.text", "body": body, **extra}
     return {
         "room_id": ROOM,
-        "sender": "@alice:example.org",
+        "sender": sender,
         "type": "m.room.message",
         "event_id": "$e",
         "content": content,
@@ -88,7 +88,7 @@ def test_text_is_queued_with_label(tmp_path):
     )
     asyncio.run(relay.handle_matrix_event(text_event()))
     job = relay._queue.get_nowait()
-    assert job["text"] == "[in] Alice: hello"
+    assert job["text"] == "[M] [in] Alice: hello"
     assert job["group"] == "G"
     assert job["event_id"] == "$e"
     store.close()
@@ -97,7 +97,42 @@ def test_text_is_queued_with_label(tmp_path):
 def test_single_room_has_no_label(tmp_path):
     relay, store = make_relay(tmp_path, FakeQQ())
     asyncio.run(relay.handle_matrix_event(text_event()))
-    assert relay._queue.get_nowait()["text"] == "Alice: hello"
+    assert relay._queue.get_nowait()["text"] == "[M] Alice: hello"
+    store.close()
+
+
+def test_each_network_gets_its_tag(tmp_path):
+    relay, store = make_relay(
+        tmp_path,
+        FakeQQ(),
+        rooms=(
+            RoomConfig(alias="#in:example.org", label="in"),
+            RoomConfig(alias="#two:example.org", label="two"),
+        ),
+    )
+    for sender, tag in (
+        ("@discord_123:example.org", "D"),
+        ("@telegram_123:example.org", "T"),
+        ("@irc_alice:example.org", "I"),
+        ("@alice:example.org", "M"),
+    ):
+        asyncio.run(relay.handle_matrix_event(text_event(sender=sender)))
+        assert relay._queue.get_nowait()["text"] == f"[{tag}] [in] Alice: hello"
+    store.close()
+
+
+def test_join_emote_says_which_network(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    asyncio.run(
+        relay.handle_matrix_event(
+            text_event(
+                body="joined the server",
+                sender="@discord_9:example.org",
+                msgtype="m.emote",
+            )
+        )
+    )
+    assert relay._queue.get_nowait()["text"] == "[D] * Alice joined the server"
     store.close()
 
 
@@ -230,7 +265,7 @@ def test_media_that_cannot_fit_becomes_a_notice(tmp_path):
     relay, store = make_relay(tmp_path, qq)
     relay.matrix = FakeMatrix()
     _run_media(relay, {"msgtype": "m.video", "url": "mxc://x/y"}, "too long for QQ")
-    assert qq.sent[-1][1] == "Alice: [video too long for QQ]"
+    assert qq.sent[-1][1] == "[M] Alice: [video too long for QQ]"
     store.close()
 
 
@@ -329,7 +364,7 @@ def test_event_cut_off_by_a_restart_is_sent_afterwards(tmp_path):
         await _run_loops(second, lambda: qq.sent)
 
     asyncio.run(after_restart())
-    assert [content for _, content, _ in qq.sent] == ["Alice: hello"]
+    assert [content for _, content, _ in qq.sent] == ["[M] Alice: hello"]
     assert _pending(store) == []
     store.close()
 
@@ -342,7 +377,7 @@ def test_long_text_resumes_after_the_parts_already_sent(tmp_path):
     store.add_message("Q0", "G", ROOM, "$e", None, "matrix")  # part 1 went out
     relay.incoming.put_nowait((seq, event))
     asyncio.run(_run_loops(relay, lambda: not _pending(store)))
-    parts = chunk("Alice: " + "x" * 4000)
+    parts = chunk("[M] Alice: " + "x" * 4000)
     assert [content for _, content, _ in qq.sent] == parts[1:]
     assert _pending(store) == []
     store.close()
@@ -435,7 +470,7 @@ def test_later_parts_wait_when_an_earlier_part_fails(tmp_path):
         await _run_loops(relay, lambda: not _pending(store))
 
     asyncio.run(retry())
-    assert [content for _, content, _ in qq.sent] == chunk("Alice: " + "x" * 4000)
+    assert [content for _, content, _ in qq.sent] == chunk("[M] Alice: " + "x" * 4000)
     store.close()
 
 

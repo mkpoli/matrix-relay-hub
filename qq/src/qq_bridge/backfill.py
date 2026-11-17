@@ -22,6 +22,7 @@ from .matrix import MatrixClient, MatrixError
 from .qq import QQClient, QQError
 from .ratelimit import RateLimiter
 from .relay import is_edit
+from .sources import source_tag
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -121,7 +122,7 @@ async def _item_for(
     if store.relayed_qq(event_id) or store.qq_for_event(event_id):
         return None
     name = await names.get(room_id, sender)
-    prefix = f"[{_stamp(timestamp)}] [{label}] "
+    prefix = f"[{_stamp(timestamp)}] [{source_tag(sender)}] [{label}] "
     if msgtype == "m.emote":
         line = f"{prefix}* {name} {body}"
     else:

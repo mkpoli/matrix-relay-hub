@@ -24,6 +24,7 @@ from .formatting import (
 from .matrix import MatrixClient, MatrixError, MediaTooLarge
 from .qq import QQClient, QQError
 from .ratelimit import RateLimiter
+from .sources import source_tag
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -312,11 +313,12 @@ class Relay:
             if not body.strip():
                 return
             name = await self._display_name(room_id, sender)
+            source = f"[{source_tag(sender)}] "
             tag = f"[{label}] " if self._tagged else ""
             text = (
-                f"{tag}* {name} {body}"
+                f"{source}{tag}* {name} {body}"
                 if msgtype == "m.emote"
-                else f"{tag}{name}: {body}"
+                else f"{source}{tag}{name}: {body}"
             )
             reference = self._reply_reference(event)
             for index, part in enumerate(chunk(text)):
@@ -517,7 +519,7 @@ class Relay:
                     "group": job["group"],
                     "room": job["room"],
                     "event_id": job["event_id"],
-                    "text": f"{name}: [{kind} {result}]",
+                    "text": f"[{source_tag(job['sender'])}] {name}: [{kind} {result}]",
                     "reference": None,
                     "pending": job.get("pending"),
                 }

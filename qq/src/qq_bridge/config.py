@@ -58,6 +58,7 @@ class Config:
     ignore_notices: bool
     state_path: Path
     relay_reactions: bool = True
+    twitter: bool = True
 
 
 def _require(section: dict, key: str, where: str) -> str:
@@ -133,6 +134,13 @@ def load(path: str | Path) -> Config:
     if not isinstance(ignore_raw, list) or not all(isinstance(x, str) for x in ignore_raw):
         raise ConfigError("ignore_senders must be a list of strings")
 
+    twitter_raw = raw.get("twitter", {})
+    if not isinstance(twitter_raw, dict):
+        raise ConfigError("[twitter] must be a table")
+    twitter_enabled = twitter_raw.get("enabled", True)
+    if not isinstance(twitter_enabled, bool):
+        raise ConfigError("twitter.enabled must be a boolean")
+
     state = raw.get("state")
     state_path = Path(state) if state else path.parent / "state.sqlite3"
 
@@ -144,4 +152,5 @@ def load(path: str | Path) -> Config:
         ignore_notices=bool(raw.get("ignore_notices", True)),
         state_path=state_path,
         relay_reactions=bool(raw.get("relay_reactions", True)),
+        twitter=twitter_enabled,
     )

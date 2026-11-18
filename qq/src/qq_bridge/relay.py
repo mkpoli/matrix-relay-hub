@@ -12,6 +12,7 @@ import time
 import uuid
 from pathlib import Path
 
+from . import twitter
 from .config import Config
 from .fit import QQ_FILE_TYPES, TOO_LARGE, UNREADABLE, Prepared, Unfit, prepare, sweep_temp
 from .formatting import (
@@ -105,6 +106,9 @@ class Relay:
         self._joined: set[tuple[str, str]] = set()
         self._names: dict[tuple[str, str], tuple[str, float]] = {}
         self._queue: asyncio.Queue[dict] = asyncio.Queue()
+        # Link expansion runs beside the send loop so a slow FixTweet call does
+        # not hold up the conversation.
+        self._twitter: asyncio.Queue[dict] = asyncio.Queue()
         # Media keeps its place in the send queue but is downloaded and shrunk
         # in these lanes, so a long transcode holds up neither text nor images.
         self._images: asyncio.Queue[dict] = asyncio.Queue()
@@ -128,6 +132,7 @@ class Relay:
         self._tasks = [
             asyncio.create_task(self._consume_matrix()),
             asyncio.create_task(self._send_loop()),
+            asyncio.create_task(self._twitter_loop()),
             asyncio.create_task(self._prepare_loop(self._images)),
             asyncio.create_task(self._prepare_loop(self._videos)),
             asyncio.create_task(self._retry_rooms()),
@@ -248,7 +253,7 @@ class Relay:
                 self._outstanding.pop(seq, None)
                 self._settle(seq)
 
-    def _put(self, job: dict) -> None:
+    def _put(self, job: dict, queue: asyncio.Queue | None = None) -> None:
         """Queue a job for QQ, counting it against the event it came from."""
         if self._current is not None and "pending" not in job:
             job["pending"] = self._current
@@ -258,7 +263,11 @@ class Relay:
         event_id = job.get("event_id")
         if event_id:
             self._inflight_events[event_id] = self._inflight_events.get(event_id, 0) + 1
-        self._queue.put_nowait(job)
+        (queue or self._queue).put_nowait(job)
+
+    def _queue_twitter(self, job: dict) -> None:
+        """Queue a link expansion; it counts like any other job for the event."""
+        self._put(job, self._twitter)
 
     def _finish(self, job: dict) -> None:
         event_id = job.get("event_id")
@@ -342,6 +351,9 @@ class Relay:
             body = strip_reply_fallback(str(content.get("body", "")))
             if not body.strip():
                 return
+            links = twitter.find(body) if self.cfg.twitter else []
+            if links:
+                body = twitter.rewrite(body)
             name = await self._display_name(room_id, sender)
             source = f"[{source_tag(sender)}] "
             tag = f"[{label}] " if self._tagged else ""
@@ -362,6 +374,14 @@ class Relay:
                         "event_id": event_id,
                         "text": part,
                         "reference": reference if index == 0 else None,
+                    }
+                )
+            if links:
+                self._queue_twitter(
+                    {
+                        "group": self.cfg.qq.group,
+                        "link": links[0],
+                        "reply_id": None,
                     }
                 )
         elif msgtype in QQ_FILE_TYPES:
@@ -739,6 +759,135 @@ class Relay:
             self.store.add_message(
                 qq_id, group, room_id, sent[0] if sent else None, ref_idx, "qq"
             )
+            links = twitter.find(body) if self.cfg.twitter else []
+            if links:
+                self._queue_twitter(
+                    {
+                        "group": group,
+                        "link": links[0],
+                        "reply_id": qq_id or None,
+                    }
+                )
+
+    # -- link expansion ---------------------------------------------------
+
+    async def _twitter_loop(self) -> None:
+        while True:
+            job = await self._twitter.get()
+            delivered = False
+            try:
+                delivered = await self._expand_tweet(job)
+            except Exception:
+                log.exception("failed to expand a tweet")
+            if not delivered:
+                self._retry_later(job)
+            self._finish(job)
+
+    async def _expand_tweet(self, job: dict) -> bool:
+        """Expand one link; False asks the pending-event retry to keep it."""
+        link: twitter.Link = job["link"]
+        group = job["group"]
+        if self.store.tweet_recent(group, link.status, 600):
+            log.debug("tweet %s was expanded recently", link.status)
+            return True
+        post = await twitter.fetch(self.matrix.session, link)
+        if post is None:
+            # A deleted or protected post will not appear on a retry either.
+            return True
+        delivered = await self._send_tweet_post(post, group, job.get("reply_id"))
+        if delivered:
+            self.store.mark_tweet(group, link.status)
+        return delivered
+
+    async def _send_tweet_post(
+        self, post: twitter.Post, group: str, reply_id: str | None = None
+    ) -> bool:
+        """Send the post; True once its text reached QQ, whatever the pictures did.
+
+        A QQ-origin post answers the member's message with `msg_id` and a fresh
+        `msg_seq`, because the group API rejects proactive pushes and ignores
+        `message_reference`.
+        """
+        text = twitter.format_post(post)
+        seq = 1
+        delivered = False
+        for part in chunk(text):
+            if reply_id and seq > 5:
+                break
+            if not await self._wait_limits(group):
+                return delivered
+            for attempt in range(3):
+                try:
+                    await self.qq.send_group_text(
+                        group,
+                        part,
+                        msg_id=reply_id,
+                        msg_seq=seq,
+                    )
+                except QQError as exc:
+                    if exc.rate_limited and attempt < 2:
+                        await asyncio.sleep(3 * (attempt + 1))
+                        continue
+                    # A retry would repeat the chunks already in the group, so
+                    # settle once any text arrived and let the rest go.
+                    log.warning("cannot send an expanded tweet to %s: %s", group, exc)
+                    return delivered
+                break
+            else:
+                return delivered
+            delivered = True
+            if reply_id:
+                seq += 1
+        if not delivered:
+            return False
+        log.info("expanded tweet %s for %s", post.link.status, group)
+        if post.sensitive:
+            return True
+        for url in twitter.image_urls(post):
+            if reply_id and seq > 5:
+                break
+            downloaded = await twitter.download(self.matrix.session, url)
+            if downloaded is None:
+                continue
+            data, content_type = downloaded
+            suffix = {
+                "image/jpeg": ".jpg",
+                "image/png": ".png",
+                "image/webp": ".webp",
+                "image/gif": ".gif",
+            }.get(content_type, ".jpg")
+            try:
+                prepared = await prepare(data, "m.image", content_type, f"tweet{suffix}")
+            except Unfit as exc:
+                log.info("cannot prepare tweet picture %s: %s", url, exc)
+                continue
+            if not await self._wait_limits(group):
+                return True
+            for attempt in range(2):
+                try:
+                    info = await self.qq.upload_group_media(
+                        group, prepared.data, prepared.filename, prepared.file_type
+                    )
+                    await self.qq.send_group_media(
+                        group, info, msg_id=reply_id, msg_seq=seq
+                    )
+                except QQError as exc:
+                    if exc.code == QQ_FORMAT_REFUSED and attempt == 0:
+                        log.info("QQ refused the format of tweet picture %s; re-encoding", url)
+                        try:
+                            prepared = await prepare(
+                                data, "m.image", content_type, f"tweet{suffix}", force=True
+                            )
+                        except Unfit as unfit:
+                            log.info("cannot re-encode tweet picture %s: %s", url, unfit)
+                            break
+                        continue
+                    log.warning("cannot send tweet picture to %s: %s", group, exc)
+                    break
+                break
+            if reply_id:
+                seq += 1
+        return True
 
     async def _resolve_faces(self, content: str) -> dict[int, str]:
         if "<faceType=" not in content:

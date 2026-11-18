@@ -12,11 +12,17 @@ OTHER = "!other:example.org"
 class FakeQQ:
     def __init__(self):
         self.sent = []
+        self.media = []
+        self.text_replies = []
+        self.media_replies = []
         self.deleted = []
         self.delete_error = None
 
-    async def send_group_text(self, group, content, *, reference=None, msg_id=None):
+    async def send_group_text(
+        self, group, content, *, reference=None, msg_id=None, msg_seq=1
+    ):
         self.sent.append((group, content, reference))
+        self.text_replies.append((msg_id, msg_seq))
         return {
             "id": f"Q{len(self.sent)}",
             "ext_info": {"ref_idx": f"REF{len(self.sent)}"},
@@ -25,7 +31,9 @@ class FakeQQ:
     async def upload_group_media(self, group, data, filename, file_type):
         return "FILEINFO"
 
-    async def send_group_media(self, group, file_info):
+    async def send_group_media(self, group, file_info, *, msg_id=None, msg_seq=1):
+        self.media.append((group, file_info))
+        self.media_replies.append((msg_id, msg_seq))
         return {"id": "QM"}
 
     async def delete_group_message(self, group, message_id):
@@ -35,11 +43,19 @@ class FakeQQ:
 
 
 class FakeMatrix:
+    session = object()
+
     def __init__(self):
         self.sent = []
 
     async def member(self, room_id, user_id):
         return {"displayname": "Alice"}
+
+    async def register_user(self, localpart, displayname):
+        return f"@{localpart}:example.org"
+
+    async def set_displayname(self, user_id, displayname):
+        return None
 
     async def send_message(self, room_id, user_id, content):
         self.sent.append((room_id, user_id, content))
@@ -52,7 +68,7 @@ class FakeMatrix:
         return b"image"
 
 
-def make_relay(tmp_path, qq, rooms=None, *, relay_reactions=True):
+def make_relay(tmp_path, qq, rooms=None, *, relay_reactions=True, twitter=True):
     rooms = rooms or (RoomConfig(alias="#in:example.org", label="in"),)
     cfg = Config(
         matrix=MatrixConfig(
@@ -68,6 +84,7 @@ def make_relay(tmp_path, qq, rooms=None, *, relay_reactions=True):
         ignore_notices=True,
         state_path=tmp_path / "state.sqlite3",
         relay_reactions=relay_reactions,
+        twitter=twitter,
     )
     store = Store(cfg.state_path)
     relay = Relay(cfg, store, FakeMatrix(), qq)
@@ -771,4 +788,309 @@ def test_a_short_qq_text_keeps_its_markup_and_one_transaction(tmp_path):
     (payload,) = [content for _, _, content in relay.matrix.sent]
     assert payload["formatted_body"]
     assert payload["body"] == "hello @全体成员"
+    store.close()
+
+
+def _tweet_post(status="123"):
+    from qq_bridge import twitter
+
+    link = twitter.find(f"https://x.com/Alice/status/{status}")[0]
+    return twitter.Post(
+        handle="Alice",
+        name="Alice",
+        text="the post",
+        created=None,
+        link=link,
+        media=(),
+        quote=None,
+        poll=(),
+        sensitive=False,
+        replying_to=None,
+    )
+
+
+def test_twitter_link_is_rewritten_and_expanded(tmp_path, monkeypatch):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+
+    async def fake_fetch(session, link):
+        return _tweet_post(link.status)
+
+    monkeypatch.setattr("qq_bridge.relay.twitter.fetch", fake_fetch)
+    asyncio.run(
+        relay.handle_matrix_event(
+            text_event(body="see https://x.com/Alice/status/123")
+        )
+    )
+    text = relay._queue.get_nowait()["text"]
+    assert "https://fixupx.com/Alice/status/123" in text
+    assert "https://x.com/Alice" not in text
+
+    job = relay._twitter.get_nowait()
+    job["event_id"] = None
+    asyncio.run(relay._expand_tweet(job))
+    assert qq.sent[-1] == ("G", "[Twitter] Alice (@Alice)\n\nthe post\n\nhttps://fixupx.com/Alice/status/123", None)
+    store.close()
+
+
+def test_twitter_expansion_is_not_repeated(tmp_path, monkeypatch):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+
+    async def fake_fetch(session, link):
+        return _tweet_post(link.status)
+
+    monkeypatch.setattr("qq_bridge.relay.twitter.fetch", fake_fetch)
+    asyncio.run(
+        relay.handle_matrix_event(
+            text_event(body="https://x.com/Alice/status/123")
+        )
+    )
+    job = relay._twitter.get_nowait()
+    job["event_id"] = None
+    asyncio.run(relay._expand_tweet(job))
+    asyncio.run(relay._expand_tweet(job))
+    assert len(qq.sent) == 1
+    store.close()
+
+
+def test_twitter_can_be_switched_off(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ(), twitter=False)
+    asyncio.run(
+        relay.handle_matrix_event(
+            text_event(body="see https://x.com/Alice/status/123")
+        )
+    )
+    assert "https://x.com/Alice/status/123" in relay._queue.get_nowait()["text"]
+    assert relay._twitter.empty()
+    store.close()
+
+
+def test_twitter_link_from_qq_is_expanded_as_a_reply(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    relay._incoming = ROOM
+    asyncio.run(
+        relay._on_group_message(
+            {
+                "group_openid": "G",
+                "id": "Q7",
+                "author": {"member_openid": "m1", "username": "Bob"},
+                "content": "see https://x.com/Alice/status/123",
+            }
+        )
+    )
+    job = relay._twitter.get_nowait()
+    assert job["reply_id"] == "Q7"
+    assert job["link"].status == "123"
+    store.close()
+
+
+def test_config_loads_twitter_toggle(tmp_path):
+    from qq_bridge.config import load
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        """
+[matrix]
+homeserver = "http://hs"
+domain = "example.org"
+as_token = "as"
+hs_token = "hs"
+bot_mxid = "@qqbot:example.org"
+
+[qq]
+group = "G"
+incoming = "#in:example.org"
+
+[[room]]
+alias = "#in:example.org"
+label = "in"
+
+[twitter]
+enabled = false
+""",
+        encoding="utf-8",
+    )
+    assert load(cfg_path).twitter is False
+
+
+def _photo_post():
+    from qq_bridge import twitter
+
+    link = twitter.find("https://x.com/Alice/status/123")[0]
+    return twitter.Post(
+        handle="Alice",
+        name="Alice",
+        text="the post",
+        created=None,
+        link=link,
+        media=(
+            twitter.Media(
+                "photo", "https://pbs.twimg.com/media/a.png?name=orig", None
+            ),
+        ),
+        quote=None,
+        poll=(),
+        sensitive=False,
+        replying_to=None,
+    )
+
+
+def test_twitter_expansion_uploads_its_pictures(tmp_path, monkeypatch):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    png = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"
+        b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+    async def fake_download(session, url, max_bytes=0):
+        assert "name=large" in url
+        return png, "image/png"
+
+    monkeypatch.setattr("qq_bridge.relay.twitter.download", fake_download)
+    asyncio.run(relay._send_tweet_post(_photo_post(), "G", "Q7"))
+    assert qq.sent[0][1].startswith("[Twitter] Alice (@Alice)")
+    assert qq.text_replies == [("Q7", 1)]
+    assert qq.media == [("G", "FILEINFO")]
+    assert qq.media_replies == [("Q7", 2)]
+    store.close()
+
+
+def test_sensitive_twitter_post_skips_its_pictures(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    post = _photo_post()
+    post = post.__class__(**{**post.__dict__, "sensitive": True})
+    asyncio.run(relay._send_tweet_post(post, "G", None))
+    assert "[sensitive]" in qq.sent[0][1]
+    assert qq.media == []
+    store.close()
+
+
+def test_twitter_expansion_is_counted_against_the_event(tmp_path, monkeypatch):
+    relay, store = make_relay(tmp_path, FakeQQ())
+
+    async def fake_fetch(session, link):
+        return _tweet_post(link.status)
+
+    monkeypatch.setattr("qq_bridge.relay.twitter.fetch", fake_fetch)
+    relay._current = 1
+    relay._outstanding[1] = 0
+    asyncio.run(
+        relay.handle_matrix_event(
+            text_event(body="https://x.com/Alice/status/123")
+        )
+    )
+    assert relay._outstanding[1] == 2
+    store.close()
+
+
+def test_twitter_marker_survives_a_store_reopen(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    store.mark_tweet("G", "123")
+    store.close()
+    reopened = Store(tmp_path / "state.sqlite3")
+    assert reopened.tweet_recent("G", "123", 600) is True
+    assert reopened.tweet_recent("G", "456", 600) is False
+    reopened.close()
+
+
+def test_twitter_send_failure_keeps_the_event_for_retry(tmp_path):
+    from qq_bridge.qq import QQError
+
+    class FailingQQ(FakeQQ):
+        async def send_group_text(
+            self, group, content, *, reference=None, msg_id=None, msg_seq=1
+        ):
+            raise QQError(500, "down", status=500)
+
+    relay, store = make_relay(tmp_path, FailingQQ())
+    assert asyncio.run(relay._send_tweet_post(_tweet_post(), "G", None)) is False
+    store.close()
+
+
+def test_config_rejects_a_non_boolean_twitter_toggle(tmp_path):
+    from qq_bridge.config import ConfigError, load
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        """
+[matrix]
+homeserver = "http://hs"
+domain = "example.org"
+as_token = "as"
+hs_token = "hs"
+bot_mxid = "@qqbot:example.org"
+
+[qq]
+group = "G"
+incoming = "#in:example.org"
+
+[[room]]
+alias = "#in:example.org"
+label = "in"
+
+[twitter]
+enabled = "false"
+""",
+        encoding="utf-8",
+    )
+    try:
+        load(cfg_path)
+    except ConfigError as exc:
+        assert "twitter.enabled" in str(exc)
+    else:
+        raise AssertionError("a string twitter.enabled was accepted")
+
+
+def test_qq_twitter_expansion_is_a_passive_reply(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    asyncio.run(relay._send_tweet_post(_tweet_post(), "G", "Q7"))
+    assert qq.text_replies == [("Q7", 1)]
+    store.close()
+
+
+def test_matrix_twitter_expansion_is_not_a_passive_reply(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    asyncio.run(relay._send_tweet_post(_tweet_post(), "G", None))
+    assert qq.text_replies == [(None, 1)]
+    store.close()
+
+
+def test_qq_passive_reply_stops_at_five_parts(tmp_path, monkeypatch):
+    from qq_bridge import twitter
+
+    class ManyPicturesQQ(FakeQQ):
+        pass
+
+    qq = ManyPicturesQQ()
+    relay, store = make_relay(tmp_path, qq)
+    link = twitter.find("https://x.com/Alice/status/123")[0]
+    post = twitter.Post(
+        handle="Alice",
+        name="Alice",
+        text="x" * 4000,
+        created=None,
+        link=link,
+        media=tuple(
+            twitter.Media("photo", f"https://pbs.twimg.com/media/{n}.jpg", None)
+            for n in range(4)
+        ),
+        quote=None,
+        poll=(),
+        sensitive=False,
+        replying_to=None,
+    )
+
+    async def fake_download(session, url, max_bytes=0):
+        return b"image", "image/jpeg"
+
+    monkeypatch.setattr("qq_bridge.relay.twitter.download", fake_download)
+    asyncio.run(relay._send_tweet_post(post, "G", "Q7"))
+    assert [seq for _, seq in qq.text_replies] == [1, 2, 3]
+    assert [seq for _, seq in qq.media_replies] == [4, 5]
     store.close()

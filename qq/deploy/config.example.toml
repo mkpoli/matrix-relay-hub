@@ -25,3 +25,8 @@ label = "test"
 [[room]]
 alias = "#welcome:example.org"
 label = "welcome"
+
+[twitter]
+# Expand X/Twitter links into the post's text and pictures. When false, links
+# are relayed unchanged.
+enabled = true

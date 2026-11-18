@@ -34,9 +34,37 @@ class FakeQQ:
         self.deleted.append(message_id)
 
 
+class FakeResponse:
+    headers = {"content-type": "image/png"}
+
+    def __init__(self, status=200):
+        self.status = status
+
+    async def read(self):
+        return b"image"
+
+    async def text(self):
+        return ""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class FakeSession:
+    def __init__(self, status=200):
+        self.status = status
+
+    def get(self, url, **kwargs):
+        return FakeResponse(self.status)
+
+
 class FakeMatrix:
     def __init__(self):
         self.sent = []
+        self.session = FakeSession()
 
     async def member(self, room_id, user_id):
         return {"displayname": "Alice"}
@@ -50,6 +78,18 @@ class FakeMatrix:
 
     async def download(self, url, max_bytes=None):
         return b"image"
+
+    async def register_user(self, localpart, displayname):
+        return f"@{localpart}:example.org"
+
+    async def set_displayname(self, user_id, displayname):
+        pass
+
+    async def set_avatar(self, user_id, avatar_url):
+        pass
+
+    async def upload(self, data, content_type, filename, user_id):
+        return "mxc://example.org/upload"
 
 
 def make_relay(tmp_path, qq, rooms=None, *, relay_reactions=True):
@@ -771,4 +811,191 @@ def test_a_short_qq_text_keeps_its_markup_and_one_transaction(tmp_path):
     (payload,) = [content for _, _, content in relay.matrix.sent]
     assert payload["formatted_body"]
     assert payload["body"] == "hello @全体成员"
+
+
+def sticker_event(**overrides):
+    data = {
+        "id": "Q1",
+        "group_openid": "G",
+        "author": {"member_openid": "u1", "username": "渚", "bot": False},
+        "content": '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">',
+        "attachments": [
+            {
+                "url": "https://example.org/sticker.png",
+                "content_type": "image/png",
+                "filename": "sticker.png",
+            }
+        ],
+    }
+    data.update(overrides)
+    return data
+
+
+def test_sticker_image_is_relayed_without_the_face_text(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay._incoming = ROOM
+
+    asyncio.run(relay._on_group_message(sticker_event()))
+
+    assert [payload["msgtype"] for _, _, payload in relay.matrix.sent] == ["m.image"]
+    assert all("\U0001f632" not in str(payload) for _, _, payload in relay.matrix.sent)
+    assert store.event_for_qq("Q1") == "$m1"
+    store.close()
+
+
+def test_sticker_is_not_lost_when_its_image_fails(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay._incoming = ROOM
+    relay.matrix.session = FakeSession(status=404)
+
+    asyncio.run(relay._on_group_message(sticker_event()))
+
+    assert [payload["msgtype"] for _, _, payload in relay.matrix.sent] == ["m.text"]
+    assert relay.matrix.sent[0][2]["body"] == "[表情]"
+    assert store.event_for_qq("Q1") == "$m1"
+    store.close()
+
+
+def test_sticker_reply_keeps_its_reply_relation(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay._incoming = ROOM
+    store.add_message("Q0", "G", ROOM, "$parent", "IDX1", "matrix")
+
+    asyncio.run(
+        relay._on_group_message(
+            sticker_event(message_scene={"ext": ["msg_idx=IDX1"]})
+        )
+    )
+
+    payload = relay.matrix.sent[0][2]
+    assert payload["msgtype"] == "m.image"
+    assert payload["m.relates_to"] == {"m.in_reply_to": {"event_id": "$parent"}}
+    store.close()
+
+
+def test_sticker_label_follows_text_when_the_image_fails(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay._incoming = ROOM
+    relay.matrix.session = FakeSession(status=404)
+
+    asyncio.run(
+        relay._on_group_message(
+            sticker_event(
+                content='look <faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
+            )
+        )
+    )
+
+    assert [payload["body"] for _, _, payload in relay.matrix.sent] == [
+        "look",
+        "[表情]",
+    ]
+    store.close()
+
+
+def test_sticker_image_does_not_add_a_label_when_it_succeeds(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay._incoming = ROOM
+
+    asyncio.run(
+        relay._on_group_message(
+            sticker_event(
+                content='look <faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
+            )
+        )
+    )
+
+    assert [payload["msgtype"] for _, _, payload in relay.matrix.sent] == [
+        "m.text",
+        "m.image",
+    ]
+    store.close()
+
+
+def test_sticker_label_is_sent_when_another_image_succeeds(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay._incoming = ROOM
+
+    class RoutingSession:
+        def get(self, url, **kwargs):
+            return FakeResponse(404 if "sticker" in url else 200)
+
+    relay.matrix.session = RoutingSession()
+    data = sticker_event()
+    data["attachments"].append(
+        {
+            "url": "https://example.org/photo.png",
+            "content_type": "image/png",
+            "filename": "photo.png",
+        }
+    )
+
+    asyncio.run(relay._on_group_message(data))
+
+    assert [(payload["msgtype"], payload["body"]) for _, _, payload in relay.matrix.sent] == [
+        ("m.image", "photo.png"),
+        ("m.text", "[表情]"),
+    ]
+    store.close()
+
+
+def test_fallback_timeout_does_not_duplicate_delivered_text(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay._incoming = ROOM
+    relay.matrix.session = FakeSession(status=404)
+    original = relay.matrix.send_message
+    calls = 0
+
+    async def timeout_on_fallback(room_id, user_id, content):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise TimeoutError
+        return await original(room_id, user_id, content)
+
+    relay.matrix.send_message = timeout_on_fallback
+
+    asyncio.run(
+        relay._on_group_message(
+            sticker_event(
+                content='look <faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
+            )
+        )
+    )
+
+    assert store.event_for_qq("Q1") == "$m1"
+    store.close()
+
+
+def test_long_text_keeps_the_sticker_label_after_an_image_failure(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay._incoming = ROOM
+    relay.matrix.session = FakeSession(status=404)
+
+    asyncio.run(
+        relay._on_group_message(
+            sticker_event(
+                content='x' * 4500
+                + ' <faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
+            )
+        )
+    )
+
+    payloads = [payload for _, _, payload in relay.matrix.sent]
+    assert [payload["msgtype"] for payload in payloads] == [
+        "m.text",
+        "m.text",
+        "m.text",
+        "m.text",
+    ]
+    assert "".join(payload["body"] for payload in payloads[:-1]).replace(" ", "") == "x" * 4500
+    assert payloads[-1]["body"] == "[表情]"
     store.close()

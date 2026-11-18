@@ -78,7 +78,7 @@ def test_is_edit():
 
 
 def test_face_markup_becomes_emoji():
-    raw = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
+    raw = '<faceType=1,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
     assert replace_faces(raw) == "😲"
 
 
@@ -97,17 +97,22 @@ def test_unknown_face_is_labelled():
 
 
 def test_face_survives_render():
-    body, _ = render_qq_text('<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0="> 你好', [], "example.org")
+    body, _ = render_qq_text('<faceType=1,faceId="0",ext="eyJ0ZXh0IjoiIn0="> 你好', [], "example.org")
     assert body == "😲 你好"
 
 
 def test_face_ids_are_collected():
-    raw = 'a <faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0="> b <faceType=6,faceId="12",ext="">'
+    raw = 'a <faceType=1,faceId="0",ext="eyJ0ZXh0IjoiIn0="> b <faceType=1,faceId="12",ext="">'
     assert extract_face_ids(raw) == [0, 12]
 
 
-def test_face_with_image_becomes_inline_emoticon():
+def test_sticker_ids_are_not_collected():
     raw = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
+    assert extract_face_ids(raw) == []
+
+
+def test_face_with_image_becomes_inline_emoticon():
+    raw = '<faceType=1,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
     body, html = render_qq_text(raw, [], "example.org", {0: "mxc://example.org/face"})
     assert body == "😲"
     assert 'data-mx-emoticon' in html
@@ -117,9 +122,49 @@ def test_face_with_image_becomes_inline_emoticon():
 
 
 def test_face_without_image_stays_text():
-    raw = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
+    raw = '<faceType=1,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
     body, html = render_qq_text(raw, [], "example.org")
     assert body == "😲"
+    assert "<img" not in html
+
+
+def test_sticker_with_an_image_has_no_text_fallback():
+    raw = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
+    body, html = render_qq_text(raw, [], "example.org", sticker_image=True)
+    assert body == ""
+    assert html == ""
+
+
+def test_sticker_without_a_name_is_not_an_emoji():
+    raw = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
+    assert replace_faces(raw) == "[表情]"
+
+
+def test_sticker_name_is_kept_without_an_image():
+    raw = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiW+Wkp+iDhl0ifQ==">'
+    body, html = render_qq_text(raw, [], "example.org")
+    assert body == "[大胆]"
+    assert html == "[大胆]"
+
+
+def test_sticker_does_not_borrow_a_system_face_image():
+    raw = (
+        '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0="> '
+        '<faceType=1,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
+    )
+    body, html = render_qq_text(
+        raw, [], "example.org", {0: "mxc://example.org/face"}
+    )
+    assert body == "[表情] 😲"
+    assert html.count("<img") == 1
+    assert 'alt="😲"' in html
+
+
+def test_sticker_text_does_not_eat_surrounding_text():
+    raw = '看这个 <faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0="> 好耶'
+    body, html = render_qq_text(raw, [], "example.org", sticker_image=True)
+    assert body == "看这个  好耶"
+    assert "😲" not in body
     assert "<img" not in html
 
 

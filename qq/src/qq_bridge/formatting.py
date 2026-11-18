@@ -13,8 +13,12 @@ TOKEN_RE = re.compile(
     r"|<@(?P<mention>[^>]+)>"
 )
 
-# QQ face ids are the classic yellow faces with a shifted order; the API gives
-# only the id, so map the common ones to the emoji they represent.
+# faceType 1 and 3 are the small yellow faces. faceType 6 is a sticker: its
+# faceId is always 0 and the picture arrives in the message's attachments.
+STICKER_FACE_TYPE = "6"
+
+# QQ face ids name the system emoji; qzoneCode is 100 + the id, except that
+# 微笑 and 惊讶 swapped places in the two lists. Map the common ones to emoji.
 FACE_CODE_EMOJI = {
     100: "😊", 101: "😒", 102: "😍", 103: "😳", 104: "😎", 105: "😭",
     106: "😊", 107: "🤐", 108: "😴", 109: "😭", 110: "😅", 111: "😡",
@@ -47,11 +51,13 @@ def _face_label(ext: str) -> str:
     return str(text) if text else ""
 
 
-def _face_plain(face_id: str, ext: str) -> str:
+def _face_plain(face_type: str, face_id: str, ext: str) -> str:
     label = _face_label(ext)
     if label:
         # QQ sometimes supplies the name already bracketed; keep one pair.
         return label if label.startswith("[") and label.endswith("]") else f"[{label}]"
+    if face_type == STICKER_FACE_TYPE:
+        return "[表情]"
     try:
         number = int(face_id)
     except (TypeError, ValueError):
@@ -61,8 +67,15 @@ def _face_plain(face_id: str, ext: str) -> str:
 
 
 def extract_face_ids(content: str) -> list[int]:
+    """Ids of the small faces that have a picture in the face mirror.
+
+    Sticker ids are left out: faceType 6 always reports 0, so the mirror's
+    face 0 would replace every sticker with the same wrong picture.
+    """
     ids: list[int] = []
     for match in FACE_RE.finditer(content or ""):
+        if match.group(1) == STICKER_FACE_TYPE:
+            continue
         try:
             ids.append(int(match.group(2)))
         except (TypeError, ValueError):
@@ -70,10 +83,26 @@ def extract_face_ids(content: str) -> list[int]:
     return ids
 
 
+def sticker_labels(content: str) -> str:
+    """Readable labels for the faceType 6 stickers in a message."""
+    labels: list[str] = []
+    for match in FACE_RE.finditer(content or ""):
+        if match.group(1) != STICKER_FACE_TYPE:
+            continue
+        label = _face_plain(
+            match.group(1), match.group(2) or "", match.group(3) or ""
+        )
+        if label:
+            labels.append(label)
+    return " ".join(labels)
+
+
 def replace_faces(content: str) -> str:
     """Turn QQ face markup into an emoji or a readable label."""
     return FACE_RE.sub(
-        lambda match: _face_plain(match.group(2) or "", match.group(3) or ""),
+        lambda match: _face_plain(
+            match.group(1), match.group(2) or "", match.group(3) or ""
+        ),
         content or "",
     )
 
@@ -98,8 +127,14 @@ def render_qq_text(
     mentions: list[dict] | None,
     domain: str,
     face_images: dict[int, str] | None = None,
+    sticker_image: bool = False,
 ) -> tuple[str, str]:
-    """Return the plain body and the HTML body for a QQ message."""
+    """Return the plain body and the HTML body for a QQ message.
+
+    `sticker_image` says the message carries an image attachment, which is
+    how a faceType 6 sticker arrives; its markup is then dropped from the
+    text because the attachment is the sticker.
+    """
     text = content or ""
     names = _mention_names(mentions)
     body: list[str] = []
@@ -121,24 +156,31 @@ def render_qq_text(
                     f'<a href="https://matrix.to/#/{html.escape(ghost)}">@{_escape(name)}</a>'
                 )
         else:
+            face_type = match.group("ftype") or ""
             face_id = match.group("face_id") or ""
-            plain = _face_plain(face_id, match.group("ext") or "")
-            body.append(plain)
-            mxc = None
-            if face_images:
-                try:
-                    mxc = face_images.get(int(face_id))
-                except (TypeError, ValueError):
-                    mxc = None
-            if mxc:
-                escaped = html.escape(plain, quote=True)
-                markup.append(
-                    f'<img data-mx-emoticon src="{html.escape(mxc, quote=True)}"'
-                    f' alt="{escaped}" title="{escaped}" height="32" />'
-                    f"{_escape(plain)}"
-                )
-            else:
-                markup.append(_escape(plain))
+            sticker = face_type == STICKER_FACE_TYPE
+            plain = (
+                ""
+                if sticker and sticker_image
+                else _face_plain(face_type, face_id, match.group("ext") or "")
+            )
+            if plain:
+                body.append(plain)
+                mxc = None
+                if face_images and not sticker:
+                    try:
+                        mxc = face_images.get(int(face_id))
+                    except (TypeError, ValueError):
+                        mxc = None
+                if mxc:
+                    escaped = html.escape(plain, quote=True)
+                    markup.append(
+                        f'<img data-mx-emoticon src="{html.escape(mxc, quote=True)}"'
+                        f' alt="{escaped}" title="{escaped}" height="32" />'
+                        f"{_escape(plain)}"
+                    )
+                else:
+                    markup.append(_escape(plain))
         position = match.end()
     body.append(text[position:])
     markup.append(_escape(text[position:]))

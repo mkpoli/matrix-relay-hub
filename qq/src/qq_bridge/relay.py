@@ -19,6 +19,7 @@ from .formatting import (
     extract_face_ids,
     format_reaction_key,
     render_qq_text,
+    sticker_labels,
     strip_leading_mentions,
     strip_reply_fallback,
 )
@@ -705,11 +706,32 @@ class Relay:
         ref_idx = self._ref_idx(data)
         reply_to = self.store.event_for_ref(group, ref_idx) if ref_idx else None
         sent: list[str] = []
+        attachments = [
+            item for item in data.get("attachments") or [] if isinstance(item, dict)
+        ]
+        image_attachments = sum(
+            1
+            for item in attachments
+            if str(item.get("content_type") or "").startswith("image/")
+        )
+        sticker_image = image_attachments > 0
 
         face_images = await self._resolve_faces(content)
         body, html_body = render_qq_text(
-            content, data.get("mentions"), self.domain, face_images
+            content,
+            data.get("mentions"),
+            self.domain,
+            face_images,
+            sticker_image=sticker_image,
         )
+        fallback_body, fallback_html = ("", "")
+        sticker_fallback = ""
+        if sticker_image:
+            fallback_body, fallback_html = render_qq_text(
+                content, data.get("mentions"), self.domain, face_images
+            )
+            sticker_fallback = sticker_labels(content)
+        text_sent = False
         if body:
             parts = chunk(body, MATRIX_TEXT_LIMIT)
             for index, part in enumerate(parts):
@@ -723,17 +745,46 @@ class Relay:
                 try:
                     event_id = await self.matrix.send_message(room_id, ghost, payload)
                     sent.append(event_id)
+                    text_sent = True
                 except MatrixError as exc:
                     log.warning("cannot send to %s as %s: %s", room_id, ghost, exc)
                     break
 
-        for attachment in data.get("attachments") or []:
+        image_delivered = 0
+        for attachment in attachments:
             try:
-                event_id = await self._send_attachment(room_id, ghost, attachment)
-                if event_id and not sent:
-                    sent.append(event_id)
+                event_id = await self._send_attachment(
+                    room_id, ghost, attachment, reply_to=reply_to
+                )
+                if event_id:
+                    if str(attachment.get("content_type") or "").startswith("image/"):
+                        image_delivered += 1
+                    if not sent:
+                        sent.append(event_id)
             except Exception as exc:
                 log.warning("cannot relay attachment: %s", exc)
+
+        if sticker_fallback and image_delivered < image_attachments:
+            fallback = sticker_fallback if text_sent else fallback_body
+            fallback_parts = chunk(fallback, MATRIX_TEXT_LIMIT)
+            for index, part in enumerate(fallback_parts):
+                payload = {"msgtype": "m.text", "body": part}
+                if not text_sent and fallback_html and len(fallback_parts) == 1:
+                    payload["format"] = "org.matrix.custom.html"
+                    payload["formatted_body"] = fallback_html
+                if reply_to and index == 0:
+                    payload["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_to}}
+                try:
+                    event_id = await self.matrix.send_message(room_id, ghost, payload)
+                    sent.append(event_id)
+                except Exception as exc:
+                    log.warning(
+                        "cannot send sticker fallback to %s as %s: %s",
+                        room_id,
+                        ghost,
+                        exc,
+                    )
+                    break
 
         if qq_id:
             self.store.add_message(
@@ -820,7 +871,12 @@ class Relay:
         return mxid
 
     async def _send_attachment(
-        self, room_id: str, ghost: str, attachment: dict
+        self,
+        room_id: str,
+        ghost: str,
+        attachment: dict,
+        *,
+        reply_to: str | None = None,
     ) -> str | None:
         url = attachment.get("url") or attachment.get("voice_wav_url")
         if not url:
@@ -857,6 +913,8 @@ class Relay:
             "url": mxc,
             "info": info,
         }
+        if reply_to:
+            payload["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_to}}
         if msgtype == "m.audio" and attachment.get("voice_wav_url"):
             payload["org.matrix.msc3245.voice"] = {}
         return await self.matrix.send_message(room_id, ghost, payload)

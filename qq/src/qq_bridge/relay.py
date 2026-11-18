@@ -33,6 +33,9 @@ log = logging.getLogger(__name__)
 MAX_MEDIA_DOWNLOAD = 40 * 1024 * 1024
 # Matrix media held in memory for shrinking; the homeserver takes 50 MB uploads.
 MAX_MATRIX_MEDIA = 64 * 1024 * 1024
+# Discord, which every public room is bridged to, refuses a longer message and posts an error
+# instead of relaying it, so QQ text beyond this goes out as several messages.
+MATRIX_TEXT_LIMIT = 2000
 QQ_FORMAT_REFUSED = 40034002
 # How long the send queue waits for media before letting later messages pass.
 MEDIA_WAIT = 20.0
@@ -708,17 +711,21 @@ class Relay:
             content, data.get("mentions"), self.domain, face_images
         )
         if body:
-            payload: dict = {"msgtype": "m.text", "body": body}
-            if html_body:
-                payload["format"] = "org.matrix.custom.html"
-                payload["formatted_body"] = html_body
-            if reply_to:
-                payload["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_to}}
-            try:
-                event_id = await self.matrix.send_message(room_id, ghost, payload)
-                sent.append(event_id)
-            except MatrixError as exc:
-                log.warning("cannot send to %s as %s: %s", room_id, ghost, exc)
+            parts = chunk(body, MATRIX_TEXT_LIMIT)
+            for index, part in enumerate(parts):
+                payload: dict = {"msgtype": "m.text", "body": part}
+                # Markup cannot be mapped onto the parts, so it is kept when the text needs one message.
+                if html_body and len(parts) == 1:
+                    payload["format"] = "org.matrix.custom.html"
+                    payload["formatted_body"] = html_body
+                if reply_to and index == 0:
+                    payload["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_to}}
+                try:
+                    event_id = await self.matrix.send_message(room_id, ghost, payload)
+                    sent.append(event_id)
+                except MatrixError as exc:
+                    log.warning("cannot send to %s as %s: %s", room_id, ghost, exc)
+                    break
 
         for attachment in data.get("attachments") or []:
             try:

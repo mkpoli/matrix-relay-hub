@@ -156,17 +156,33 @@ def strip_reply_fallback(body: str) -> str:
     return body
 
 
+def utf16_length(text: str) -> int:
+    """The text's length in UTF-16 code units, the unit Matrix bridges and Discord count."""
+    return sum(2 if ord(char) > 0xFFFF else 1 for char in text)
+
+
+def _prefix_within(text: str, limit: int) -> int:
+    """The length of the longest prefix of `text` that is at most `limit` code units."""
+    units = 0
+    for index, char in enumerate(text):
+        units += 2 if ord(char) > 0xFFFF else 1
+        if units > limit:
+            return index
+    return len(text)
+
+
 def chunk(text: str, limit: int = 1800) -> list[str]:
-    """Split a long message on paragraph or line boundaries."""
+    """Split a long message on paragraph or line boundaries, each part at most `limit` code units."""
     chunks: list[str] = []
-    while len(text) > limit:
-        cut = text.rfind("\n", 0, limit)
-        if cut < limit // 2:
-            cut = text.rfind(" ", 0, limit)
-        if cut < limit // 2:
-            cut = limit
-        chunks.append(text[:cut].rstrip())
-        text = text[cut:].lstrip("\n")
+    while utf16_length(text) > limit:
+        cut = _prefix_within(text, limit)
+        break_at = text.rfind("\n", 0, cut)
+        if break_at < cut // 2:
+            break_at = text.rfind(" ", 0, cut)
+        if break_at < cut // 2:
+            break_at = cut
+        chunks.append(text[:break_at].rstrip())
+        text = text[break_at:].lstrip("\n")
     if text:
         chunks.append(text)
     return chunks

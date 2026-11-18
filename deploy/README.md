@@ -67,7 +67,7 @@ Copy `qq/deploy/config.example.toml` to `$QQ_DATA_DIR/config.toml` and set the h
 
 The bot must be added to the QQ group with message receiving and active posting enabled. [Tencent's send documentation](https://raw.githubusercontent.com/tencent-connect/bot-docs/main/docs/develop/api-v2/server-inter/message/send-receive/send.md) says proactive push ended on 21 April 2025, so Matrix-to-QQ delivery depends on current account permissions and may be rejected; test in a sandbox group first. The bridge does not support encrypted Matrix rooms. QQ takes at most 10 MiB per upload, so the bridge shrinks larger images to JPEG and transcodes videos (and WebM, which QQ refuses) to H.264 MP4 with `ffmpeg`; media that still cannot fit is replaced with a notice. Matrix events stay in the state database until QQ takes or refuses them; events cut off by a restart, a network failure or a QQ outage are retried every 15 minutes, up to eight times within a day.
 
-X/Twitter status links are rewritten to FixupX and expanded into the post's text and pictures through the FixTweet API, so the group can read them where the QQ client cannot open x.com. Set `enabled = false` in the `[twitter]` table to relay the links unchanged.
+X/Twitter status links are rewritten to FixupX and expanded into the post's text and media through the FixTweet API, so the group can read them where the QQ client cannot open x.com. GIFs arrive as X's MP4 versions. Set `enabled = false` in the `[twitter]` table to relay the links unchanged.
 
 ## Operate
 

@@ -42,7 +42,7 @@ class FakeMatrix:
         return b"image"
 
 
-def make_relay(tmp_path, qq, rooms=None):
+def make_relay(tmp_path, qq, rooms=None, *, relay_reactions=True):
     rooms = rooms or (RoomConfig(alias="#in:example.org", label="in"),)
     cfg = Config(
         matrix=MatrixConfig(
@@ -57,6 +57,7 @@ def make_relay(tmp_path, qq, rooms=None):
         ignore_senders=(),
         ignore_notices=True,
         state_path=tmp_path / "state.sqlite3",
+        relay_reactions=relay_reactions,
     )
     store = Store(cfg.state_path)
     relay = Relay(cfg, store, FakeMatrix(), qq)
@@ -74,6 +75,31 @@ def text_event(body="hello", sender="@alice:example.org", **extra):
         "type": "m.room.message",
         "event_id": "$e",
         "content": content,
+    }
+
+
+def reaction_event(
+    target="$orig",
+    key="👍",
+    *,
+    event_id="$react",
+    sender="@alice:example.org",
+    room_id=ROOM,
+    **extra_content,
+):
+    return {
+        "room_id": room_id,
+        "sender": sender,
+        "type": "m.reaction",
+        "event_id": event_id,
+        "content": {
+            "m.relates_to": {
+                "rel_type": "m.annotation",
+                "event_id": target,
+                "key": key,
+            },
+            **extra_content,
+        },
     }
 
 
@@ -506,3 +532,186 @@ def test_claimed_event_is_not_queued_twice(tmp_path):
     asyncio.run(go())
     assert relay.incoming.qsize() == 1
     store.close()
+
+
+def test_matrix_reaction_becomes_a_quoted_reply(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    store.add_message("Q9", "G", ROOM, "$orig", "REF9", "matrix")
+    asyncio.run(relay.handle_matrix_event(reaction_event(target="$orig", key="👍")))
+    job = relay._queue.get_nowait()
+    assert job["text"] == "[M] Alice reacted with 👍"
+    assert job["reference"] == "REF9"
+    assert job["event_id"] == "$react"
+    store.close()
+
+
+def test_matrix_reaction_to_qq_message_uses_qq_reference(tmp_path):
+    relay, store = make_relay(
+        tmp_path,
+        FakeQQ(),
+        rooms=(
+            RoomConfig(alias="#in:example.org", label="in"),
+            RoomConfig(alias="#two:example.org", label="two"),
+        ),
+    )
+    store.add_message("QQ1", "G", ROOM, "$qq_ev", "IDX1", "qq")
+    asyncio.run(
+        relay.handle_matrix_event(
+            reaction_event(
+                target="$qq_ev",
+                key="❤️",
+                sender="@discord_123:example.org",
+            )
+        )
+    )
+    job = relay._queue.get_nowait()
+    assert job["text"] == "[D] [in] Alice reacted with ❤️"
+    assert job["reference"] == "IDX1"
+    store.close()
+
+
+def test_reaction_removal_recalls_the_quoted_reply(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    store.add_message("Q9", "G", ROOM, "$orig", "REF9", "matrix")
+    (seq,) = store.accept_transaction("t1", [reaction_event(target="$orig", key="😂")])
+    relay.incoming.put_nowait((seq, reaction_event(target="$orig", key="😂")))
+    asyncio.run(_run_loops(relay, lambda: not _pending(store)))
+    assert qq.sent == [("G", "[M] Alice reacted with 😂", "REF9")]
+
+    redaction = {
+        "room_id": ROOM,
+        "sender": "@alice:example.org",
+        "type": "m.room.redaction",
+        "redacts": "$react",
+        "content": {},
+    }
+    asyncio.run(relay.handle_matrix_event(redaction))
+    assert qq.deleted == ["Q1"]
+    store.close()
+
+
+def test_reaction_to_an_unbridged_message_is_skipped(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    asyncio.run(relay.handle_matrix_event(reaction_event(target="$missing", key="👍")))
+    assert relay._queue.empty()
+    store.close()
+
+
+def test_ghost_reaction_is_skipped(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    store.add_message("Q9", "G", ROOM, "$orig", "REF9", "matrix")
+    for sender in ("@qqbot:example.org", "@qq_abc:example.org"):
+        asyncio.run(
+            relay.handle_matrix_event(
+                reaction_event(target="$orig", key="👍", sender=sender)
+            )
+        )
+    assert relay._queue.empty()
+    store.close()
+
+
+def test_reaction_disabled_in_config_is_skipped(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ(), relay_reactions=False)
+    store.add_message("Q9", "G", ROOM, "$orig", "REF9", "matrix")
+    asyncio.run(relay.handle_matrix_event(reaction_event(target="$orig", key="👍")))
+    assert relay._queue.empty()
+    store.close()
+
+
+def test_custom_emoji_mxc_reaction_uses_fallback(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    store.add_message("Q9", "G", ROOM, "$orig", "REF9", "matrix")
+    asyncio.run(
+        relay.handle_matrix_event(
+            reaction_event(
+                target="$orig",
+                key="mxc://example.org/custom",
+                sender="@telegram_99:example.org",
+            )
+        )
+    )
+    job = relay._queue.get_nowait()
+    assert job["text"] == "[T] Alice reacted with [custom emoji]"
+    assert job["reference"] == "REF9"
+    store.close()
+
+
+def test_reaction_in_same_burst_as_target_resolves_reference(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    msg = text_event("hello")
+    react = reaction_event(target="$e", key="🎉")
+    seq1, seq2 = store.accept_transaction("t1", [msg, react])
+    relay.incoming.put_nowait((seq1, msg))
+    relay.incoming.put_nowait((seq2, react))
+    asyncio.run(_run_loops(relay, lambda: not _pending(store)))
+    assert qq.sent == [
+        ("G", "[M] Alice: hello", None),
+        ("G", "[M] Alice reacted with 🎉", "REF1"),
+    ]
+    assert relay._inflight_events == {}
+    store.close()
+
+
+def test_reaction_in_same_burst_is_skipped_when_target_fails(tmp_path):
+    from qq_bridge.qq import QQError
+
+    class FirstFails(FakeQQ):
+        async def send_group_text(self, group, content, **kwargs):
+            if content == "[M] Alice: hello":
+                raise QQError(400, "bad request", status=400)
+            return await super().send_group_text(group, content, **kwargs)
+
+    qq = FirstFails()
+    relay, store = make_relay(tmp_path, qq)
+    msg = text_event("hello")
+    react = reaction_event(target="$e", key="🎉")
+    seq1, seq2 = store.accept_transaction("t1", [msg, react])
+    relay.incoming.put_nowait((seq1, msg))
+    relay.incoming.put_nowait((seq2, react))
+    asyncio.run(_run_loops(relay, lambda: not _pending(store)))
+    assert qq.sent == []
+    assert relay._inflight_events == {}
+    store.close()
+
+
+def test_duplicate_reaction_is_not_sent_again(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    store.add_message("Q9", "G", ROOM, "$orig", "REF9", "matrix")
+    store.add_message("Q10", "G", ROOM, "$react", "REF10", "matrix")
+    asyncio.run(relay.handle_matrix_event(reaction_event(target="$orig", key="👍")))
+    assert relay._queue.empty()
+    store.close()
+
+
+def test_config_loads_relay_reactions(tmp_path):
+    from qq_bridge.config import load
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        """
+[matrix]
+homeserver = "http://hs"
+domain = "example.org"
+as_token = "as"
+hs_token = "hs"
+bot_mxid = "@qqbot:example.org"
+
+[qq]
+group = "G"
+incoming = "#in:example.org"
+
+[[room]]
+alias = "#in:example.org"
+label = "in"
+""",
+        encoding="utf-8",
+    )
+    assert load(cfg_path).relay_reactions is True
+    cfg_path.write_text(
+        "relay_reactions = false\n" + cfg_path.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    assert load(cfg_path).relay_reactions is False

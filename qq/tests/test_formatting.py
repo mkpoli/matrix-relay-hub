@@ -1,6 +1,7 @@
 from qq_bridge.formatting import (
     chunk,
     extract_face_ids,
+    format_reaction_key,
     render_qq_text,
     replace_faces,
     strip_leading_mentions,
@@ -119,3 +120,27 @@ def test_face_without_image_stays_text():
     body, html = render_qq_text(raw, [], "example.org")
     assert body == "😲"
     assert "<img" not in html
+
+
+def test_format_reaction_key_handles_emojis_shortcodes_and_mxc():
+    assert format_reaction_key("👍") == "👍"
+    assert format_reaction_key("  ❤️\n ") == "❤️"
+    assert format_reaction_key("  ") == ""
+    assert format_reaction_key(None) == ""
+    assert format_reaction_key(":party_blob:") == ":party_blob:"
+    assert format_reaction_key("mxc://example.org/abc") == "[custom emoji]"
+    assert (
+        format_reaction_key(
+            "mxc://example.org/abc",
+            relates={"shortcode": ":party_blob:"},
+        )
+        == ":party_blob:"
+    )
+    assert (
+        format_reaction_key(
+            "mxc://example.org/abc",
+            content={"shortcode": "blob"},
+        )
+        == ":blob:"
+    )
+    assert format_reaction_key("x" * 150) == ("x" * 100) + "..."

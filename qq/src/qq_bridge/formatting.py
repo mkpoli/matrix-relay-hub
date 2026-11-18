@@ -175,3 +175,29 @@ def chunk(text: str, limit: int = 1800) -> list[str]:
 def strip_leading_mentions(text: str) -> str:
     """Drop the <@bot> prefix QQ puts in front of an @-message."""
     return re.sub(r"^(?:\s*(?:<@[^>]+>|@[^\s@]+))+\s*", "", text).strip()
+
+
+def format_reaction_key(
+    key: object,
+    *,
+    content: dict | None = None,
+    relates: dict | None = None,
+) -> str:
+    """Turn a Matrix reaction key into safe, readable text for QQ."""
+    if not isinstance(key, str):
+        return ""
+    cleaned = " ".join(key.split())
+    if not cleaned:
+        return ""
+    if cleaned.startswith("mxc://"):
+        for source in (relates, content):
+            if isinstance(source, dict):
+                shortcode = source.get("shortcode")
+                if isinstance(shortcode, str):
+                    code = " ".join(shortcode.split()).strip(":")
+                    if code:
+                        return f":{code[:64]}:"
+        return "[custom emoji]"
+    if len(cleaned) > 100:
+        return cleaned[:100] + "..."
+    return cleaned

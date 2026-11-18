@@ -17,6 +17,7 @@ from .fit import QQ_FILE_TYPES, TOO_LARGE, UNREADABLE, Prepared, Unfit, prepare,
 from .formatting import (
     chunk,
     extract_face_ids,
+    format_reaction_key,
     render_qq_text,
     strip_leading_mentions,
     strip_reply_fallback,
@@ -86,6 +87,7 @@ class Relay:
         self.incoming: asyncio.Queue[tuple[int | None, dict]] = asyncio.Queue()
         self._current: int | None = None
         self._outstanding: dict[int, int] = {}
+        self._inflight_events: dict[str, int] = {}
         self._keep: set[int] = set()
         self._claimed: set[int] = set()
         self._rooms: dict[str, str] = {}
@@ -250,9 +252,19 @@ class Relay:
         seq = job.get("pending")
         if seq is not None:
             self._outstanding[seq] = self._outstanding.get(seq, 0) + 1
+        event_id = job.get("event_id")
+        if event_id:
+            self._inflight_events[event_id] = self._inflight_events.get(event_id, 0) + 1
         self._queue.put_nowait(job)
 
     def _finish(self, job: dict) -> None:
+        event_id = job.get("event_id")
+        if event_id:
+            left_event = self._inflight_events.get(event_id, 0) - 1
+            if left_event > 0:
+                self._inflight_events[event_id] = left_event
+            else:
+                self._inflight_events.pop(event_id, None)
         seq = job.get("pending")
         if seq is None:
             return
@@ -290,7 +302,9 @@ class Relay:
         if event_type == "m.room.redaction":
             await self._redact(event)
             return
-        if event_type != "m.room.message":
+        if event_type not in ("m.room.message", "m.reaction"):
+            return
+        if event_type == "m.reaction" and not self.cfg.relay_reactions:
             return
         if self._ignored(sender):
             return
@@ -299,6 +313,9 @@ class Relay:
             if len(self._rooms) < len(self.cfg.rooms):
                 # A configured room may not be resolved yet; try again later.
                 self._retry_later()
+            return
+        if event_type == "m.reaction":
+            await self._handle_reaction(event, room_id, sender, label)
             return
         content = event.get("content") or {}
         if is_edit(content):
@@ -356,6 +373,50 @@ class Relay:
                 }
             )
 
+    async def _handle_reaction(
+        self, event: dict, room_id: str, sender: str, label: str
+    ) -> None:
+        if not self.cfg.relay_reactions:
+            return
+        event_id = event.get("event_id", "")
+        if event_id and (
+            self.store.relayed_qq(event_id) or self.store.sent_count(event_id)
+        ):
+            log.debug("ignoring a reaction already carried to QQ: %s", event_id)
+            return
+        content = event.get("content") or {}
+        relates = content.get("m.relates_to") or {}
+        if relates.get("rel_type") != "m.annotation":
+            return
+        target = relates.get("event_id")
+        if not isinstance(target, str) or not target:
+            return
+        emoji = format_reaction_key(relates.get("key"), content=content, relates=relates)
+        if not emoji:
+            return
+        reference = self._reference_for_event(target)
+        reference_event = None
+        if reference is None:
+            if not self._inflight_events.get(target):
+                log.debug("ignoring reaction to unbridged event %s", target)
+                return
+            reference_event = target
+        name = await self._display_name(room_id, sender)
+        source = f"[{source_tag(sender)}] "
+        tag = f"[{label}] " if self._tagged else ""
+        text = chunk(f"{source}{tag}{name} reacted with {emoji}")[0]
+        self._put(
+            {
+                "kind": "text",
+                "group": self.cfg.qq.group,
+                "room": room_id,
+                "event_id": event_id,
+                "text": text,
+                "reference": reference,
+                "reference_event": reference_event,
+            }
+        )
+
     def _enqueue_media(self, job: dict) -> None:
         loop = asyncio.get_running_loop()
         job = {**job, "ready": loop.create_future(), "sent": asyncio.Event()}
@@ -371,17 +432,20 @@ class Relay:
                 return True
         return False
 
+    def _reference_for_event(self, event_id: str) -> str | None:
+        row = self.store.conn.execute(
+            "SELECT qq_id, ref_idx FROM messages WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return row["ref_idx"] or row["qq_id"]
+
     def _reply_reference(self, event: dict) -> str | None:
         relates = (event.get("content") or {}).get("m.relates_to") or {}
         target = (relates.get("m.in_reply_to") or {}).get("event_id")
         if not target:
             return None
-        row = self.store.conn.execute(
-            "SELECT qq_id, ref_idx FROM messages WHERE event_id = ?", (target,)
-        ).fetchone()
-        if not row:
-            return None
-        return row["ref_idx"] or row["qq_id"]
+        return self._reference_for_event(target)
 
     async def _display_name(self, room_id: str, user_id: str) -> str:
         key = (room_id, user_id)
@@ -443,6 +507,15 @@ class Relay:
         return True
 
     async def _send_text(self, job: dict) -> None:
+        reference = job.get("reference")
+        if reference is None and job.get("reference_event"):
+            reference = self._reference_for_event(job["reference_event"])
+            if reference is None:
+                log.debug(
+                    "skipping reaction; target %s was not delivered to QQ",
+                    job["reference_event"],
+                )
+                return
         if not await self._wait_limits(job["group"]):
             self._retry_later(job)
             return
@@ -451,7 +524,7 @@ class Relay:
                 response = await self.qq.send_group_text(
                     job["group"],
                     job["text"],
-                    reference=job.get("reference"),
+                    reference=reference,
                     msg_id=job.get("msg_id"),
                 )
             except QQError as exc:

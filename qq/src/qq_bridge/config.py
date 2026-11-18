@@ -57,6 +57,7 @@ class Config:
     ignore_senders: tuple[str, ...]
     ignore_notices: bool
     state_path: Path
+    relay_reactions: bool = True
 
 
 def _require(section: dict, key: str, where: str) -> str:
@@ -142,4 +143,5 @@ def load(path: str | Path) -> Config:
         ignore_senders=tuple(ignore_raw),
         ignore_notices=bool(raw.get("ignore_notices", True)),
         state_path=state_path,
+        relay_reactions=bool(raw.get("relay_reactions", True)),
     )

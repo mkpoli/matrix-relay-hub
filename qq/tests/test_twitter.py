@@ -285,7 +285,7 @@ def _sizes(monkeypatch, table):
     monkeypatch.setattr("qq_bridge.twitter._content_length", size)
 
 
-def test_the_best_variant_that_fits_qq_is_taken(monkeypatch):
+def test_the_best_variant_that_fits_qq_is_tried_first(monkeypatch):
     _sizes(
         monkeypatch,
         {
@@ -293,18 +293,15 @@ def test_the_best_variant_that_fits_qq_is_taken(monkeypatch):
             "https://video.twimg.com/hd.mp4": 4_000_000,
         },
     )
-    assert (
-        asyncio.run(
-            twitter._variant(
-                object(),
-                ("https://video.twimg.com/4k.mp4", "https://video.twimg.com/hd.mp4"),
-            )
+    assert asyncio.run(
+        twitter._ranked(
+            object(),
+            ("https://video.twimg.com/4k.mp4", "https://video.twimg.com/hd.mp4"),
         )
-        == "https://video.twimg.com/4k.mp4"
-    )
+    ) == ["https://video.twimg.com/4k.mp4", "https://video.twimg.com/hd.mp4"]
 
 
-def test_the_smallest_variant_is_taken_when_none_fit(monkeypatch):
+def test_the_smallest_variant_is_tried_first_when_none_fit(monkeypatch):
     _sizes(
         monkeypatch,
         {
@@ -312,28 +309,40 @@ def test_the_smallest_variant_is_taken_when_none_fit(monkeypatch):
             "https://video.twimg.com/hd.mp4": 20_000_000,
         },
     )
-    assert (
-        asyncio.run(
-            twitter._variant(
-                object(),
-                ("https://video.twimg.com/4k.mp4", "https://video.twimg.com/hd.mp4"),
-            )
+    assert asyncio.run(
+        twitter._ranked(
+            object(),
+            ("https://video.twimg.com/4k.mp4", "https://video.twimg.com/hd.mp4"),
         )
-        == "https://video.twimg.com/hd.mp4"
-    )
+    ) == ["https://video.twimg.com/hd.mp4", "https://video.twimg.com/4k.mp4"]
 
 
-def test_the_best_variant_is_taken_when_sizes_are_unknown(monkeypatch):
+def test_the_best_variant_is_tried_first_when_sizes_are_unknown(monkeypatch):
     _sizes(monkeypatch, {})
-    assert (
-        asyncio.run(
-            twitter._variant(
-                object(),
-                ("https://video.twimg.com/4k.mp4", "https://video.twimg.com/hd.mp4"),
-            )
+    assert asyncio.run(
+        twitter._ranked(
+            object(),
+            ("https://video.twimg.com/4k.mp4", "https://video.twimg.com/hd.mp4"),
         )
-        == "https://video.twimg.com/4k.mp4"
+    ) == ["https://video.twimg.com/4k.mp4", "https://video.twimg.com/hd.mp4"]
+
+
+def test_download_falls_back_to_the_next_variant(monkeypatch):
+    big = "https://video.twimg.com/4k.mp4"
+    small = "https://video.twimg.com/hd.mp4"
+
+    async def ranked(session, candidates):
+        return [big, small]
+
+    async def fetch(session, url, kind, hosts, prefix, limit):
+        return (b"mp4", "video/mp4") if url == small else None
+
+    monkeypatch.setattr("qq_bridge.twitter._ranked", ranked)
+    monkeypatch.setattr("qq_bridge.twitter._fetch", fetch)
+    got = asyncio.run(
+        twitter.download(object(), twitter.Attachment("video", big, (big, small)))
     )
+    assert got == (b"mp4", "video/mp4")
 
 
 def test_hevc_and_playlists_are_skipped_for_a_takeable_mp4():

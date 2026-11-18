@@ -429,18 +429,73 @@ async def _content_length(session: aiohttp.ClientSession, url: str) -> int | Non
         return None
 
 
-async def _variant(session: aiohttp.ClientSession, candidates: tuple[str, ...]) -> str:
-    """The best variant QQ can take as-is; the smallest when none can."""
+async def _ranked(
+    session: aiohttp.ClientSession, candidates: tuple[str, ...]
+) -> list[str]:
+    """Candidates best first, with those that fit QQ ahead of the rest."""
     if len(candidates) == 1:
-        return candidates[0]
+        return [candidates[0]]
     sizes = await asyncio.gather(*(_content_length(session, url) for url in candidates))
-    for url, size in zip(candidates, sizes):
-        if size is not None and size <= QQ_TARGET:
-            return url
-    known = [(size, url) for url, size in zip(candidates, sizes) if size is not None]
+    fitting = [
+        url
+        for url, size in zip(candidates, sizes)
+        if size is not None and size <= QQ_TARGET
+    ]
+    if fitting:
+        return fitting + [url for url in candidates if url not in fitting]
+    known = sorted(
+        (size, url) for url, size in zip(candidates, sizes) if size is not None
+    )
     if known:
-        return min(known)[1]
-    return candidates[0]
+        measured = {url for _, url in known}
+        return [url for _, url in known] + [
+            url for url in candidates if url not in measured
+        ]
+    return list(candidates)
+
+
+async def _fetch(
+    session: aiohttp.ClientSession,
+    url: str,
+    kind: str,
+    hosts: frozenset[str],
+    prefix: str,
+    limit: int,
+) -> tuple[bytes, str] | None:
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        async with session.get(
+            url, headers=headers, timeout=DOWNLOAD_TIMEOUT, allow_redirects=False
+        ) as response:
+            if response.status != 200:
+                log.info("%s %s returned %s", kind, url, response.status)
+                return None
+            # A redirect must not carry the fetch onto another host.
+            if urllib.parse.urlsplit(str(response.url)).hostname not in hosts:
+                log.info("%s %s redirected away from %s", kind, url, hosts)
+                return None
+            content_type = response.headers.get("content-type", "").split(";", 1)[0]
+            if not content_type.startswith(prefix):
+                log.info(
+                    "%s %s is %s",
+                    kind,
+                    url,
+                    content_type or f"not {prefix.rstrip('/')}",
+                )
+                return None
+            if (response.content_length or 0) > limit:
+                log.info("%s %s is over %d bytes", kind, url, limit)
+                return None
+            data = bytearray()
+            async for piece in response.content.iter_chunked(1 << 16):
+                data += piece
+                if len(data) > limit:
+                    log.info("%s %s grew over %d bytes", kind, url, limit)
+                    return None
+            return bytes(data), content_type
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        log.info("cannot download %s: %s", url, exc)
+        return None
 
 
 async def download(
@@ -450,44 +505,22 @@ async def download(
 ) -> tuple[bytes, str] | None:
     """Fetch one attachment; None when it is missing, too large or the wrong type."""
     if attachment.kind == "image":
+        if _still(attachment.url) is None:
+            return None
         hosts, prefix, cap = IMAGE_HOSTS, "image/", MAX_IMAGE
     else:
+        if _video_url(attachment.url) is None:
+            return None
         hosts, prefix, cap = VIDEO_HOSTS, "video/", MAX_VIDEO
     limit = cap if max_bytes is None else max_bytes
-    url = attachment.url
-    if attachment.kind == "video" and attachment.candidates:
-        url = await _variant(session, attachment.candidates)
-    headers = {"User-Agent": USER_AGENT}
-    try:
-        async with session.get(
-            url, headers=headers, timeout=DOWNLOAD_TIMEOUT, allow_redirects=False
-        ) as response:
-            if response.status != 200:
-                log.info("%s %s returned %s", attachment.kind, url, response.status)
-                return None
-            # A redirect must not carry the fetch onto another host.
-            if urllib.parse.urlsplit(str(response.url)).hostname not in hosts:
-                log.info("%s %s redirected away from %s", attachment.kind, url, hosts)
-                return None
-            content_type = response.headers.get("content-type", "").split(";", 1)[0]
-            if not content_type.startswith(prefix):
-                log.info(
-                    "%s %s is %s",
-                    attachment.kind,
-                    url,
-                    content_type or f"not {prefix.rstrip('/')}",
-                )
-                return None
-            if (response.content_length or 0) > limit:
-                log.info("%s %s is over %d bytes", attachment.kind, url, limit)
-                return None
-            data = bytearray()
-            async for piece in response.content.iter_chunked(1 << 16):
-                data += piece
-                if len(data) > limit:
-                    log.info("%s %s grew over %d bytes", attachment.kind, url, limit)
-                    return None
-            return bytes(data), content_type
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        log.info("cannot download %s: %s", url, exc)
-        return None
+    candidates = tuple(item for item in attachment.candidates if _video_url(item))
+    urls = (
+        await _ranked(session, candidates)
+        if attachment.kind == "video" and candidates
+        else [attachment.url]
+    )
+    for url in urls:
+        fetched = await _fetch(session, url, attachment.kind, hosts, prefix, limit)
+        if fetched is not None:
+            return fetched
+    return None

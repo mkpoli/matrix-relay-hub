@@ -35,8 +35,18 @@ class FakeQQ:
 
 
 class FakeMatrix:
+    def __init__(self):
+        self.sent = []
+
     async def member(self, room_id, user_id):
         return {"displayname": "Alice"}
+
+    async def send_message(self, room_id, user_id, content):
+        self.sent.append((room_id, user_id, content))
+        return f"$m{len(self.sent)}"
+
+    async def join(self, room_id, user_id):
+        pass
 
     async def download(self, url, max_bytes=None):
         return b"image"
@@ -715,3 +725,50 @@ label = "in"
         encoding="utf-8",
     )
     assert load(cfg_path).relay_reactions is False
+
+
+def qq_group_message(content, *, msg_id="Q1", ref_idx=None):
+    data = {
+        "group_openid": "G",
+        "id": msg_id,
+        "author": {"member_openid": "M1", "username": "Alice"},
+        "content": content,
+    }
+    if ref_idx:
+        data["message_scene"] = {"ext": [f"msg_idx={ref_idx}"]}
+    return data
+
+
+def test_long_qq_text_goes_out_as_several_messages(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    relay._incoming = ROOM
+    asyncio.run(relay._on_group_message(qq_group_message("x" * 4500)))
+
+    payloads = [content for _, _, content in relay.matrix.sent]
+    assert len(payloads) == 3
+    assert "".join(payload["body"] for payload in payloads) == "x" * 4500
+    assert all("formatted_body" not in payload for payload in payloads)
+    store.close()
+
+
+def test_only_the_first_part_quotes_the_replied_message(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    relay._incoming = ROOM
+    store.add_message("Q0", "G", ROOM, "$parent", "REF1", "qq")
+    asyncio.run(relay._on_group_message(qq_group_message("y" * 4500, ref_idx="REF1")))
+
+    payloads = [content for _, _, content in relay.matrix.sent]
+    assert payloads[0]["m.relates_to"] == {"m.in_reply_to": {"event_id": "$parent"}}
+    assert all("m.relates_to" not in payload for payload in payloads[1:])
+    store.close()
+
+
+def test_a_short_qq_text_keeps_its_markup_and_one_transaction(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    relay._incoming = ROOM
+    asyncio.run(relay._on_group_message(qq_group_message("hello <@all>")))
+
+    (payload,) = [content for _, _, content in relay.matrix.sent]
+    assert payload["formatted_body"]
+    assert payload["body"] == "hello @全体成员"
+    store.close()

@@ -6,6 +6,7 @@ from qq_bridge.formatting import (
     replace_faces,
     strip_leading_mentions,
     strip_reply_fallback,
+    utf16_length,
 )
 
 
@@ -144,3 +145,15 @@ def test_format_reaction_key_handles_emojis_shortcodes_and_mxc():
         == ":blob:"
     )
     assert format_reaction_key("x" * 150) == ("x" * 100) + "..."
+
+
+def test_chunk_measures_utf16_code_units():
+    text = "😀" * 120
+    parts = chunk(text, limit=100)
+    assert "".join(parts) == text
+    assert all(utf16_length(part) <= 100 for part in parts)
+
+
+def test_chunk_leaves_a_character_that_would_pass_the_limit():
+    text = "a" * 1999 + "😀"
+    assert chunk(text, limit=2000) == ["a" * 1999, "😀"]

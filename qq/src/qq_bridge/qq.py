@@ -146,11 +146,20 @@ class QQClient:
         )
         return response["file_info"]
 
-    async def send_group_media(self, group_openid: str, file_info: str) -> dict:
+    async def send_group_media(
+        self,
+        group_openid: str,
+        file_info: str,
+        *,
+        msg_id: str | None = None,
+        msg_seq: int = 1,
+    ) -> dict:
+        payload: dict = {"msg_type": 7, "media": {"file_info": file_info}}
+        if msg_id:
+            payload["msg_id"] = msg_id
+            payload["msg_seq"] = msg_seq
         return await self.request(
-            "POST",
-            f"/v2/groups/{group_openid}/messages",
-            json={"msg_type": 7, "media": {"file_info": file_info}},
+            "POST", f"/v2/groups/{group_openid}/messages", json=payload
         )
 
     async def delete_group_message(self, group_openid: str, message_id: str) -> None:

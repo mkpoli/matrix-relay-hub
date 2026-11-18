@@ -60,6 +60,13 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS tweets (
+    group_openid TEXT NOT NULL,
+    status_id TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    PRIMARY KEY (group_openid, status_id)
+);
 """
 
 
@@ -206,6 +213,29 @@ class Store:
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """,
             (key, value),
+        )
+
+    # -- expanded tweets --------------------------------------------------
+
+    def tweet_recent(self, group_openid: str, status_id: str, seconds: int) -> bool:
+        """Whether this group already got the post within `seconds`."""
+        row = self.conn.execute(
+            "SELECT 1 FROM tweets WHERE group_openid = ? AND status_id = ? AND ts >= ?",
+            (group_openid, status_id, int(time.time()) - seconds),
+        ).fetchone()
+        return row is not None
+
+    def mark_tweet(self, group_openid: str, status_id: str) -> None:
+        now = int(time.time())
+        # A day is far longer than the duplicate window; keeping the table
+        # small costs one delete per expansion.
+        self.conn.execute("DELETE FROM tweets WHERE ts < ?", (now - 86_400,))
+        self.conn.execute(
+            """
+            INSERT INTO tweets(group_openid, status_id, ts) VALUES(?, ?, ?)
+            ON CONFLICT(group_openid, status_id) DO UPDATE SET ts = excluded.ts
+            """,
+            (group_openid, status_id, now),
         )
 
     # -- transactions -----------------------------------------------------

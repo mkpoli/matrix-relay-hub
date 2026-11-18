@@ -184,7 +184,7 @@ def local_time(value: datetime.datetime | None) -> str:
 
 
 def _video_url(url: Any) -> str | None:
-    """A playable MP4 URL on X's video host, or None."""
+    """A playable H.264 MP4 URL on X's video host, or None."""
     if not isinstance(url, str):
         return None
     try:
@@ -193,18 +193,24 @@ def _video_url(url: Any) -> str | None:
         return None
     if parts.scheme != "https" or parts.hostname not in VIDEO_HOSTS:
         return None
-    if not parts.path.lower().endswith(".mp4") or "hevc" in url.lower():
+    path = parts.path.lower()
+    if not path.endswith(".mp4"):
+        return None
+    if set(path.split("/")) & {"hevc", "av1", "av01", "vp9"}:
         return None
     return url
 
 
 def _variants(item: dict[str, Any]) -> tuple[tuple[int, bool, str], ...]:
-    """The MP4 variants of a video or GIF: (bitrate, is_h264, url)."""
+    """The H.264 MP4 variants of a video or GIF: (bitrate, is_h264, url)."""
     variants: list[tuple[int, bool, str]] = []
     formats = item.get("formats")
     if isinstance(formats, list):
         for fmt in formats:
             if not isinstance(fmt, dict):
+                continue
+            codec = str(fmt.get("codec") or "").lower()
+            if codec and codec not in ("h264", "avc1"):
                 continue
             url = _video_url(fmt.get("url"))
             if url is None:
@@ -212,7 +218,7 @@ def _variants(item: dict[str, Any]) -> tuple[tuple[int, bool, str], ...]:
             bitrate = fmt.get("bitrate")
             if not isinstance(bitrate, (int, float)) or bitrate < 0:
                 bitrate = 0
-            h264 = str(fmt.get("codec") or "").lower() == "h264" or "avc1" in url
+            h264 = codec in ("h264", "avc1") or "avc1" in url.lower()
             variants.append((int(bitrate), h264, url))
     if not variants:
         url = _video_url(item.get("url"))
@@ -430,16 +436,19 @@ async def _content_length(session: aiohttp.ClientSession, url: str) -> int | Non
 
 
 async def _ranked(
-    session: aiohttp.ClientSession, candidates: tuple[str, ...]
+    session: aiohttp.ClientSession,
+    candidates: tuple[str, ...],
+    limit: int = QQ_TARGET,
 ) -> list[str]:
     """Candidates best first, with those that fit QQ ahead of the rest."""
     if len(candidates) == 1:
         return [candidates[0]]
+    budget = min(QQ_TARGET, limit)
     sizes = await asyncio.gather(*(_content_length(session, url) for url in candidates))
     fitting = [
         url
         for url, size in zip(candidates, sizes)
-        if size is not None and size <= QQ_TARGET
+        if size is not None and size <= budget
     ]
     if fitting:
         return fitting + [url for url in candidates if url not in fitting]
@@ -474,7 +483,8 @@ async def _fetch(
             if urllib.parse.urlsplit(str(response.url)).hostname not in hosts:
                 log.info("%s %s redirected away from %s", kind, url, hosts)
                 return None
-            content_type = response.headers.get("content-type", "").split(";", 1)[0]
+            raw_type = response.headers.get("content-type", "")
+            content_type = raw_type.split(";", 1)[0].strip().lower()
             if not content_type.startswith(prefix):
                 log.info(
                     "%s %s is %s",
@@ -511,11 +521,11 @@ async def download(
     else:
         if _video_url(attachment.url) is None:
             return None
-        hosts, prefix, cap = VIDEO_HOSTS, "video/", MAX_VIDEO
+        hosts, prefix, cap = VIDEO_HOSTS, "video/mp4", MAX_VIDEO
     limit = cap if max_bytes is None else max_bytes
     candidates = tuple(item for item in attachment.candidates if _video_url(item))
     urls = (
-        await _ranked(session, candidates)
+        await _ranked(session, candidates, limit)
         if attachment.kind == "video" and candidates
         else [attachment.url]
     )

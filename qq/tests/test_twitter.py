@@ -331,7 +331,7 @@ def test_download_falls_back_to_the_next_variant(monkeypatch):
     big = "https://video.twimg.com/4k.mp4"
     small = "https://video.twimg.com/hd.mp4"
 
-    async def ranked(session, candidates):
+    async def ranked(session, candidates, limit=0):
         return [big, small]
 
     async def fetch(session, url, kind, hosts, prefix, limit):
@@ -345,7 +345,7 @@ def test_download_falls_back_to_the_next_variant(monkeypatch):
     assert got == (b"mp4", "video/mp4")
 
 
-def test_hevc_and_playlists_are_skipped_for_a_takeable_mp4():
+def test_hevc_av1_vp9_and_playlists_are_skipped_for_a_takeable_mp4():
     link = twitter.find("https://x.com/a/status/1")[0]
     tweet = _video_tweet(
         10,
@@ -357,6 +357,16 @@ def test_hevc_and_playlists_are_skipped_for_a_takeable_mp4():
                 "codec": "hevc",
             },
             {
+                "url": "https://video.twimg.com/av1/1080.mp4",
+                "bitrate": 8000000,
+                "codec": "av1",
+            },
+            {
+                "url": "https://video.twimg.com/vp9/1080.mp4",
+                "bitrate": 7000000,
+                "codec": "vp9",
+            },
+            {
                 "url": "https://video.twimg.com/avc1/480.mp4",
                 "bitrate": 256000,
                 "codec": "h264",
@@ -364,6 +374,7 @@ def test_hevc_and_playlists_are_skipped_for_a_takeable_mp4():
         ],
     )
     post = twitter.parse(tweet, link)
+    assert post.media[0].variants == ("https://video.twimg.com/avc1/480.mp4",)
     assert twitter.attachments(post) == [
         twitter.Attachment("video", "https://video.twimg.com/avc1/480.mp4")
     ]

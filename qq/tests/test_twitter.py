@@ -317,14 +317,24 @@ def test_the_smallest_variant_is_tried_first_when_none_fit(monkeypatch):
     ) == ["https://video.twimg.com/hd.mp4", "https://video.twimg.com/4k.mp4"]
 
 
-def test_the_best_variant_is_tried_first_when_sizes_are_unknown(monkeypatch):
+def test_the_smallest_variant_is_tried_first_when_sizes_are_unknown(monkeypatch):
     _sizes(monkeypatch, {})
     assert asyncio.run(
         twitter._ranked(
             object(),
             ("https://video.twimg.com/4k.mp4", "https://video.twimg.com/hd.mp4"),
         )
-    ) == ["https://video.twimg.com/4k.mp4", "https://video.twimg.com/hd.mp4"]
+    ) == ["https://video.twimg.com/hd.mp4", "https://video.twimg.com/4k.mp4"]
+
+
+def test_an_unmeasured_variant_is_tried_before_an_oversized_one(monkeypatch):
+    _sizes(monkeypatch, {"https://video.twimg.com/4k.mp4": 40_000_000})
+    assert asyncio.run(
+        twitter._ranked(
+            object(),
+            ("https://video.twimg.com/4k.mp4", "https://video.twimg.com/hd.mp4"),
+        )
+    ) == ["https://video.twimg.com/hd.mp4", "https://video.twimg.com/4k.mp4"]
 
 
 def test_download_falls_back_to_the_next_variant(monkeypatch):

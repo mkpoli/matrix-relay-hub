@@ -440,7 +440,7 @@ async def _ranked(
     candidates: tuple[str, ...],
     limit: int = QQ_TARGET,
 ) -> list[str]:
-    """Candidates best first, with those that fit QQ ahead of the rest."""
+    """Try order: the best that fits QQ, then smaller ones."""
     if len(candidates) == 1:
         return [candidates[0]]
     budget = min(QQ_TARGET, limit)
@@ -457,10 +457,11 @@ async def _ranked(
     )
     if known:
         measured = {url for _, url in known}
-        return [url for _, url in known] + [
-            url for url in candidates if url not in measured
-        ]
-    return list(candidates)
+        unmeasured = [url for url in reversed(candidates) if url not in measured]
+        return unmeasured + [url for _, url in known]
+    # Nothing was measured: start with the least demanding variant, because a
+    # download that turns out too large cannot fall back.
+    return list(reversed(candidates))
 
 
 async def _fetch(

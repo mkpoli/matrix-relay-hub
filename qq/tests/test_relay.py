@@ -293,6 +293,28 @@ def test_media_is_queued(tmp_path):
     store.close()
 
 
+def test_matrix_sticker_is_sent_as_an_image(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    event = {
+        "room_id": ROOM,
+        "sender": "@alice:example.org",
+        "type": "m.sticker",
+        "event_id": "$sticker",
+        "content": {
+            "body": "开心",
+            "url": "mxc://example.org/sticker",
+            "info": {"mimetype": "image/png", "w": 128, "h": 128},
+        },
+    }
+    asyncio.run(relay.handle_matrix_event(event))
+    job = relay._queue.get_nowait()
+    assert job["kind"] == "media"
+    assert relay._images.get_nowait() is job
+    assert job["content"]["msgtype"] == "m.image"
+    assert job["content"]["url"] == "mxc://example.org/sticker"
+    store.close()
+
+
 def test_redaction_deletes_the_qq_copy(tmp_path):
     qq = FakeQQ()
     relay, store = make_relay(tmp_path, qq)

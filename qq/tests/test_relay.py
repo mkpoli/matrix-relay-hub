@@ -187,6 +187,15 @@ def test_text_is_queued_with_label(tmp_path):
     store.close()
 
 
+def test_a_message_that_is_all_quote_reaches_qq(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    body = "> 자음\n> \n> ㄱ  1획\n> ㅋ  2획  *ㄱ에 1획을 더한 글자\n"
+    asyncio.run(relay.handle_matrix_event(text_event(body, format="org.matrix.custom.html",
+                                                     formatted_body="<blockquote><p>자음</p></blockquote>")))
+    assert relay._queue.get_nowait()["text"].startswith("[M] Alice: > 자음")
+    store.close()
+
+
 def test_single_room_has_no_label(tmp_path):
     relay, store = make_relay(tmp_path, FakeQQ())
     asyncio.run(relay.handle_matrix_event(text_event()))

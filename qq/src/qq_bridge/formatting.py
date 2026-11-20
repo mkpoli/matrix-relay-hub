@@ -187,13 +187,20 @@ def render_qq_text(
     return "".join(body).strip(), "".join(markup).strip()
 
 
+REPLY_FALLBACK = re.compile(r"> (?:\* )?<[@!#][^\s>]+>")
+
+
 def strip_reply_fallback(body: str) -> str:
-    """Drop the `> <@user> ...` block Matrix clients put in front of replies."""
+    """Drop the `> <@user> ...` block Matrix clients put in front of replies. Only a block that
+    opens the way the spec writes a fallback is dropped: a message that is itself a quote (a
+    Markdown blockquote ends up as `> ...` lines) is kept whole."""
     lines = body.split("\n")
+    if not lines or not REPLY_FALLBACK.match(lines[0]):
+        return body
     index = 0
     while index < len(lines) and lines[index].startswith(">"):
         index += 1
-    if index and index < len(lines) and lines[index] == "":
+    if index < len(lines) and lines[index] == "":
         return "\n".join(lines[index + 1 :])
     return body
 

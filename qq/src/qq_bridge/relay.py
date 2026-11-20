@@ -315,7 +315,7 @@ class Relay:
         if event_type == "m.room.redaction":
             await self._redact(event)
             return
-        if event_type not in ("m.room.message", "m.reaction"):
+        if event_type not in ("m.room.message", "m.sticker", "m.reaction"):
             return
         if event_type == "m.reaction" and not self.cfg.relay_reactions:
             return
@@ -331,6 +331,11 @@ class Relay:
             await self._handle_reaction(event, room_id, sender, label)
             return
         content = event.get("content") or {}
+        if event_type == "m.sticker":
+            # A sticker has no msgtype; send it as the image or video it holds.
+            mimetype = str((content.get("info") or {}).get("mimetype") or "")
+            kind = "m.video" if mimetype.startswith("video/") else "m.image"
+            content = {**content, "msgtype": kind}
         if is_edit(content):
             log.debug("ignoring an edit in %s", room_id)
             return

@@ -61,6 +61,18 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS superseded (
+    event_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    ts INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS edits (
+    edit_id TEXT PRIMARY KEY,
+    target TEXT NOT NULL,
+    ts INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS tweets (
     group_openid TEXT NOT NULL,
     status_id TEXT NOT NULL,
@@ -159,9 +171,38 @@ class Store:
             (event_id,),
         ).fetchall()
 
-    def forget_event_messages(self, event_id: str) -> None:
+    def forget_messages(self, qq_ids: list[str]) -> None:
+        self.conn.executemany("DELETE FROM messages WHERE qq_id = ?", [(qq_id,) for qq_id in qq_ids])
+
+    # -- edits and redactions -------------------------------------------------
+
+    def supersede(self, event_id: str, kind: str) -> None:
+        """Record that an event was edited or redacted, so its old text is never sent again."""
         self.conn.execute(
-            "DELETE FROM messages WHERE event_id = ? AND direction = 'matrix'", (event_id,)
+            """
+            INSERT INTO superseded(event_id, kind, ts) VALUES(?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                kind = CASE WHEN superseded.kind = 'redacted' THEN 'redacted' ELSE excluded.kind END,
+                ts = excluded.ts
+            """,
+            (event_id, kind, int(time.time())),
+        )
+
+    def superseded(self, event_id: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT kind FROM superseded WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        return row["kind"] if row else None
+
+    def edit_done(self, edit_id: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM edits WHERE edit_id = ?", (edit_id,)
+        ).fetchone() is not None
+
+    def mark_edit_done(self, edit_id: str, target: str) -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO edits(edit_id, target, ts) VALUES(?, ?, ?)",
+            (edit_id, target, int(time.time())),
         )
 
     def qq_for_event(self, event_id: str) -> sqlite3.Row | None:

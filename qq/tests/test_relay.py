@@ -77,6 +77,12 @@ class FakeMatrix:
         self.sent = []
         self.session = FakeSession()
 
+    authors = {"$orig": "@alice:example.org", "$pic": "@alice:example.org", "$long": "@alice:example.org"}
+
+    async def event(self, room_id, event_id, user_id=None):
+        author = self.authors.get(event_id)
+        return {"event_id": event_id, "sender": author} if author else None
+
     async def member(self, room_id, user_id):
         return {"displayname": "Alice"}
 
@@ -251,18 +257,39 @@ def edit_event(body="fixed", target="$orig", msgtype="m.text", event_id="$edit")
     return event
 
 
+def run_edit(relay):
+    job = relay._queue.get_nowait()
+    assert job["kind"] == "edit"
+    asyncio.run(relay._send_edit(job))
+    return job
+
+
 def test_an_edit_recalls_the_qq_copy_and_sends_the_new_text(tmp_path):
     qq = FakeQQ()
     relay, store = make_relay(tmp_path, qq)
     store.add_message("Q1", "G", ROOM, "$orig", "REF1", "matrix")
     store.add_message("Q2", "G", ROOM, "$orig", "REF2", "matrix")
     asyncio.run(relay.handle_matrix_event(edit_event()))
+    run_edit(relay)
     assert qq.deleted == ["Q1", "Q2"]
-    job = relay._queue.get_nowait()
-    assert job["text"] == "[M] Alice: fixed" and job["event_id"] == "$orig"
-    assert store.qq_messages_for_event("$orig") == []
+    assert qq.sent[-1][1] == "[M] Alice: fixed"
+    assert [row["qq_id"] for row in store.qq_messages_for_event("$orig")] == ["Q1"]
     asyncio.run(relay.handle_matrix_event(edit_event()))
     assert relay._queue.empty(), "a redelivered edit is not sent twice"
+    asyncio.run(relay.handle_matrix_event(text_event("old text") | {"event_id": "$orig"}))
+    assert relay._queue.empty(), "the original's old text is never sent again"
+    store.close()
+
+
+def test_a_second_edit_replaces_the_first(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    store.add_message("Q0", "G", ROOM, "$orig", "REF0", "matrix")
+    asyncio.run(relay.handle_matrix_event(edit_event("v1")))
+    asyncio.run(relay.handle_matrix_event(edit_event("v2", event_id="$edit2")))
+    run_edit(relay)
+    run_edit(relay)
+    assert qq.deleted == ["Q0", "Q1"] and qq.sent[-1][1] == "[M] Alice: v2"
     store.close()
 
 
@@ -270,9 +297,33 @@ def test_an_edit_qq_will_not_recall_is_marked(tmp_path):
     qq = FakeQQ()
     qq.delete_error = QQError(40054005, "too old")
     relay, store = make_relay(tmp_path, qq)
+    store.add_message("QOLD", "G", ROOM, "$orig", "REFOLD", "matrix")
+    asyncio.run(relay.handle_matrix_event(edit_event()))
+    run_edit(relay)
+    assert qq.sent[-1][1] == "[M] Alice ✎: fixed"
+    assert {row["qq_id"] for row in store.qq_messages_for_event("$orig")} == {"QOLD", "Q1"}, "the old copy is still on QQ"
+    store.close()
+
+
+def test_a_recall_that_may_pass_later_keeps_the_edit(tmp_path):
+    qq = FakeQQ()
+    qq.delete_error = QQError(429, "slow down", status=429)
+    relay, store = make_relay(tmp_path, qq)
     store.add_message("Q1", "G", ROOM, "$orig", "REF1", "matrix")
     asyncio.run(relay.handle_matrix_event(edit_event()))
-    assert relay._queue.get_nowait()["text"] == "[M] Alice ✎: fixed"
+    job = run_edit(relay)
+    assert qq.sent == [] and not store.edit_done("$edit")
+    store.close()
+
+
+def test_an_edit_by_someone_else_is_ignored(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    store.add_message("Q1", "G", ROOM, "$orig", "REF1", "matrix")
+    event = edit_event()
+    event["sender"] = "@mallory:example.org"
+    asyncio.run(relay.handle_matrix_event(event))
+    assert relay._queue.empty() and qq.deleted == []
     store.close()
 
 
@@ -403,6 +454,8 @@ def test_redaction_recalls_every_part_of_a_long_text(tmp_path):
              "redacts": "$long", "content": {}}
     asyncio.run(relay.handle_matrix_event(event))
     assert qq.deleted == ["Q1", "Q2", "Q3"]
+    asyncio.run(relay.handle_matrix_event(text_event("redacted text") | {"event_id": "$long"}))
+    assert relay._queue.empty(), "a retry of the redacted original sends nothing"
     store.close()
 
 
@@ -1417,4 +1470,17 @@ def test_qq_passive_reply_stops_at_five_parts(tmp_path, monkeypatch):
     asyncio.run(relay._send_tweet_post(post, "G", "Q7"))
     assert [seq for _, seq in qq.text_replies] == [1, 2, 3]
     assert [seq for _, seq in qq.media_replies] == [4, 5]
+    store.close()
+
+
+def test_an_edit_of_a_text_still_queued_replaces_it(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    asyncio.run(relay.handle_matrix_event(text_event("typo") | {"event_id": "$orig"}))
+    asyncio.run(relay.handle_matrix_event(edit_event()))
+    original = relay._queue.get_nowait()
+    asyncio.run(relay._send_text(original))
+    relay._finish(original)
+    run_edit(relay)
+    assert [text for _, text, _ in qq.sent] == ["[M] Alice: fixed"]
     store.close()

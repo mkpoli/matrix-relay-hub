@@ -95,7 +95,6 @@ class Relay:
         self._inflight_events: dict[str, int] = {}
         self._keep: set[int] = set()
         self._claimed: set[int] = set()
-        self._edits: dict[str, None] = {}
         self._rooms: dict[str, str] = {}
         self._labels: dict[str, str] = {}
         self._incoming: str | None = None
@@ -344,6 +343,9 @@ class Relay:
         event_id = event.get("event_id", "")
         if self.cfg.ignore_notices and msgtype == "m.notice":
             return
+        if event_id and self.store.superseded(event_id):
+            log.debug("ignoring %s, edited or redacted since", event_id)
+            return
         # A long text posts several QQ messages; after a restart only the parts
         # not yet posted are sent.
         sent = self.store.sent_count(event_id) if event_id else 0
@@ -496,71 +498,113 @@ class Relay:
         target = event.get("redacts") or (event.get("content") or {}).get("redacts")
         if not target:
             return
+        self.store.supersede(target, "redacted")
         await self._recall(target)
 
-    async def _recall(self, event_id: str) -> bool:
-        """Recall every QQ message a Matrix event was sent as (a long text is several), and
-        forget them; False when QQ refused any recall."""
-        recalled = True
+    async def _recall(self, event_id: str) -> tuple[bool, bool]:
+        """Recall every QQ message a Matrix event was sent as (a long text is several) and forget
+        those QQ took back. Answers (refused, transient): whether QQ refused some for good, as for
+        an old message, and whether some failed in a way worth retrying."""
+        refused = transient = False
+        recalled = []
         for row in self.store.qq_messages_for_event(event_id):
             try:
                 await self.qq.delete_group_message(row["group_openid"], row["qq_id"])
             except QQError as exc:
                 log.info("cannot recall QQ message %s: %s", row["qq_id"], exc)
-                recalled = False
-        self.store.forget_event_messages(event_id)
-        return recalled
+                if _transient(exc):
+                    transient = True
+                else:
+                    refused = True
+                continue
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                log.info("cannot reach QQ to recall %s: %s", row["qq_id"], exc)
+                transient = True
+                continue
+            recalled.append(row["qq_id"])
+        self.store.forget_messages(recalled)
+        return refused, transient
 
     async def _handle_edit(
         self, event: dict, room_id: str, sender: str, label: str, content: dict
     ) -> None:
-        """A Matrix edit of a text that reached QQ: recall the QQ copy and send the new text in
-        its place, under the original event so a later edit or redaction finds it. When QQ
-        refuses the recall (an old message), the new text is marked as an edit."""
+        """A Matrix edit, by its author, of a text that is on QQ or on its way: queue a job that
+        recalls the QQ copy and sends the new text under the original event, so a later edit or
+        redaction finds it. From here on the original's old text is never sent again."""
         target = (content.get("m.relates_to") or {}).get("event_id")
         new = content.get("m.new_content")
-        if not isinstance(target, str) or not isinstance(new, dict):
+        edit_id = event.get("event_id", "")
+        if not isinstance(target, str) or not isinstance(new, dict) or not edit_id:
             return
         msgtype = new.get("msgtype")
         if msgtype not in ("m.text", "m.emote"):
             log.debug("ignoring an edit of a %s in %s", msgtype, room_id)
             return
-        edit_id = event.get("event_id", "")
-        if edit_id in self._edits:
+        if self.store.edit_done(edit_id) or self.store.superseded(target) == "redacted":
             return
-        if not self.store.qq_messages_for_event(target):
-            log.debug("ignoring an edit of %s, which did not reach QQ", target)
+        known = (
+            self.store.qq_messages_for_event(target)
+            or self.store.superseded(target) == "edited"
+            or self._inflight_events.get(target)
+        )
+        if not known:
+            log.debug("ignoring an edit of %s, which is not on QQ", target)
+            return
+        original = await self.matrix.event(room_id, target, self.bot_mxid)
+        if not original or original.get("sender") != sender:
+            log.info("ignoring an edit of %s by someone other than its author", target)
             return
         body = str(new.get("body") or "")
         if not body.strip():
             return
-        if edit_id:
-            self._edits[edit_id] = None
-            while len(self._edits) > 1024:
-                self._edits.pop(next(iter(self._edits)))
-        recalled = await self._recall(target)
         name = await self._display_name(room_id, sender)
-        if not recalled:
-            name = f"{name} ✎"
         source = f"[{source_tag(sender)}] "
         tag = f"[{label}] " if self._tagged else ""
-        text = (
-            f"{source}{tag}* {name} {body}"
-            if msgtype == "m.emote"
-            else f"{source}{tag}{name}: {body}"
+
+        def line(who: str) -> str:
+            if msgtype == "m.emote":
+                return f"{source}{tag}* {who} {body}"
+            return f"{source}{tag}{who}: {body}"
+
+        self.store.supersede(target, "edited")
+        self._put(
+            {
+                "kind": "edit",
+                "group": self.cfg.qq.group,
+                "room": room_id,
+                "event_id": target,
+                "edit_id": edit_id,
+                "text": line(name),
+                "marked": line(f"{name} ✎"),
+            }
         )
-        log.info("relaying an edit of %s (%s)", target, "recalled" if recalled else "kept")
+
+    async def _send_edit(self, job: dict) -> None:
+        """Recall the original's QQ copy, then send the edited text in its place. A recall that
+        failed for now keeps the edit for retry; one QQ refused for good leaves the old copy and
+        marks the new text as an edit."""
+        refused, transient = await self._recall(job["event_id"])
+        if transient:
+            self._retry_later(job)
+            return
+        text = job["marked"] if refused else job["text"]
         for part in chunk(text):
-            self._put(
+            await self._send_text(
                 {
                     "kind": "text",
-                    "group": self.cfg.qq.group,
-                    "room": room_id,
-                    "event_id": target,
+                    "group": job["group"],
+                    "room": job["room"],
+                    "event_id": job["event_id"],
                     "text": part,
                     "reference": None,
+                    "edit": True,
+                    "pending": job.get("pending"),
                 }
             )
+            if job.get("pending") in self._keep:
+                return
+        self.store.mark_edit_done(job["edit_id"], job["event_id"])
+        log.info("relayed an edit of %s (%s)", job["event_id"], "kept" if refused else "recalled")
 
     # -- outbound queue ---------------------------------------------------
 
@@ -576,6 +620,8 @@ class Relay:
             try:
                 if job["kind"] == "text":
                     await self._send_text(job)
+                elif job["kind"] == "edit":
+                    await self._send_edit(job)
                 else:
                     deferred = await self._send_media(job)
             except Exception:
@@ -595,6 +641,10 @@ class Relay:
         return True
 
     async def _send_text(self, job: dict) -> None:
+        event_id = job.get("event_id")
+        if event_id and not job.get("edit") and self.store.superseded(event_id):
+            log.debug("dropping a queued part of %s, edited or redacted since", event_id)
+            return
         reference = job.get("reference")
         if reference is None and job.get("reference_event"):
             reference = self._reference_for_event(job["reference_event"])

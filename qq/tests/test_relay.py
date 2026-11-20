@@ -315,6 +315,26 @@ def test_matrix_sticker_is_sent_as_an_image(tmp_path):
     store.close()
 
 
+def test_video_sticker_takes_the_video_lane(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    event = {
+        "room_id": ROOM,
+        "sender": "@telegram_99:example.org",
+        "type": "m.sticker",
+        "event_id": "$vsticker",
+        "content": {
+            "body": "wave",
+            "url": "mxc://example.org/wave",
+            "info": {"mimetype": "video/webm"},
+        },
+    }
+    asyncio.run(relay.handle_matrix_event(event))
+    job = relay._queue.get_nowait()
+    assert relay._videos.get_nowait() is job
+    assert job["content"]["msgtype"] == "m.video"
+    store.close()
+
+
 def test_redaction_deletes_the_qq_copy(tmp_path):
     qq = FakeQQ()
     relay, store = make_relay(tmp_path, qq)

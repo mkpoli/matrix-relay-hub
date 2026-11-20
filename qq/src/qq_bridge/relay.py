@@ -332,8 +332,10 @@ class Relay:
             return
         content = event.get("content") or {}
         if event_type == "m.sticker":
-            # A sticker carries an image without a msgtype; QQ takes it as one.
-            content = {**content, "msgtype": "m.image"}
+            # A sticker has no msgtype; send it as the image or video it holds.
+            mimetype = str((content.get("info") or {}).get("mimetype") or "")
+            kind = "m.video" if mimetype.startswith("video/") else "m.image"
+            content = {**content, "msgtype": kind}
         if is_edit(content):
             log.debug("ignoring an edit in %s", room_id)
             return

@@ -70,7 +70,8 @@ CREATE TABLE IF NOT EXISTS superseded (
 CREATE TABLE IF NOT EXISTS edits (
     edit_id TEXT PRIMARY KEY,
     target TEXT NOT NULL,
-    ts INTEGER NOT NULL
+    ts INTEGER NOT NULL,
+    sent_ts INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS tweets (
@@ -199,11 +200,19 @@ class Store:
             "SELECT 1 FROM edits WHERE edit_id = ?", (edit_id,)
         ).fetchone() is not None
 
-    def mark_edit_done(self, edit_id: str, target: str) -> None:
+    def mark_edit_done(self, edit_id: str, target: str, sent_ts: int = 0) -> None:
+        """Record an edit as applied; `sent_ts` is when its author made it, to order edits."""
         self.conn.execute(
-            "INSERT OR IGNORE INTO edits(edit_id, target, ts) VALUES(?, ?, ?)",
-            (edit_id, target, int(time.time())),
+            "INSERT OR IGNORE INTO edits(edit_id, target, ts, sent_ts) VALUES(?, ?, ?, ?)",
+            (edit_id, target, int(time.time()), sent_ts),
         )
+
+    def newest_edit(self, target: str) -> int:
+        """When the newest edit applied to an event was made, or 0."""
+        row = self.conn.execute(
+            "SELECT max(sent_ts) AS ts FROM edits WHERE target = ?", (target,)
+        ).fetchone()
+        return int(row["ts"] or 0)
 
     def qq_for_event(self, event_id: str) -> sqlite3.Row | None:
         return self.conn.execute(

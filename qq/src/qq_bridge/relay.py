@@ -95,6 +95,7 @@ class Relay:
         self._inflight_events: dict[str, int] = {}
         self._keep: set[int] = set()
         self._claimed: set[int] = set()
+        self._edits: dict[str, None] = {}
         self._rooms: dict[str, str] = {}
         self._labels: dict[str, str] = {}
         self._incoming: str | None = None
@@ -337,7 +338,7 @@ class Relay:
             kind = "m.video" if mimetype.startswith("video/") else "m.image"
             content = {**content, "msgtype": kind}
         if is_edit(content):
-            log.debug("ignoring an edit in %s", room_id)
+            await self._handle_edit(event, room_id, sender, label, content)
             return
         msgtype = content.get("msgtype")
         event_id = event.get("event_id", "")
@@ -495,13 +496,71 @@ class Relay:
         target = event.get("redacts") or (event.get("content") or {}).get("redacts")
         if not target:
             return
-        row = self.store.qq_for_event(target)
-        if not row:
+        await self._recall(target)
+
+    async def _recall(self, event_id: str) -> bool:
+        """Recall every QQ message a Matrix event was sent as (a long text is several), and
+        forget them; False when QQ refused any recall."""
+        recalled = True
+        for row in self.store.qq_messages_for_event(event_id):
+            try:
+                await self.qq.delete_group_message(row["group_openid"], row["qq_id"])
+            except QQError as exc:
+                log.info("cannot recall QQ message %s: %s", row["qq_id"], exc)
+                recalled = False
+        self.store.forget_event_messages(event_id)
+        return recalled
+
+    async def _handle_edit(
+        self, event: dict, room_id: str, sender: str, label: str, content: dict
+    ) -> None:
+        """A Matrix edit of a text that reached QQ: recall the QQ copy and send the new text in
+        its place, under the original event so a later edit or redaction finds it. When QQ
+        refuses the recall (an old message), the new text is marked as an edit."""
+        target = (content.get("m.relates_to") or {}).get("event_id")
+        new = content.get("m.new_content")
+        if not isinstance(target, str) or not isinstance(new, dict):
             return
-        try:
-            await self.qq.delete_group_message(row["group_openid"], row["qq_id"])
-        except QQError as exc:
-            log.info("cannot recall QQ message %s: %s", row["qq_id"], exc)
+        msgtype = new.get("msgtype")
+        if msgtype not in ("m.text", "m.emote"):
+            log.debug("ignoring an edit of a %s in %s", msgtype, room_id)
+            return
+        edit_id = event.get("event_id", "")
+        if edit_id in self._edits:
+            return
+        if not self.store.qq_messages_for_event(target):
+            log.debug("ignoring an edit of %s, which did not reach QQ", target)
+            return
+        body = str(new.get("body") or "")
+        if not body.strip():
+            return
+        if edit_id:
+            self._edits[edit_id] = None
+            while len(self._edits) > 1024:
+                self._edits.pop(next(iter(self._edits)))
+        recalled = await self._recall(target)
+        name = await self._display_name(room_id, sender)
+        if not recalled:
+            name = f"{name} ✎"
+        source = f"[{source_tag(sender)}] "
+        tag = f"[{label}] " if self._tagged else ""
+        text = (
+            f"{source}{tag}* {name} {body}"
+            if msgtype == "m.emote"
+            else f"{source}{tag}{name}: {body}"
+        )
+        log.info("relaying an edit of %s (%s)", target, "recalled" if recalled else "kept")
+        for part in chunk(text):
+            self._put(
+                {
+                    "kind": "text",
+                    "group": self.cfg.qq.group,
+                    "room": room_id,
+                    "event_id": target,
+                    "text": part,
+                    "reference": None,
+                }
+            )
 
     # -- outbound queue ---------------------------------------------------
 

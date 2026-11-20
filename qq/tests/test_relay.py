@@ -2,6 +2,7 @@ import asyncio
 
 from qq_bridge.config import Config, MatrixConfig, QQConfig, RoomConfig
 from qq_bridge.formatting import chunk
+from qq_bridge.qq import QQError
 from qq_bridge.relay import Relay
 from qq_bridge.store import Store
 
@@ -238,17 +239,50 @@ def test_join_emote_says_which_network(tmp_path):
     store.close()
 
 
-def test_edit_is_ignored(tmp_path):
-    relay, store = make_relay(tmp_path, FakeQQ())
+def edit_event(body="fixed", target="$orig", msgtype="m.text", event_id="$edit"):
     event = text_event(
-        body="* fixed",
+        body=f"* {body}",
         **{
-            "m.new_content": {"body": "fixed", "msgtype": "m.text"},
-            "m.relates_to": {"rel_type": "m.replace", "event_id": "$orig"},
+            "m.new_content": {"body": body, "msgtype": msgtype},
+            "m.relates_to": {"rel_type": "m.replace", "event_id": target},
         },
     )
-    asyncio.run(relay.handle_matrix_event(event))
-    assert relay._queue.empty()
+    event["event_id"] = event_id
+    return event
+
+
+def test_an_edit_recalls_the_qq_copy_and_sends_the_new_text(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    store.add_message("Q1", "G", ROOM, "$orig", "REF1", "matrix")
+    store.add_message("Q2", "G", ROOM, "$orig", "REF2", "matrix")
+    asyncio.run(relay.handle_matrix_event(edit_event()))
+    assert qq.deleted == ["Q1", "Q2"]
+    job = relay._queue.get_nowait()
+    assert job["text"] == "[M] Alice: fixed" and job["event_id"] == "$orig"
+    assert store.qq_messages_for_event("$orig") == []
+    asyncio.run(relay.handle_matrix_event(edit_event()))
+    assert relay._queue.empty(), "a redelivered edit is not sent twice"
+    store.close()
+
+
+def test_an_edit_qq_will_not_recall_is_marked(tmp_path):
+    qq = FakeQQ()
+    qq.delete_error = QQError(40054005, "too old")
+    relay, store = make_relay(tmp_path, qq)
+    store.add_message("Q1", "G", ROOM, "$orig", "REF1", "matrix")
+    asyncio.run(relay.handle_matrix_event(edit_event()))
+    assert relay._queue.get_nowait()["text"] == "[M] Alice ✎: fixed"
+    store.close()
+
+
+def test_an_edit_of_something_qq_never_got_is_ignored(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    asyncio.run(relay.handle_matrix_event(edit_event()))
+    store.add_message("Q1", "G", ROOM, "$pic", "REF1", "matrix")
+    asyncio.run(relay.handle_matrix_event(edit_event(target="$pic", msgtype="m.image", event_id="$e2")))
+    assert relay._queue.empty() and qq.deleted == []
     store.close()
 
 
@@ -357,6 +391,18 @@ def test_redaction_deletes_the_qq_copy(tmp_path):
     }
     asyncio.run(relay.handle_matrix_event(event))
     assert qq.deleted == ["Q9"]
+    store.close()
+
+
+def test_redaction_recalls_every_part_of_a_long_text(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    for part in ("Q1", "Q2", "Q3"):
+        store.add_message(part, "G", ROOM, "$long", None, "matrix")
+    event = {"room_id": ROOM, "sender": "@alice:example.org", "type": "m.room.redaction",
+             "redacts": "$long", "content": {}}
+    asyncio.run(relay.handle_matrix_event(event))
+    assert qq.deleted == ["Q1", "Q2", "Q3"]
     store.close()
 
 

@@ -152,6 +152,18 @@ class Store:
             (event_id,),
         ).fetchone()[0]
 
+    def qq_messages_for_event(self, event_id: str) -> list[sqlite3.Row]:
+        """Every QQ message a Matrix event was sent as, in the order they went out."""
+        return self.conn.execute(
+            "SELECT * FROM messages WHERE event_id = ? AND direction = 'matrix' ORDER BY rowid",
+            (event_id,),
+        ).fetchall()
+
+    def forget_event_messages(self, event_id: str) -> None:
+        self.conn.execute(
+            "DELETE FROM messages WHERE event_id = ? AND direction = 'matrix'", (event_id,)
+        )
+
     def qq_for_event(self, event_id: str) -> sqlite3.Row | None:
         return self.conn.execute(
             "SELECT * FROM messages WHERE event_id = ? AND direction = 'matrix'",

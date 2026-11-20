@@ -54,6 +54,20 @@ def test_strip_reply_fallback_leaves_quotes_in_text():
     assert strip_reply_fallback(body) == body
 
 
+def test_a_message_that_is_a_quote_is_kept():
+    body = "> 자음\n> \n> ㄱ  1획\n> ㅋ  2획  *ㄱ에 1획을 더한 글자\n\n"
+    assert strip_reply_fallback(body) == body
+
+
+def test_a_crlf_or_indented_reply_fallback_is_dropped():
+    assert strip_reply_fallback("> <@a:b.org> hi\r\n\r\nreply") == "reply"
+    assert strip_reply_fallback(" > <@a:b.org> hi\n\nreply") == "reply"
+
+
+def test_an_emote_reply_fallback_is_dropped():
+    assert strip_reply_fallback("> * <@alice:example.org> waves\n\nhi") == "hi"
+
+
 def test_chunk_keeps_all_text():
     text = "a" * 100 + "\n" + "b" * 100
     parts = chunk(text, limit=120)

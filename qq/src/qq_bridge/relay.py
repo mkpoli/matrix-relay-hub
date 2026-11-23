@@ -870,8 +870,15 @@ class Relay:
         if qq_id and self.store.event_for_qq(qq_id):
             log.debug("dropping redelivered QQ message %s", qq_id)
             return
-        ref_idx = self._ref_idx(data)
-        reply_to = self.store.event_for_ref(group, ref_idx) if ref_idx else None
+        ref_idx = self._scene_index(data, "msg_idx")
+        reply_to = next(
+            (
+                event
+                for quoted in self._quoted_indexes(data)
+                if (event := self.store.event_for_ref(group, quoted))
+            ),
+            None,
+        )
         sent: list[str] = []
         attachments = [
             item for item in data.get("attachments") or [] if isinstance(item, dict)
@@ -1216,11 +1223,31 @@ class Relay:
         return await self.matrix.send_message(room_id, ghost, payload)
 
     @staticmethod
-    def _ref_idx(data: dict) -> str | None:
+    def _scene_index(data: dict, key: str) -> str | None:
+        """One `key=REFIDX_…` entry of `message_scene.ext`: `msg_idx` names the message itself,
+        `ref_msg_idx` the message it quotes. Field meanings and parsing follow Tencent's
+        openclaw-qqbot `src/types.ts` and its SDK @tencent-connect/qqbot-nodejs 1.0.6,
+        `parseRefIndices` in `src/protocol/utils/text-parsing.ts`."""
         for item in (data.get("message_scene") or {}).get("ext") or []:
-            if isinstance(item, str) and item.startswith("msg_idx="):
-                return item[len("msg_idx=") :]
+            if isinstance(item, str) and item.startswith(key + "="):
+                return item[len(key) + 1 :].strip() or None
         return None
+
+    @classmethod
+    def _quoted_indexes(cls, data: dict) -> list[str]:
+        """The indexes a QQ reply may quote, best first: for a quote message (type 103) its first
+        element, which holds the quoted message and which the SDK ranks above the scene, then
+        the scene's `ref_msg_idx`."""
+        found: list[str] = []
+        elements = data.get("msg_elements") or []
+        if data.get("message_type") == 103 and elements and isinstance(elements[0], dict):
+            element = str(elements[0].get("msg_idx") or "").strip()
+            if element:
+                found.append(element)
+        scene = cls._scene_index(data, "ref_msg_idx")
+        if scene and scene not in found:
+            found.append(scene)
+        return found
 
     async def _command(
         self, group: str, content: str, msg_id: str | None = None

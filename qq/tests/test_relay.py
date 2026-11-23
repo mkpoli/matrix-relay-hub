@@ -999,6 +999,40 @@ def test_a_quote_message_replies_to_its_first_element(tmp_path):
     store.close()
 
 
+def test_a_quote_message_falls_back_to_the_scene_reference(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    relay._incoming = ROOM
+    store.add_message("Q0", "G", ROOM, "$parent", "REF1", "matrix")
+    data = qq_group_message("hi", own_idx="REF3", ref_idx=" REF1 ")
+    data["message_type"] = 103
+    data["msg_elements"] = [{"msg_idx": "UNKNOWN"}]
+    asyncio.run(relay._on_group_message(data))
+
+    (payload,) = [content for _, _, content in relay.matrix.sent]
+    assert payload["m.relates_to"] == {"m.in_reply_to": {"event_id": "$parent"}}
+    store.close()
+
+
+def test_a_quote_message_prefers_its_element_and_tolerates_empty_fields(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    relay._incoming = ROOM
+    store.add_message("Q0", "G", ROOM, "$element", "REF1", "matrix")
+    store.add_message("Q9", "G", ROOM, "$scene", "REF9", "matrix")
+    data = qq_group_message("hi", own_idx="REF3", ref_idx="REF9")
+    data["message_type"] = 103
+    data["msg_elements"] = [{"msg_idx": "REF1"}]
+    asyncio.run(relay._on_group_message(data))
+    empty = qq_group_message("hey", msg_id="Q2", own_idx="REF4")
+    empty["message_scene"]["ext"].append("ref_msg_idx=")
+    empty["message_type"] = 103
+    asyncio.run(relay._on_group_message(empty))
+
+    first, second = [content for _, _, content in relay.matrix.sent]
+    assert first["m.relates_to"] == {"m.in_reply_to": {"event_id": "$element"}}
+    assert "m.relates_to" not in second
+    store.close()
+
+
 def test_a_short_qq_text_keeps_its_markup_and_one_transaction(tmp_path):
     relay, store = make_relay(tmp_path, FakeQQ())
     relay._incoming = ROOM

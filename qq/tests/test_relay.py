@@ -934,15 +934,18 @@ label = "in"
     assert load(cfg_path).relay_reactions is False
 
 
-def qq_group_message(content, *, msg_id="Q1", ref_idx=None):
+def qq_group_message(content, *, msg_id="Q1", ref_idx=None, own_idx=None):
     data = {
         "group_openid": "G",
         "id": msg_id,
         "author": {"member_openid": "M1", "username": "Alice"},
         "content": content,
     }
+    ext = [f"msg_idx={own_idx}"] if own_idx else []
     if ref_idx:
-        data["message_scene"] = {"ext": [f"msg_idx={ref_idx}"]}
+        ext.append(f"ref_msg_idx={ref_idx}")
+    if ext:
+        data["message_scene"] = {"ext": ext}
     return data
 
 
@@ -967,6 +970,32 @@ def test_only_the_first_part_quotes_the_replied_message(tmp_path):
     payloads = [content for _, _, content in relay.matrix.sent]
     assert payloads[0]["m.relates_to"] == {"m.in_reply_to": {"event_id": "$parent"}}
     assert all("m.relates_to" not in payload for payload in payloads[1:])
+    store.close()
+
+
+def test_a_qq_message_is_not_a_reply_to_itself_or_an_older_index(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    relay._incoming = ROOM
+    store.add_message("Q0", "G", ROOM, "$parent", "REF1", "qq")
+    asyncio.run(relay._on_group_message(qq_group_message("hi", own_idx="REF1")))
+
+    (payload,) = [content for _, _, content in relay.matrix.sent]
+    assert "m.relates_to" not in payload
+    store.close()
+
+
+def test_a_quote_message_replies_to_its_first_element(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    relay._incoming = ROOM
+    store.add_message("Q0", "G", ROOM, "$parent", "REF1", "matrix")
+    data = qq_group_message("translate this", own_idx="REF2")
+    data["message_type"] = 103
+    data["msg_elements"] = [{"msg_idx": "REF1", "content": "大肥魚: hello"}]
+    asyncio.run(relay._on_group_message(data))
+
+    (payload,) = [content for _, _, content in relay.matrix.sent]
+    assert payload["m.relates_to"] == {"m.in_reply_to": {"event_id": "$parent"}}
+    assert store.event_for_ref("G", "REF2")
     store.close()
 
 
@@ -1033,7 +1062,7 @@ def test_sticker_reply_keeps_its_reply_relation(tmp_path):
 
     asyncio.run(
         relay._on_group_message(
-            sticker_event(message_scene={"ext": ["msg_idx=IDX1"]})
+            sticker_event(message_scene={"ext": ["msg_idx=IDX2", "ref_msg_idx=IDX1"]})
         )
     )
 

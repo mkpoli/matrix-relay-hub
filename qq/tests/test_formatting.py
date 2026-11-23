@@ -21,6 +21,18 @@ def test_mention_becomes_pill():
     assert "@小明" in html
 
 
+def test_bot_mention_is_left_out():
+    mentions = [
+        {"member_openid": "B0T", "username": "Glyph Atlas Matrix", "is_you": True},
+        {"member_openid": "OTHER", "username": "Helper", "bot": True},
+        {"member_openid": "M1", "username": "小明"},
+    ]
+    body, html = render_qq_text("<@B0T> 是 <@OTHER>，<@M1>", mentions, "example.org")
+    assert body == "是 ，@小明"
+    assert "Glyph Atlas" not in html and "Helper" not in html
+    assert render_qq_text("<@B0T>", mentions, "example.org") == ("", "")
+
+
 def test_mention_all():
     body, html = render_qq_text("<@all> 开会", [], "example.org")
     assert body == "@全体成员 开会"

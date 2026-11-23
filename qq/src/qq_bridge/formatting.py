@@ -7,6 +7,7 @@ import html
 import json
 import re
 
+SPACE_RE = re.compile(r"\s*")
 FACE_RE = re.compile(r'<faceType=(\d+),faceId="([^"]*)"?,ext="([^"]*)"\s*/?>')
 TOKEN_RE = re.compile(
     r'<faceType=(?P<ftype>\d+),faceId="(?P<face_id>[^"]*)"?,ext="(?P<ext>[^"]*)"\s*/?>'
@@ -111,15 +112,22 @@ def _escape(text: str) -> str:
     return html.escape(text, quote=False).replace("\n", "<br/>")
 
 
-def _mention_names(mentions: list[dict] | None) -> dict[str, str]:
+def _mention_names(mentions: list[dict] | None) -> tuple[dict[str, str], set[str]]:
+    """Names by openid, and the openids of bots. A QQ reply to a relayed message @-mentions the
+    bridge's own bot; QQ marks it with `is_you` or `bot`
+    (https://github.com/tencent-connect/openclaw-qqbot src/types.ts, read 2026-11-24). No bot can
+    be reached from Matrix, so their mentions are left out."""
     names: dict[str, str] = {}
+    bots: set[str] = set()
     for mention in mentions or []:
-        name = mention.get("username") or ""
+        name = mention.get("username") or mention.get("nickname") or ""
         for key in ("id", "member_openid", "user_openid"):
             value = mention.get(key)
             if value:
                 names[str(value).lower()] = name
-    return names
+                if mention.get("is_you") or mention.get("bot"):
+                    bots.add(str(value).lower())
+    return names, bots
 
 
 def render_qq_text(
@@ -136,7 +144,7 @@ def render_qq_text(
     text because the attachment is the sticker.
     """
     text = content or ""
-    names = _mention_names(mentions)
+    names, bots = _mention_names(mentions)
     body: list[str] = []
     markup: list[str] = []
     position = 0
@@ -145,6 +153,9 @@ def render_qq_text(
         markup.append(_escape(text[position : match.start()]))
         if match.group("mention") is not None:
             openid = match.group("mention")
+            if openid.lower() in bots:
+                position = SPACE_RE.match(text, match.end()).end()
+                continue
             if openid.lower() == "all":
                 body.append("@全体成员")
                 markup.append("<strong>@全体成员</strong>")

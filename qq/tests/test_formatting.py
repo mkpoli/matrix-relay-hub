@@ -31,6 +31,7 @@ def test_bot_mention_is_left_out():
     assert body == "是 ，@小明"
     assert "Glyph Atlas" not in html and "Helper" not in html
     assert render_qq_text("<@B0T>", mentions, "example.org") == ("", "")
+    assert render_qq_text("看这个 <@B0T>\n\n下一段", mentions, "example.org")[0] == "看这个 \n\n下一段"
 
 
 def test_mention_all():

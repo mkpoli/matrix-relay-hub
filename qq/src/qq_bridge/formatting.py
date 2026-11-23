@@ -7,7 +7,7 @@ import html
 import json
 import re
 
-SPACE_RE = re.compile(r"\s*")
+SPACE_RE = re.compile(r"[ \t]*")
 FACE_RE = re.compile(r'<faceType=(\d+),faceId="([^"]*)"?,ext="([^"]*)"\s*/?>')
 TOKEN_RE = re.compile(
     r'<faceType=(?P<ftype>\d+),faceId="(?P<face_id>[^"]*)"?,ext="(?P<ext>[^"]*)"\s*/?>'

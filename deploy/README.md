@@ -23,7 +23,7 @@ Set only the directories for bridges you operate. The fallback paths under `/var
 
 Use the version-specific configuration references and setup guides:
 
-- Discord v0.7.7: [sample configuration](https://github.com/mautrix/discord/blob/v0.7.7/example-config.yaml), [authentication](https://docs.mau.fi/bridges/go/discord/authentication.html).
+- Discord `0dd14c1` (v0.7.7 + Lottie sticker fix `0979753`): [sample configuration](https://github.com/mautrix/discord/blob/0dd14c1eec58/example-config.yaml), [authentication](https://docs.mau.fi/bridges/go/discord/authentication.html).
 - Telegram v26.10: [sample configuration](https://docs.mau.fi/configs/mautrix-telegram/v26.10.html), [authentication](https://docs.mau.fi/bridges/go/telegram/authentication.html).
 - IRC 4.0.1: [sample configuration](https://github.com/matrix-org/matrix-appservice-irc/blob/4.0.1/config.sample.yaml), [bridge setup](https://github.com/matrix-org/matrix-appservice-irc/blob/4.0.1/docs/bridge_setup.md), [image startup script](https://github.com/matrix-org/matrix-appservice-irc/blob/4.0.1/docker/start.sh). The image expects `/data/config.yaml` and `/data/appservice-registration-irc.yaml`.
 - QQ: an existing bridge checkout containing `src/qq_bridge/`, configured below.

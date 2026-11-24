@@ -771,6 +771,26 @@ class Relay:
         tag = f"[{label}] " if self._tagged and label else ""
         return f"{source}{tag}{name}"
 
+    def _handle_media_error(self, job: dict, exc: QQError, action: str) -> None:
+        if exc.code == QQ_FORMAT_REFUSED and not job.get("force"):
+            log.info("QQ refused the format of %s; re-encoding", job["event_id"])
+            retry = {
+                key: value
+                for key, value in job.items()
+                if key not in ("ready", "sent")
+            }
+            self._enqueue_media({**retry, "force": True})
+            return
+        log.warning(
+            "cannot %s media to %s: %s (trace %s)",
+            action,
+            job["group"],
+            exc,
+            exc.trace_id,
+        )
+        if _transient(exc):
+            self._retry_later(job)
+
     async def _deliver_media(self, job: dict, result: Prepared | str) -> None:
         prefix = await self._sender_prefix(job["room"], job["sender"])
         if isinstance(result, str):
@@ -797,39 +817,14 @@ class Relay:
                 job["group"], result.data, result.filename, result.file_type
             )
         except QQError as exc:
-            if exc.code == QQ_FORMAT_REFUSED and not job.get("force"):
-                log.info("QQ refused the format of %s; re-encoding", job["event_id"])
-                retry = {
-                    key: value
-                    for key, value in job.items()
-                    if key not in ("ready", "sent")
-                }
-                self._enqueue_media({**retry, "force": True})
-                return
-            log.warning(
-                "cannot upload media to %s: %s (trace %s)",
-                job["group"],
-                exc,
-                exc.trace_id,
-            )
-            if _transient(exc):
-                self._retry_later(job)
+            self._handle_media_error(job, exc, "upload")
             return
         try:
             response = await self.qq.send_group_media(
                 job["group"], file_info, content=caption
             )
         except QQError as exc:
-            if exc.code == QQ_FORMAT_REFUSED and not job.get("force"):
-                log.info("QQ refused the format of %s; re-encoding", job["event_id"])
-                retry = {
-                    key: value
-                    for key, value in job.items()
-                    if key not in ("ready", "sent")
-                }
-                self._enqueue_media({**retry, "force": True})
-                return
-            if caption and not _transient(exc):
+            if caption and not _transient(exc) and exc.code != QQ_FORMAT_REFUSED:
                 log.info(
                     "QQ refused media caption for %s (%s); sending without caption",
                     job["event_id"],
@@ -838,24 +833,10 @@ class Relay:
                 try:
                     response = await self.qq.send_group_media(job["group"], file_info)
                 except QQError as retry_exc:
-                    log.warning(
-                        "cannot send media to %s: %s (trace %s)",
-                        job["group"],
-                        retry_exc,
-                        retry_exc.trace_id,
-                    )
-                    if _transient(retry_exc):
-                        self._retry_later(job)
+                    self._handle_media_error(job, retry_exc, "send")
                     return
             else:
-                log.warning(
-                    "cannot send media to %s: %s (trace %s)",
-                    job["group"],
-                    exc,
-                    exc.trace_id,
-                )
-                if _transient(exc):
-                    self._retry_later(job)
+                self._handle_media_error(job, exc, "send")
                 return
         self._remember_sent(job["group"], job["room"], job["event_id"], response)
         log.info("sent media to QQ group %s: %s", job["group"], response.get("id"))

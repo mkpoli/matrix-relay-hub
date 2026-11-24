@@ -580,6 +580,42 @@ def test_media_retries_without_caption_when_qq_refuses_it(tmp_path):
     store.close()
 
 
+def test_captionless_retry_still_reencodes_on_format_refusal(tmp_path):
+    from qq_bridge.fit import QQ_IMAGE, Prepared
+
+    class CaptionThenFormatRefusingQQ(FakeQQ):
+        async def send_group_media(
+            self, group, file_info, *, content=None, msg_id=None, msg_seq=1
+        ):
+            if content:
+                raise QQError(304003, "URL not allowed", status=400)
+            raise QQError(40034002, "富媒体文件格式不支持", status=400)
+
+    relay, store = make_relay(tmp_path, CaptionThenFormatRefusingQQ())
+
+    async def go():
+        relay._enqueue_media(
+            {
+                "kind": "media",
+                "group": "G",
+                "room": ROOM,
+                "event_id": "$img",
+                "sender": "@alice:example.org",
+                "content": {"msgtype": "m.image", "url": "mxc://x/y"},
+            }
+        )
+        job = relay._queue.get_nowait()
+        relay._images.get_nowait()
+        job["ready"].set_result(Prepared(b"img", "a.webp", QQ_IMAGE))
+        await relay._send_media(job)
+        retry = relay._queue.get_nowait()
+        assert retry["force"] is True
+        assert relay._images.get_nowait() is retry
+
+    asyncio.run(go())
+    store.close()
+
+
 def test_refused_format_is_reencoded_once(tmp_path):
     from qq_bridge.fit import Prepared
     from qq_bridge.qq import QQError

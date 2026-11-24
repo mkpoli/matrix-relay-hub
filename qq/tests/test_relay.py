@@ -433,6 +433,99 @@ def test_video_sticker_takes_the_video_lane(tmp_path):
     store.close()
 
 
+def test_sticker_without_url_becomes_a_label(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    event = {
+        "room_id": ROOM,
+        "sender": "@discord_9:example.org",
+        "type": "m.sticker",
+        "event_id": "$lottie_missing",
+        "content": {
+            "body": "Wave",
+            "info": {"mimetype": "application/json", "w": 160, "h": 160},
+        },
+    }
+    asyncio.run(relay.handle_matrix_event(event))
+    job = relay._queue.get_nowait()
+    assert job["kind"] == "text"
+    assert job["text"] == "[D] Alice: [sticker: Wave]"
+    assert relay._images.empty() and relay._videos.empty()
+    store.close()
+
+
+def test_lottie_json_sticker_becomes_a_label(tmp_path):
+    relay, store = make_relay(tmp_path, FakeQQ())
+    event = {
+        "room_id": ROOM,
+        "sender": "@discord_9:example.org",
+        "type": "m.sticker",
+        "event_id": "$lottie_json",
+        "content": {
+            "body": "Wave",
+            "url": "mxc://example.org/wave.json",
+            "info": {"mimetype": "application/json", "w": 160, "h": 160},
+        },
+    }
+    asyncio.run(relay.handle_matrix_event(event))
+    job = relay._queue.get_nowait()
+    assert job["kind"] == "text"
+    assert job["text"] == "[D] Alice: [sticker: Wave]"
+    assert relay._images.empty() and relay._videos.empty()
+    store.close()
+
+
+def test_unreadable_sticker_falls_back_to_its_name(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+
+    async def go():
+        relay._enqueue_media(
+            {
+                "kind": "media",
+                "group": "G",
+                "room": ROOM,
+                "event_id": "$bad_sticker",
+                "sender": "@discord_9:example.org",
+                "content": {"msgtype": "m.image", "body": "Wave", "url": "mxc://x/y"},
+                "sticker": True,
+            }
+        )
+        job = relay._queue.get_nowait()
+        relay._images.get_nowait()
+        job["ready"].set_result("not accepted by QQ")
+        await relay._send_media(job)
+
+    asyncio.run(go())
+    assert qq.sent[-1][1] == "[D] Alice: [sticker: Wave]"
+    store.close()
+
+
+def test_long_sticker_fallback_label_is_bounded(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+
+    async def go():
+        relay._enqueue_media(
+            {
+                "kind": "media",
+                "group": "G",
+                "room": ROOM,
+                "event_id": "$long_sticker",
+                "sender": "@discord_9:example.org",
+                "content": {"msgtype": "m.image", "body": "x" * 3000, "url": "mxc://x/y"},
+                "sticker": True,
+            }
+        )
+        job = relay._queue.get_nowait()
+        relay._images.get_nowait()
+        job["ready"].set_result("not accepted by QQ")
+        await relay._send_media(job)
+
+    asyncio.run(go())
+    assert qq.sent[-1][1] == f"[D] Alice: [sticker: {'x' * 200}...]"
+    store.close()
+
+
 def test_redaction_deletes_the_qq_copy(tmp_path):
     qq = FakeQQ()
     relay, store = make_relay(tmp_path, qq)

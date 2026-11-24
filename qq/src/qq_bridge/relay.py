@@ -71,6 +71,15 @@ def _transient(exc: QQError) -> bool:
     return exc.rate_limited or (exc.status or 0) >= 500
 
 
+def _sticker_label(body: object, *, reason: str | None = None) -> str:
+    label = " ".join(str(body or "").split())
+    if label:
+        if len(label) > 200:
+            label = label[:200] + "..."
+        return f"[sticker: {label}]"
+    return f"[sticker {reason}]" if reason else "[sticker]"
+
+
 def is_edit(content: dict) -> bool:
     """Matrix sends edits as ordinary messages carrying m.new_content."""
     if "m.new_content" in content:
@@ -336,11 +345,22 @@ class Relay:
             await self._handle_reaction(event, room_id, sender, label)
             return
         content = event.get("content") or {}
-        if event_type == "m.sticker":
-            # A sticker has no msgtype; send it as the image or video it holds.
+        sticker = event_type == "m.sticker"
+        if sticker:
+            # A sticker has no msgtype; send it as the image or video it holds,
+            # or fall back to its label when no raster/video media was bridged
+            # (e.g. unconverted Lottie JSON or a missing URL).
             mimetype = str((content.get("info") or {}).get("mimetype") or "")
-            kind = "m.video" if mimetype.startswith("video/") else "m.image"
-            content = {**content, "msgtype": kind}
+            url = content.get("url") or (content.get("file") or {}).get("url")
+            if not url or (mimetype and not mimetype.startswith(("image/", "video/"))):
+                content = {
+                    **content,
+                    "msgtype": "m.text",
+                    "body": _sticker_label(content.get("body")),
+                }
+            else:
+                kind = "m.video" if mimetype.startswith("video/") else "m.image"
+                content = {**content, "msgtype": kind}
         if is_edit(content):
             await self._handle_edit(event, room_id, sender, label, content)
             return
@@ -407,6 +427,7 @@ class Relay:
                     "event_id": event_id,
                     "sender": sender,
                     "content": content,
+                    "sticker": sticker,
                 }
             )
 
@@ -794,13 +815,17 @@ class Relay:
     async def _deliver_media(self, job: dict, result: Prepared | str) -> None:
         prefix = await self._sender_prefix(job["room"], job["sender"])
         if isinstance(result, str):
-            kind = str(job["content"].get("msgtype", "m.file"))[2:]
+            if job.get("sticker"):
+                notice = _sticker_label(job["content"].get("body"), reason=result)
+            else:
+                kind = str(job["content"].get("msgtype", "m.file"))[2:]
+                notice = f"[{kind} {result}]"
             await self._send_text(
                 {
                     "group": job["group"],
                     "room": job["room"],
                     "event_id": job["event_id"],
-                    "text": f"{prefix}: [{kind} {result}]",
+                    "text": chunk(f"{prefix}: {notice}")[0],
                     "reference": None,
                     "pending": job.get("pending"),
                 }

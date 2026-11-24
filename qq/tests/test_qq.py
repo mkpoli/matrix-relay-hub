@@ -65,6 +65,29 @@ def test_group_media_carries_content_when_given():
     }
 
 
+def test_group_media_carries_reference_when_given():
+    client = _client()
+    calls = []
+
+    async def request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {}
+
+    client.request = request
+    asyncio.run(
+        client.send_group_media(
+            "G", "FILE", content="[D] mkpoli → ItMarki:", reference="REF1"
+        )
+    )
+    payload = calls[0][2]["json"]
+    assert payload == {
+        "msg_type": 7,
+        "media": {"file_info": "FILE"},
+        "content": "[D] mkpoli → ItMarki:",
+        "message_reference": {"message_id": "REF1"},
+    }
+
+
 def test_group_text_without_a_reply_has_no_passive_fields():
     client = _client()
     calls = []

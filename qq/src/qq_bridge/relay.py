@@ -389,6 +389,12 @@ class Relay:
             if links:
                 body = twitter.rewrite(body)
             name = await self._display_name(room_id, sender)
+            if sticker:
+                reply_name = await self._reply_target_name(
+                    room_id, sender, content, sticker=True
+                )
+                if reply_name:
+                    name = f"{name} → {reply_name}"
             source = f"[{source_tag(sender)}] "
             tag = f"[{label}] " if self._tagged else ""
             text = (
@@ -408,6 +414,7 @@ class Relay:
                         "event_id": event_id,
                         "text": part,
                         "reference": reference if index == 0 else None,
+                        "fallback_unquoted": sticker,
                     }
                 )
             if links:
@@ -428,6 +435,7 @@ class Relay:
                     "sender": sender,
                     "content": content,
                     "sticker": sticker,
+                    "reply_to": self._reply_event_id(content),
                 }
             )
 
@@ -498,12 +506,65 @@ class Relay:
             return None
         return row["ref_idx"] or row["qq_id"]
 
+    @staticmethod
+    def _reply_event_id(content: dict) -> str | None:
+        relates = content.get("m.relates_to")
+        if not isinstance(relates, dict):
+            return None
+        in_reply_to = relates.get("m.in_reply_to")
+        if not isinstance(in_reply_to, dict):
+            return None
+        target = in_reply_to.get("event_id")
+        return target if isinstance(target, str) and target else None
+
     def _reply_reference(self, event: dict) -> str | None:
-        relates = (event.get("content") or {}).get("m.relates_to") or {}
-        target = (relates.get("m.in_reply_to") or {}).get("event_id")
-        if not target:
+        target = self._reply_event_id(event.get("content") or {})
+        if not target or self.store.superseded(target) == "redacted":
             return None
         return self._reference_for_event(target)
+
+    async def _reply_target_name(
+        self, room_id: str, sender: str, content: dict, *, sticker: bool = False
+    ) -> str | None:
+        """Display name of the person a media/sticker event replies to, or None."""
+        target_sender: str | None = None
+        target = self._reply_event_id(content)
+        if target:
+            try:
+                original = await self.matrix.event(room_id, target, self.bot_mxid)
+            except (MatrixError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                log.debug("cannot read reply target %s in %s: %s", target, room_id, exc)
+                original = None
+            if isinstance(original, dict):
+                candidate = original.get("sender")
+                if isinstance(candidate, str) and candidate:
+                    if candidate == sender:
+                        return None
+                    target_sender = candidate
+        if not target_sender and sticker:
+            mentions = content.get("m.mentions")
+            user_ids = mentions.get("user_ids") if isinstance(mentions, dict) else None
+            if isinstance(user_ids, list):
+                targets = list(
+                    dict.fromkeys(
+                        uid
+                        for uid in user_ids
+                        if isinstance(uid, str) and uid and uid != sender
+                    )
+                )
+                if len(targets) == 1:
+                    target_sender = targets[0]
+        if not target_sender:
+            return None
+        try:
+            raw_name = await self._display_name(room_id, target_sender)
+        except (MatrixError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            log.debug(
+                "cannot read display name for %s in %s: %s", target_sender, room_id, exc
+            )
+            return None
+        name = " ".join(raw_name.split())
+        return name or None
 
     async def _display_name(self, room_id: str, user_id: str) -> str:
         key = (room_id, user_id)
@@ -707,25 +768,38 @@ class Relay:
         if not await self._wait_limits(job["group"]):
             self._retry_later(job)
             return
-        for attempt in range(3):
-            try:
-                response = await self.qq.send_group_text(
-                    job["group"],
-                    job["text"],
-                    reference=reference,
-                    msg_id=job.get("msg_id"),
-                )
-            except QQError as exc:
-                if exc.rate_limited and attempt < 2:
-                    await asyncio.sleep(3 * (attempt + 1))
-                    continue
-                log.warning("cannot send to %s: %s", job["group"], exc)
-                if _transient(exc):
-                    self._retry_later(job)
+        while True:
+            for attempt in range(3):
+                try:
+                    response = await self.qq.send_group_text(
+                        job["group"],
+                        job["text"],
+                        reference=reference,
+                        msg_id=job.get("msg_id"),
+                    )
+                except QQError as exc:
+                    if exc.rate_limited and attempt < 2:
+                        await asyncio.sleep(3 * (attempt + 1))
+                        continue
+                    if (
+                        reference
+                        and job.get("fallback_unquoted")
+                        and not _transient(exc)
+                    ):
+                        log.info(
+                            "QQ refused reference on %s (%s); sending unquoted",
+                            event_id,
+                            exc,
+                        )
+                        reference = None
+                        break
+                    log.warning("cannot send to %s: %s", job["group"], exc)
+                    if _transient(exc):
+                        self._retry_later(job)
+                    return
+                self._remember_sent(job["group"], job["room"], job["event_id"], response)
+                log.info("sent to QQ group %s: %s", job["group"], response.get("id"))
                 return
-            self._remember_sent(job["group"], job["room"], job["event_id"], response)
-            log.info("sent to QQ group %s: %s", job["group"], response.get("id"))
-            return
 
     async def _prepare_loop(self, lane: asyncio.Queue[dict]) -> None:
         while True:
@@ -814,6 +888,24 @@ class Relay:
 
     async def _deliver_media(self, job: dict, result: Prepared | str) -> None:
         prefix = await self._sender_prefix(job["room"], job["sender"])
+        reply_to = job.get("reply_to") or self._reply_event_id(job["content"])
+        reference = (
+            self._reference_for_event(reply_to)
+            if reply_to and self.store.superseded(reply_to) != "redacted"
+            else None
+        )
+        needs_caption = isinstance(result, str) or result.file_type != QQ_AUDIO
+        reply_name = (
+            await self._reply_target_name(
+                job["room"],
+                job["sender"],
+                job["content"],
+                sticker=bool(job.get("sticker")),
+            )
+            if needs_caption
+            else None
+        )
+        speaker = f"{prefix} → {reply_name}" if reply_name else prefix
         if isinstance(result, str):
             if job.get("sticker"):
                 notice = _sticker_label(job["content"].get("body"), reason=result)
@@ -825,8 +917,9 @@ class Relay:
                     "group": job["group"],
                     "room": job["room"],
                     "event_id": job["event_id"],
-                    "text": chunk(f"{prefix}: {notice}")[0],
-                    "reference": None,
+                    "text": chunk(f"{speaker}: {notice}")[0],
+                    "reference": reference,
+                    "fallback_unquoted": True,
                     "pending": job.get("pending"),
                 }
             )
@@ -836,7 +929,7 @@ class Relay:
             return
         # QQ's official SDK passes `content` alongside `media` for image/video/file
         # (msg_type 7) to embed text and media in one message, and omits it for voice.
-        caption = f"{prefix}:" if result.file_type != QQ_AUDIO else None
+        caption = chunk(f"{speaker}:")[0] if result.file_type != QQ_AUDIO else None
         try:
             file_info = await self.qq.upload_group_media(
                 job["group"], result.data, result.filename, result.file_type
@@ -844,25 +937,36 @@ class Relay:
         except QQError as exc:
             self._handle_media_error(job, exc, "upload")
             return
-        try:
-            response = await self.qq.send_group_media(
-                job["group"], file_info, content=caption
-            )
-        except QQError as exc:
-            if caption and not _transient(exc) and exc.code != QQ_FORMAT_REFUSED:
+        attempts: list[tuple[str | None, str | None]] = [(caption, reference)]
+        if caption is not None and reference is not None:
+            attempts.append((caption, None))
+            attempts.append((None, reference))
+            attempts.append((None, None))
+        elif reference is not None or caption is not None:
+            attempts.append((None, None))
+        response: dict | None = None
+        for index, (send_content, send_ref) in enumerate(attempts):
+            try:
+                response = await self.qq.send_group_media(
+                    job["group"], file_info, content=send_content, reference=send_ref
+                )
+                break
+            except QQError as exc:
+                if (
+                    index == len(attempts) - 1
+                    or _transient(exc)
+                    or exc.code == QQ_FORMAT_REFUSED
+                ):
+                    self._handle_media_error(job, exc, "send")
+                    return
                 log.info(
-                    "QQ refused media caption for %s (%s); sending without caption",
+                    "QQ refused media send for %s (caption=%s, reference=%s): %s; retrying",
                     job["event_id"],
+                    bool(send_content),
+                    bool(send_ref),
                     exc,
                 )
-                try:
-                    response = await self.qq.send_group_media(job["group"], file_info)
-                except QQError as retry_exc:
-                    self._handle_media_error(job, retry_exc, "send")
-                    return
-            else:
-                self._handle_media_error(job, exc, "send")
-                return
+        assert response is not None
         self._remember_sent(job["group"], job["room"], job["event_id"], response)
         log.info("sent media to QQ group %s: %s", job["group"], response.get("id"))
 

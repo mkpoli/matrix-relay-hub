@@ -968,9 +968,14 @@ def test_media_retries_without_reference_keeping_caption_when_qq_refuses_referen
     from qq_bridge.fit import QQ_IMAGE, Prepared
 
     class ReferenceRefusingQQ(FakeQQ):
+        def __init__(self):
+            super().__init__()
+            self.attempts = []
+
         async def send_group_media(
             self, group, file_info, *, content=None, reference=None, msg_id=None, msg_seq=1
         ):
+            self.attempts.append((content, reference))
             if reference:
                 raise QQError(400, "message_reference not supported", status=400)
             return await super().send_group_media(
@@ -1012,6 +1017,10 @@ def test_media_retries_without_reference_keeping_caption_when_qq_refuses_referen
         await relay._send_media(job)
 
     asyncio.run(go())
+    assert qq.attempts == [
+        ("[D] mkpoli → ItMarki:", "REFJOIN"),
+        ("[D] mkpoli → ItMarki:", None),
+    ]
     assert qq.media_contents == ["[D] mkpoli → ItMarki:"]
     assert qq.media_references == [None]
     store.close()
@@ -1021,9 +1030,14 @@ def test_audio_reply_passes_reference_without_caption_and_retries_if_refused(tmp
     from qq_bridge.fit import QQ_AUDIO, Prepared
 
     class ReferenceRefusingQQ(FakeQQ):
+        def __init__(self):
+            super().__init__()
+            self.attempts = []
+
         async def send_group_media(
             self, group, file_info, *, content=None, reference=None, msg_id=None, msg_seq=1
         ):
+            self.attempts.append((content, reference))
             if reference:
                 raise QQError(400, "message_reference not supported", status=400)
             return await super().send_group_media(
@@ -1065,6 +1079,7 @@ def test_audio_reply_passes_reference_without_caption_and_retries_if_refused(tmp
         await relay._send_media(job)
 
     asyncio.run(go())
+    assert qq.attempts == [(None, "REFJOIN"), (None, None)]
     assert qq.media_contents == [None]
     assert qq.media_references == [None]
     store.close()
@@ -1107,6 +1122,149 @@ def test_media_reply_to_redacted_event_omits_reference(tmp_path):
     assert qq.media_contents == ["[D] mkpoli → ItMarki:"]
     assert qq.media_references == [None]
     store.close()
+
+
+def test_media_caption_refusal_keeps_valid_reference(tmp_path):
+    from qq_bridge.fit import QQ_IMAGE, Prepared
+
+    class CaptionRefusingQQ(FakeQQ):
+        async def send_group_media(
+            self, group, file_info, *, content=None, reference=None, msg_id=None, msg_seq=1
+        ):
+            if content:
+                raise QQError(304003, "URL not allowed", status=400)
+            return await super().send_group_media(
+                group,
+                file_info,
+                content=content,
+                reference=reference,
+                msg_id=msg_id,
+                msg_seq=msg_seq,
+            )
+
+    qq = CaptionRefusingQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay.matrix.authors["$join"] = "@discord_2:example.org"
+    relay.matrix.names = {
+        "@discord_1:example.org": "mkpoli",
+        "@discord_2:example.org": "foo.example",
+    }
+    store.add_message("QJ", "G", ROOM, "$join", "REFJOIN", "matrix")
+
+    event = {
+        "room_id": ROOM,
+        "sender": "@discord_1:example.org",
+        "type": "m.sticker",
+        "event_id": "$wave",
+        "content": {
+            "body": "Wave",
+            "url": "mxc://example.org/wave",
+            "info": {"mimetype": "image/webp"},
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$join"}},
+        },
+    }
+
+    async def go():
+        await relay.handle_matrix_event(event)
+        job = relay._queue.get_nowait()
+        relay._images.get_nowait()
+        job["ready"].set_result(Prepared(b"gif", "wave.gif", QQ_IMAGE))
+        await relay._send_media(job)
+
+    asyncio.run(go())
+    assert qq.media_contents == [None]
+    assert qq.media_references == ["REFJOIN"]
+    store.close()
+
+
+def test_media_fallback_notice_retries_unquoted_when_reference_is_refused(tmp_path):
+    class ReferenceRefusingTextQQ(FakeQQ):
+        async def send_group_text(
+            self, group, content, *, reference=None, msg_id=None, msg_seq=1
+        ):
+            if reference:
+                raise QQError(400, "invalid reference", status=400)
+            return await super().send_group_text(
+                group, content, reference=reference, msg_id=msg_id, msg_seq=msg_seq
+            )
+
+    qq = ReferenceRefusingTextQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay.matrix.authors["$join"] = "@discord_2:example.org"
+    relay.matrix.names = {
+        "@discord_1:example.org": "mkpoli",
+        "@discord_2:example.org": "ItMarki",
+    }
+    store.add_message("QJ", "G", ROOM, "$join", "REFJOIN", "matrix")
+
+    event = {
+        "room_id": ROOM,
+        "sender": "@discord_1:example.org",
+        "type": "m.sticker",
+        "event_id": "$unfit_ref",
+        "content": {
+            "body": "Wave",
+            "url": "mxc://example.org/wave",
+            "info": {"mimetype": "image/webp"},
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$join"}},
+        },
+    }
+
+    async def go():
+        await relay.handle_matrix_event(event)
+        job = relay._queue.get_nowait()
+        relay._images.get_nowait()
+        job["ready"].set_result("not accepted by QQ")
+        await relay._send_media(job)
+
+    asyncio.run(go())
+    assert qq.sent == [("G", "[D] mkpoli → ItMarki: [sticker: Wave]", None)]
+    store.close()
+
+
+def test_reply_target_member_network_or_timeout_error_does_not_drop_media(tmp_path):
+    import aiohttp
+    from qq_bridge.fit import QQ_IMAGE, Prepared
+
+    for idx, failure in enumerate(
+        (aiohttp.ClientConnectionError("reset"), asyncio.TimeoutError())
+    ):
+        qq = FakeQQ()
+        relay, store = make_relay(tmp_path / f"case_{idx}", qq)
+        relay.matrix.authors["$join"] = "@discord_2:example.org"
+
+        async def flaky_member(room_id, user_id, exc=failure):
+            if user_id == "@discord_2:example.org":
+                raise exc
+            return {"displayname": "mkpoli"}
+
+        relay.matrix.member = flaky_member
+        store.add_message("QJ", "G", ROOM, "$join", "REFJOIN", "matrix")
+
+        event = {
+            "room_id": ROOM,
+            "sender": "@discord_1:example.org",
+            "type": "m.sticker",
+            "event_id": f"$wave_flaky_{idx}",
+            "content": {
+                "body": "Wave",
+                "url": "mxc://example.org/wave",
+                "info": {"mimetype": "image/webp"},
+                "m.relates_to": {"m.in_reply_to": {"event_id": "$join"}},
+            },
+        }
+
+        async def go():
+            await relay.handle_matrix_event(event)
+            job = relay._queue.get_nowait()
+            relay._images.get_nowait()
+            job["ready"].set_result(Prepared(b"gif", "wave.gif", QQ_IMAGE))
+            await relay._send_media(job)
+
+        asyncio.run(go())
+        assert qq.media_contents == ["[D] mkpoli:"]
+        assert qq.media_references == ["REFJOIN"]
+        store.close()
 
 
 def test_refused_format_is_reencoded_once(tmp_path):

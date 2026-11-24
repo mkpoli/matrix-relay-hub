@@ -414,6 +414,7 @@ class Relay:
                         "event_id": event_id,
                         "text": part,
                         "reference": reference if index == 0 else None,
+                        "fallback_unquoted": sticker,
                     }
                 )
             if links:
@@ -555,7 +556,14 @@ class Relay:
                     target_sender = targets[0]
         if not target_sender:
             return None
-        name = " ".join((await self._display_name(room_id, target_sender)).split())
+        try:
+            raw_name = await self._display_name(room_id, target_sender)
+        except (MatrixError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            log.debug(
+                "cannot read display name for %s in %s: %s", target_sender, room_id, exc
+            )
+            return None
+        name = " ".join(raw_name.split())
         return name or None
 
     async def _display_name(self, room_id: str, user_id: str) -> str:
@@ -760,25 +768,38 @@ class Relay:
         if not await self._wait_limits(job["group"]):
             self._retry_later(job)
             return
-        for attempt in range(3):
-            try:
-                response = await self.qq.send_group_text(
-                    job["group"],
-                    job["text"],
-                    reference=reference,
-                    msg_id=job.get("msg_id"),
-                )
-            except QQError as exc:
-                if exc.rate_limited and attempt < 2:
-                    await asyncio.sleep(3 * (attempt + 1))
-                    continue
-                log.warning("cannot send to %s: %s", job["group"], exc)
-                if _transient(exc):
-                    self._retry_later(job)
+        while True:
+            for attempt in range(3):
+                try:
+                    response = await self.qq.send_group_text(
+                        job["group"],
+                        job["text"],
+                        reference=reference,
+                        msg_id=job.get("msg_id"),
+                    )
+                except QQError as exc:
+                    if exc.rate_limited and attempt < 2:
+                        await asyncio.sleep(3 * (attempt + 1))
+                        continue
+                    if (
+                        reference
+                        and job.get("fallback_unquoted")
+                        and not _transient(exc)
+                    ):
+                        log.info(
+                            "QQ refused reference on %s (%s); sending unquoted",
+                            event_id,
+                            exc,
+                        )
+                        reference = None
+                        break
+                    log.warning("cannot send to %s: %s", job["group"], exc)
+                    if _transient(exc):
+                        self._retry_later(job)
+                    return
+                self._remember_sent(job["group"], job["room"], job["event_id"], response)
+                log.info("sent to QQ group %s: %s", job["group"], response.get("id"))
                 return
-            self._remember_sent(job["group"], job["room"], job["event_id"], response)
-            log.info("sent to QQ group %s: %s", job["group"], response.get("id"))
-            return
 
     async def _prepare_loop(self, lane: asyncio.Queue[dict]) -> None:
         while True:
@@ -898,6 +919,7 @@ class Relay:
                     "event_id": job["event_id"],
                     "text": chunk(f"{speaker}: {notice}")[0],
                     "reference": reference,
+                    "fallback_unquoted": True,
                     "pending": job.get("pending"),
                 }
             )
@@ -916,9 +938,11 @@ class Relay:
             self._handle_media_error(job, exc, "upload")
             return
         attempts: list[tuple[str | None, str | None]] = [(caption, reference)]
-        if reference is not None:
+        if caption is not None and reference is not None:
             attempts.append((caption, None))
-        if caption is not None:
+            attempts.append((None, reference))
+            attempts.append((None, None))
+        elif reference is not None or caption is not None:
             attempts.append((None, None))
         response: dict | None = None
         for index, (send_content, send_ref) in enumerate(attempts):
@@ -936,9 +960,10 @@ class Relay:
                     self._handle_media_error(job, exc, "send")
                     return
                 log.info(
-                    "QQ refused media %s for %s (%s); retrying",
-                    "reference" if send_ref else "caption",
+                    "QQ refused media send for %s (caption=%s, reference=%s): %s; retrying",
                     job["event_id"],
+                    bool(send_content),
+                    bool(send_ref),
                     exc,
                 )
         assert response is not None

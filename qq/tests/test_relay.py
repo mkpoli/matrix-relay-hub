@@ -14,6 +14,7 @@ class FakeQQ:
     def __init__(self):
         self.sent = []
         self.media = []
+        self.media_contents = []
         self.text_replies = []
         self.media_replies = []
         self.deleted = []
@@ -32,8 +33,11 @@ class FakeQQ:
     async def upload_group_media(self, group, data, filename, file_type):
         return "FILEINFO"
 
-    async def send_group_media(self, group, file_info, *, msg_id=None, msg_seq=1):
+    async def send_group_media(
+        self, group, file_info, *, content=None, msg_id=None, msg_seq=1
+    ):
         self.media.append((group, file_info))
+        self.media_contents.append(content)
         self.media_replies.append((msg_id, msg_seq))
         return {"id": "QM"}
 
@@ -509,6 +513,106 @@ def test_media_that_cannot_fit_becomes_a_notice(tmp_path):
     relay.matrix = FakeMatrix()
     _run_media(relay, {"msgtype": "m.video", "url": "mxc://x/y"}, "too long for QQ")
     assert qq.sent[-1][1] == "[M] Alice: [video too long for QQ]"
+    store.close()
+
+
+def test_media_carries_its_sender_in_content(tmp_path):
+    from qq_bridge.fit import QQ_AUDIO, QQ_IMAGE, Prepared
+
+    qq = FakeQQ()
+    relay, store = make_relay(
+        tmp_path,
+        qq,
+        rooms=(
+            RoomConfig(alias="#in:example.org", label="in"),
+            RoomConfig(alias="#two:example.org", label="two"),
+        ),
+    )
+
+    async def go():
+        for sender, prepared in (
+            ("@discord_9:example.org", Prepared(b"img", "a.png", QQ_IMAGE)),
+            ("@alice:example.org", Prepared(b"aud", "a.silk", QQ_AUDIO)),
+        ):
+            relay._enqueue_media(
+                {
+                    "kind": "media",
+                    "group": "G",
+                    "room": ROOM,
+                    "event_id": "$m",
+                    "sender": sender,
+                    "content": {"msgtype": "m.image", "url": "mxc://x/y"},
+                }
+            )
+            job = relay._queue.get_nowait()
+            relay._images.get_nowait()
+            job["ready"].set_result(prepared)
+            await relay._send_media(job)
+
+    asyncio.run(go())
+    assert qq.media_contents == ["[D] [in] Alice:", None]
+    store.close()
+
+
+def test_media_retries_without_caption_when_qq_refuses_it(tmp_path):
+    from qq_bridge.fit import QQ_IMAGE, Prepared
+
+    class CaptionRefusingQQ(FakeQQ):
+        async def send_group_media(
+            self, group, file_info, *, content=None, msg_id=None, msg_seq=1
+        ):
+            if content:
+                raise QQError(304003, "URL not allowed", status=400)
+            return await super().send_group_media(
+                group, file_info, content=content, msg_id=msg_id, msg_seq=msg_seq
+            )
+
+    qq = CaptionRefusingQQ()
+    relay, store = make_relay(tmp_path, qq)
+    _run_media(
+        relay,
+        {"msgtype": "m.image", "url": "mxc://x/y"},
+        Prepared(b"img", "a.png", QQ_IMAGE),
+    )
+    assert qq.media == [("G", "FILEINFO")]
+    assert qq.media_contents == [None]
+    assert store.qq_for_event("$img")["qq_id"] == "QM"
+    store.close()
+
+
+def test_captionless_retry_still_reencodes_on_format_refusal(tmp_path):
+    from qq_bridge.fit import QQ_IMAGE, Prepared
+
+    class CaptionThenFormatRefusingQQ(FakeQQ):
+        async def send_group_media(
+            self, group, file_info, *, content=None, msg_id=None, msg_seq=1
+        ):
+            if content:
+                raise QQError(304003, "URL not allowed", status=400)
+            raise QQError(40034002, "富媒体文件格式不支持", status=400)
+
+    relay, store = make_relay(tmp_path, CaptionThenFormatRefusingQQ())
+
+    async def go():
+        relay._enqueue_media(
+            {
+                "kind": "media",
+                "group": "G",
+                "room": ROOM,
+                "event_id": "$img",
+                "sender": "@alice:example.org",
+                "content": {"msgtype": "m.image", "url": "mxc://x/y"},
+            }
+        )
+        job = relay._queue.get_nowait()
+        relay._images.get_nowait()
+        job["ready"].set_result(Prepared(b"img", "a.webp", QQ_IMAGE))
+        await relay._send_media(job)
+        retry = relay._queue.get_nowait()
+        assert retry["force"] is True
+        assert relay._images.get_nowait() is retry
+
+    asyncio.run(go())
     store.close()
 
 

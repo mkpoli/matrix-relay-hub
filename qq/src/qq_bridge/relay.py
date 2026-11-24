@@ -14,7 +14,7 @@ from pathlib import Path
 
 from . import twitter
 from .config import Config
-from .fit import QQ_FILE_TYPES, TOO_LARGE, UNREADABLE, Prepared, Unfit, prepare, sweep_temp
+from .fit import QQ_AUDIO, QQ_FILE_TYPES, TOO_LARGE, UNREADABLE, Prepared, Unfit, prepare, sweep_temp
 from .formatting import (
     chunk,
     extract_face_ids,
@@ -764,16 +764,43 @@ class Relay:
             job["sent"].set()
         return False
 
+    async def _sender_prefix(self, room_id: str, sender: str) -> str:
+        name = await self._display_name(room_id, sender)
+        source = f"[{source_tag(sender)}] "
+        label = self._labels.get(room_id)
+        tag = f"[{label}] " if self._tagged and label else ""
+        return f"{source}{tag}{name}"
+
+    def _handle_media_error(self, job: dict, exc: QQError, action: str) -> None:
+        if exc.code == QQ_FORMAT_REFUSED and not job.get("force"):
+            log.info("QQ refused the format of %s; re-encoding", job["event_id"])
+            retry = {
+                key: value
+                for key, value in job.items()
+                if key not in ("ready", "sent")
+            }
+            self._enqueue_media({**retry, "force": True})
+            return
+        log.warning(
+            "cannot %s media to %s: %s (trace %s)",
+            action,
+            job["group"],
+            exc,
+            exc.trace_id,
+        )
+        if _transient(exc):
+            self._retry_later(job)
+
     async def _deliver_media(self, job: dict, result: Prepared | str) -> None:
+        prefix = await self._sender_prefix(job["room"], job["sender"])
         if isinstance(result, str):
-            name = await self._display_name(job["room"], job["sender"])
             kind = str(job["content"].get("msgtype", "m.file"))[2:]
             await self._send_text(
                 {
                     "group": job["group"],
                     "room": job["room"],
                     "event_id": job["event_id"],
-                    "text": f"[{source_tag(job['sender'])}] {name}: [{kind} {result}]",
+                    "text": f"{prefix}: [{kind} {result}]",
                     "reference": None,
                     "pending": job.get("pending"),
                 }
@@ -782,30 +809,35 @@ class Relay:
         if not await self._wait_limits(job["group"]):
             self._retry_later(job)
             return
+        # QQ's official SDK passes `content` alongside `media` for image/video/file
+        # (msg_type 7) to embed text and media in one message, and omits it for voice.
+        caption = f"{prefix}:" if result.file_type != QQ_AUDIO else None
         try:
             file_info = await self.qq.upload_group_media(
                 job["group"], result.data, result.filename, result.file_type
             )
-            response = await self.qq.send_group_media(job["group"], file_info)
         except QQError as exc:
-            if exc.code == QQ_FORMAT_REFUSED and not job.get("force"):
-                log.info("QQ refused the format of %s; re-encoding", job["event_id"])
-                retry = {
-                    key: value
-                    for key, value in job.items()
-                    if key not in ("ready", "sent")
-                }
-                self._enqueue_media({**retry, "force": True})
-                return
-            log.warning(
-                "cannot send media to %s: %s (trace %s)",
-                job["group"],
-                exc,
-                exc.trace_id,
-            )
-            if _transient(exc):
-                self._retry_later(job)
+            self._handle_media_error(job, exc, "upload")
             return
+        try:
+            response = await self.qq.send_group_media(
+                job["group"], file_info, content=caption
+            )
+        except QQError as exc:
+            if caption and not _transient(exc) and exc.code != QQ_FORMAT_REFUSED:
+                log.info(
+                    "QQ refused media caption for %s (%s); sending without caption",
+                    job["event_id"],
+                    exc,
+                )
+                try:
+                    response = await self.qq.send_group_media(job["group"], file_info)
+                except QQError as retry_exc:
+                    self._handle_media_error(job, retry_exc, "send")
+                    return
+            else:
+                self._handle_media_error(job, exc, "send")
+                return
         self._remember_sent(job["group"], job["room"], job["event_id"], response)
         log.info("sent media to QQ group %s: %s", job["group"], response.get("id"))
 

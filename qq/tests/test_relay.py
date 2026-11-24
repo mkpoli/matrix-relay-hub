@@ -15,6 +15,7 @@ class FakeQQ:
         self.sent = []
         self.media = []
         self.media_contents = []
+        self.media_references = []
         self.text_replies = []
         self.media_replies = []
         self.deleted = []
@@ -34,10 +35,11 @@ class FakeQQ:
         return "FILEINFO"
 
     async def send_group_media(
-        self, group, file_info, *, content=None, msg_id=None, msg_seq=1
+        self, group, file_info, *, content=None, reference=None, msg_id=None, msg_seq=1
     ):
         self.media.append((group, file_info))
         self.media_contents.append(content)
+        self.media_references.append(reference)
         self.media_replies.append((msg_id, msg_seq))
         return {"id": "QM"}
 
@@ -80,6 +82,8 @@ class FakeMatrix:
     def __init__(self):
         self.sent = []
         self.session = FakeSession()
+        self.authors = dict(self.authors)
+        self.names = {}
 
     authors = {"$orig": "@alice:example.org", "$pic": "@alice:example.org", "$long": "@alice:example.org"}
 
@@ -88,7 +92,7 @@ class FakeMatrix:
         return {"event_id": event_id, "sender": author} if author else None
 
     async def member(self, room_id, user_id):
-        return {"displayname": "Alice"}
+        return {"displayname": self.names.get(user_id, "Alice")}
 
     async def register_user(self, localpart, displayname):
         return f"@{localpart}:example.org"
@@ -652,12 +656,17 @@ def test_media_retries_without_caption_when_qq_refuses_it(tmp_path):
 
     class CaptionRefusingQQ(FakeQQ):
         async def send_group_media(
-            self, group, file_info, *, content=None, msg_id=None, msg_seq=1
+            self, group, file_info, *, content=None, reference=None, msg_id=None, msg_seq=1
         ):
             if content:
                 raise QQError(304003, "URL not allowed", status=400)
             return await super().send_group_media(
-                group, file_info, content=content, msg_id=msg_id, msg_seq=msg_seq
+                group,
+                file_info,
+                content=content,
+                reference=reference,
+                msg_id=msg_id,
+                msg_seq=msg_seq,
             )
 
     qq = CaptionRefusingQQ()
@@ -678,7 +687,7 @@ def test_captionless_retry_still_reencodes_on_format_refusal(tmp_path):
 
     class CaptionThenFormatRefusingQQ(FakeQQ):
         async def send_group_media(
-            self, group, file_info, *, content=None, msg_id=None, msg_seq=1
+            self, group, file_info, *, content=None, reference=None, msg_id=None, msg_seq=1
         ):
             if content:
                 raise QQError(304003, "URL not allowed", status=400)
@@ -706,6 +715,397 @@ def test_captionless_retry_still_reencodes_on_format_refusal(tmp_path):
         assert relay._images.get_nowait() is retry
 
     asyncio.run(go())
+    store.close()
+
+
+def test_welcome_sticker_reply_names_greeted_user_and_quotes_join(tmp_path):
+    from qq_bridge.fit import QQ_IMAGE, Prepared
+
+    qq = FakeQQ()
+    relay, store = make_relay(
+        tmp_path,
+        qq,
+        rooms=(
+            RoomConfig(alias="#welcome:example.org", label="歡迎"),
+            RoomConfig(alias="#two:example.org", label="two"),
+        ),
+    )
+    relay.matrix.authors["$join"] = "@discord_2:example.org"
+    relay.matrix.names = {
+        "@discord_1:example.org": "mkpoli",
+        "@discord_2:example.org": "ItMarki",
+    }
+    store.add_message("QJ", "G", ROOM, "$join", "REFJOIN", "matrix")
+
+    event = {
+        "room_id": ROOM,
+        "sender": "@discord_1:example.org",
+        "type": "m.sticker",
+        "event_id": "$wave",
+        "content": {
+            "body": "Wave",
+            "url": "mxc://example.org/wave",
+            "info": {"mimetype": "image/webp"},
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$join"}},
+        },
+    }
+
+    async def go():
+        await relay.handle_matrix_event(event)
+        job = relay._queue.get_nowait()
+        relay._images.get_nowait()
+        job["ready"].set_result(Prepared(b"gif", "wave.gif", QQ_IMAGE))
+        await relay._send_media(job)
+
+    asyncio.run(go())
+    assert qq.media_contents == ["[D] [歡迎] mkpoli → ItMarki:"]
+    assert qq.media_references == ["REFJOIN"]
+    store.close()
+
+
+def test_sticker_reply_still_names_target_without_stored_qq_reference(tmp_path):
+    from qq_bridge.fit import QQ_IMAGE, Prepared
+
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay.matrix.authors["$join"] = "@discord_2:example.org"
+    relay.matrix.names = {
+        "@discord_1:example.org": "mkpoli",
+        "@discord_2:example.org": "ItMarki",
+    }
+
+    event = {
+        "room_id": ROOM,
+        "sender": "@discord_1:example.org",
+        "type": "m.sticker",
+        "event_id": "$wave",
+        "content": {
+            "body": "Wave",
+            "url": "mxc://example.org/wave",
+            "info": {"mimetype": "image/webp"},
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$join"}},
+        },
+    }
+
+    async def go():
+        await relay.handle_matrix_event(event)
+        job = relay._queue.get_nowait()
+        relay._images.get_nowait()
+        job["ready"].set_result(Prepared(b"gif", "wave.gif", QQ_IMAGE))
+        await relay._send_media(job)
+
+    asyncio.run(go())
+    assert qq.media_contents == ["[D] mkpoli → ItMarki:"]
+    assert qq.media_references == [None]
+    store.close()
+
+
+def test_sticker_reply_resolves_reference_after_target_is_sent(tmp_path):
+    from qq_bridge.fit import QQ_IMAGE, Prepared
+
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay.matrix.authors["$join"] = "@discord_2:example.org"
+    relay.matrix.names = {
+        "@discord_1:example.org": "mkpoli",
+        "@discord_2:example.org": "ItMarki",
+    }
+
+    event = {
+        "room_id": ROOM,
+        "sender": "@discord_1:example.org",
+        "type": "m.sticker",
+        "event_id": "$wave",
+        "content": {
+            "body": "Wave",
+            "url": "mxc://example.org/wave",
+            "info": {"mimetype": "image/webp"},
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$join"}},
+        },
+    }
+
+    async def go():
+        await relay.handle_matrix_event(event)
+        job = relay._queue.get_nowait()
+        relay._images.get_nowait()
+        # Simulate the preceding join message finishing delivery before the sticker sends.
+        store.add_message("QJ", "G", ROOM, "$join", "REFJOIN", "matrix")
+        job["ready"].set_result(Prepared(b"gif", "wave.gif", QQ_IMAGE))
+        await relay._send_media(job)
+
+    asyncio.run(go())
+    assert qq.media_contents == ["[D] mkpoli → ItMarki:"]
+    assert qq.media_references == ["REFJOIN"]
+    store.close()
+
+
+def test_sticker_falls_back_to_single_mention_when_reply_target_unavailable(tmp_path):
+    from qq_bridge.fit import QQ_IMAGE, Prepared
+
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay.matrix.names = {
+        "@discord_1:example.org": "mkpoli",
+        "@discord_2:example.org": "ItMarki",
+    }
+
+    event = {
+        "room_id": ROOM,
+        "sender": "@discord_1:example.org",
+        "type": "m.sticker",
+        "event_id": "$wave",
+        "content": {
+            "body": "Wave",
+            "url": "mxc://example.org/wave",
+            "info": {"mimetype": "image/webp"},
+            "m.mentions": {"user_ids": ["@discord_2:example.org"]},
+        },
+    }
+
+    async def go():
+        await relay.handle_matrix_event(event)
+        job = relay._queue.get_nowait()
+        relay._images.get_nowait()
+        job["ready"].set_result(Prepared(b"gif", "wave.gif", QQ_IMAGE))
+        await relay._send_media(job)
+
+    asyncio.run(go())
+    assert qq.media_contents == ["[D] mkpoli → ItMarki:"]
+    assert qq.media_references == [None]
+    store.close()
+
+
+def test_media_self_reply_keeps_reference_without_duplicating_sender_name(tmp_path):
+    from qq_bridge.fit import QQ_IMAGE, Prepared
+
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay.matrix.authors["$self"] = "@discord_1:example.org"
+    relay.matrix.names = {"@discord_1:example.org": "mkpoli"}
+    store.add_message("QS", "G", ROOM, "$self", "REFSELF", "matrix")
+
+    event = {
+        "room_id": ROOM,
+        "sender": "@discord_1:example.org",
+        "type": "m.sticker",
+        "event_id": "$wave_self",
+        "content": {
+            "body": "Wave",
+            "url": "mxc://example.org/wave",
+            "info": {"mimetype": "image/webp"},
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$self"}},
+            "m.mentions": {"user_ids": ["@discord_2:example.org"]},
+        },
+    }
+
+    async def go():
+        await relay.handle_matrix_event(event)
+        job = relay._queue.get_nowait()
+        relay._images.get_nowait()
+        job["ready"].set_result(Prepared(b"gif", "wave.gif", QQ_IMAGE))
+        await relay._send_media(job)
+
+    asyncio.run(go())
+    assert qq.media_contents == ["[D] mkpoli:"]
+    assert qq.media_references == ["REFSELF"]
+    store.close()
+
+
+def test_sticker_text_and_unfit_fallbacks_preserve_reply_target_and_reference(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay.matrix.authors["$join"] = "@discord_2:example.org"
+    relay.matrix.names = {
+        "@discord_1:example.org": "mkpoli",
+        "@discord_2:example.org": "ItMarki",
+    }
+    store.add_message("QJ", "G", ROOM, "$join", "REFJOIN", "matrix")
+
+    unconverted = {
+        "room_id": ROOM,
+        "sender": "@discord_1:example.org",
+        "type": "m.sticker",
+        "event_id": "$lottie",
+        "content": {
+            "body": "Wave",
+            "info": {"mimetype": "application/json"},
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$join"}},
+        },
+    }
+    asyncio.run(relay.handle_matrix_event(unconverted))
+    job = relay._queue.get_nowait()
+    assert job["text"] == "[D] mkpoli → ItMarki: [sticker: Wave]"
+    assert job["reference"] == "REFJOIN"
+
+    unfit = {
+        "room_id": ROOM,
+        "sender": "@discord_1:example.org",
+        "type": "m.sticker",
+        "event_id": "$unfit",
+        "content": {
+            "body": "Wave",
+            "url": "mxc://example.org/wave",
+            "info": {"mimetype": "image/webp"},
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$join"}},
+        },
+    }
+
+    async def go():
+        await relay.handle_matrix_event(unfit)
+        media_job = relay._queue.get_nowait()
+        relay._images.get_nowait()
+        media_job["ready"].set_result("not accepted by QQ")
+        await relay._send_media(media_job)
+
+    asyncio.run(go())
+    assert qq.sent[-1] == ("G", "[D] mkpoli → ItMarki: [sticker: Wave]", "REFJOIN")
+    store.close()
+
+
+def test_media_retries_without_reference_keeping_caption_when_qq_refuses_reference(
+    tmp_path,
+):
+    from qq_bridge.fit import QQ_IMAGE, Prepared
+
+    class ReferenceRefusingQQ(FakeQQ):
+        async def send_group_media(
+            self, group, file_info, *, content=None, reference=None, msg_id=None, msg_seq=1
+        ):
+            if reference:
+                raise QQError(400, "message_reference not supported", status=400)
+            return await super().send_group_media(
+                group,
+                file_info,
+                content=content,
+                reference=reference,
+                msg_id=msg_id,
+                msg_seq=msg_seq,
+            )
+
+    qq = ReferenceRefusingQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay.matrix.authors["$join"] = "@discord_2:example.org"
+    relay.matrix.names = {
+        "@discord_1:example.org": "mkpoli",
+        "@discord_2:example.org": "ItMarki",
+    }
+    store.add_message("QJ", "G", ROOM, "$join", "REFJOIN", "matrix")
+
+    event = {
+        "room_id": ROOM,
+        "sender": "@discord_1:example.org",
+        "type": "m.sticker",
+        "event_id": "$wave",
+        "content": {
+            "body": "Wave",
+            "url": "mxc://example.org/wave",
+            "info": {"mimetype": "image/webp"},
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$join"}},
+        },
+    }
+
+    async def go():
+        await relay.handle_matrix_event(event)
+        job = relay._queue.get_nowait()
+        relay._images.get_nowait()
+        job["ready"].set_result(Prepared(b"gif", "wave.gif", QQ_IMAGE))
+        await relay._send_media(job)
+
+    asyncio.run(go())
+    assert qq.media_contents == ["[D] mkpoli → ItMarki:"]
+    assert qq.media_references == [None]
+    store.close()
+
+
+def test_audio_reply_passes_reference_without_caption_and_retries_if_refused(tmp_path):
+    from qq_bridge.fit import QQ_AUDIO, Prepared
+
+    class ReferenceRefusingQQ(FakeQQ):
+        async def send_group_media(
+            self, group, file_info, *, content=None, reference=None, msg_id=None, msg_seq=1
+        ):
+            if reference:
+                raise QQError(400, "message_reference not supported", status=400)
+            return await super().send_group_media(
+                group,
+                file_info,
+                content=content,
+                reference=reference,
+                msg_id=msg_id,
+                msg_seq=msg_seq,
+            )
+
+    qq = ReferenceRefusingQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay.matrix.authors["$join"] = "@discord_2:example.org"
+    relay.matrix.names = {
+        "@discord_1:example.org": "mkpoli",
+        "@discord_2:example.org": "ItMarki",
+    }
+    store.add_message("QJ", "G", ROOM, "$join", "REFJOIN", "matrix")
+
+    event = {
+        "room_id": ROOM,
+        "sender": "@discord_1:example.org",
+        "type": "m.room.message",
+        "event_id": "$aud",
+        "content": {
+            "msgtype": "m.audio",
+            "body": "voice.ogg",
+            "url": "mxc://example.org/voice",
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$join"}},
+        },
+    }
+
+    async def go():
+        await relay.handle_matrix_event(event)
+        job = relay._queue.get_nowait()
+        relay._images.get_nowait()
+        job["ready"].set_result(Prepared(b"aud", "voice.silk", QQ_AUDIO))
+        await relay._send_media(job)
+
+    asyncio.run(go())
+    assert qq.media_contents == [None]
+    assert qq.media_references == [None]
+    store.close()
+
+
+def test_media_reply_to_redacted_event_omits_reference(tmp_path):
+    from qq_bridge.fit import QQ_IMAGE, Prepared
+
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay.matrix.authors["$join"] = "@discord_2:example.org"
+    relay.matrix.names = {
+        "@discord_1:example.org": "mkpoli",
+        "@discord_2:example.org": "ItMarki",
+    }
+    store.add_message("QJ", "G", ROOM, "$join", "REFJOIN", "matrix")
+    store.supersede("$join", "redacted")
+
+    event = {
+        "room_id": ROOM,
+        "sender": "@discord_1:example.org",
+        "type": "m.sticker",
+        "event_id": "$wave",
+        "content": {
+            "body": "Wave",
+            "url": "mxc://example.org/wave",
+            "info": {"mimetype": "image/webp"},
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$join"}},
+        },
+    }
+
+    async def go():
+        await relay.handle_matrix_event(event)
+        job = relay._queue.get_nowait()
+        relay._images.get_nowait()
+        job["ready"].set_result(Prepared(b"gif", "wave.gif", QQ_IMAGE))
+        await relay._send_media(job)
+
+    asyncio.run(go())
+    assert qq.media_contents == ["[D] mkpoli → ItMarki:"]
+    assert qq.media_references == [None]
     store.close()
 
 

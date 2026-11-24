@@ -44,6 +44,25 @@ def test_group_media_carries_a_passive_reply():
     assert payload["msg_id"] == "Q7"
     assert payload["msg_seq"] == 4
     assert payload["media"] == {"file_info": "FILE"}
+    assert "content" not in payload
+
+
+def test_group_media_carries_content_when_given():
+    client = _client()
+    calls = []
+
+    async def request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {}
+
+    client.request = request
+    asyncio.run(client.send_group_media("G", "FILE", content="[D] Alice:"))
+    payload = calls[0][2]["json"]
+    assert payload == {
+        "msg_type": 7,
+        "media": {"file_info": "FILE"},
+        "content": "[D] Alice:",
+    }
 
 
 def test_group_text_without_a_reply_has_no_passive_fields():

@@ -369,7 +369,7 @@ class _EmoticonHTMLParser(HTMLParser):
         if tag == "a" and self._link_stack:
             href, start_index = self._link_stack.pop()
             if href.startswith(("http://", "https://")) and not href.startswith(
-                "https://matrix.to/#/"
+                "https://matrix.to/#/@"
             ):
                 inner = "".join(self.parts[start_index:]).strip()
                 if inner and href not in inner:

@@ -17,6 +17,7 @@ class FakeQQ:
         self.uploads = []
         self.media_contents = []
         self.media_references = []
+        self.order = []
         self.text_replies = []
         self.media_replies = []
         self.deleted = []
@@ -26,6 +27,7 @@ class FakeQQ:
         self, group, content, *, reference=None, msg_id=None, msg_seq=1
     ):
         self.sent.append((group, content, reference))
+        self.order.append(("text", content, reference))
         self.text_replies.append((msg_id, msg_seq))
         return {
             "id": f"Q{len(self.sent)}",
@@ -42,6 +44,7 @@ class FakeQQ:
         self.media.append((group, file_info))
         self.media_contents.append(content)
         self.media_references.append(reference)
+        self.order.append(("media", file_info, content, reference))
         self.media_replies.append((msg_id, msg_seq))
         return {"id": "QM"}
 
@@ -649,29 +652,25 @@ def test_media_carries_its_sender_in_content(tmp_path):
             await relay._send_media(job)
 
     asyncio.run(go())
-    assert qq.media_contents == ["[D] [in] Alice:", None]
+    assert qq.order == [
+        ("text", "[D] [in] Alice:", None),
+        ("media", "FILEINFO", None, None),
+        ("text", "[M] [in] Alice:", None),
+        ("media", "FILEINFO", None, None),
+    ]
     store.close()
 
 
-def test_media_retries_without_caption_when_qq_refuses_it(tmp_path):
+def test_media_still_sends_when_label_text_is_refused(tmp_path):
     from qq_bridge.fit import QQ_IMAGE, Prepared
 
-    class CaptionRefusingQQ(FakeQQ):
-        async def send_group_media(
-            self, group, file_info, *, content=None, reference=None, msg_id=None, msg_seq=1
+    class LabelRefusingQQ(FakeQQ):
+        async def send_group_text(
+            self, group, content, *, reference=None, msg_id=None, msg_seq=1
         ):
-            if content:
-                raise QQError(304003, "URL not allowed", status=400)
-            return await super().send_group_media(
-                group,
-                file_info,
-                content=content,
-                reference=reference,
-                msg_id=msg_id,
-                msg_seq=msg_seq,
-            )
+            raise QQError(304003, "URL not allowed", status=400)
 
-    qq = CaptionRefusingQQ()
+    qq = LabelRefusingQQ()
     relay, store = make_relay(tmp_path, qq)
     _run_media(
         relay,
@@ -684,18 +683,17 @@ def test_media_retries_without_caption_when_qq_refuses_it(tmp_path):
     store.close()
 
 
-def test_captionless_retry_still_reencodes_on_format_refusal(tmp_path):
+def test_format_refusal_after_label_reencodes_without_repeating_label(tmp_path):
     from qq_bridge.fit import QQ_IMAGE, Prepared
 
-    class CaptionThenFormatRefusingQQ(FakeQQ):
+    class FormatRefusingMediaQQ(FakeQQ):
         async def send_group_media(
             self, group, file_info, *, content=None, reference=None, msg_id=None, msg_seq=1
         ):
-            if content:
-                raise QQError(304003, "URL not allowed", status=400)
             raise QQError(40034002, "富媒体文件格式不支持", status=400)
 
-    relay, store = make_relay(tmp_path, CaptionThenFormatRefusingQQ())
+    qq = FormatRefusingMediaQQ()
+    relay, store = make_relay(tmp_path, qq)
 
     async def go():
         relay._enqueue_media(
@@ -714,9 +712,11 @@ def test_captionless_retry_still_reencodes_on_format_refusal(tmp_path):
         await relay._send_media(job)
         retry = relay._queue.get_nowait()
         assert retry["force"] is True
+        assert retry["skip_labels"] == 1
         assert relay._images.get_nowait() is retry
 
     asyncio.run(go())
+    assert qq.sent == [("G", "[M] Alice:", None)]
     store.close()
 
 
@@ -760,8 +760,10 @@ def test_welcome_sticker_reply_names_greeted_user_and_quotes_join(tmp_path):
         await relay._send_media(job)
 
     asyncio.run(go())
-    assert qq.media_contents == ["[D] [歡迎] mkpoli → ItMarki:"]
-    assert qq.media_references == ["REFJOIN"]
+    assert qq.order == [
+        ("text", "[D] [歡迎] mkpoli → ItMarki:", "REFJOIN"),
+        ("media", "FILEINFO", None, None),
+    ]
     store.close()
 
 
@@ -797,8 +799,10 @@ def test_sticker_reply_still_names_target_without_stored_qq_reference(tmp_path):
         await relay._send_media(job)
 
     asyncio.run(go())
-    assert qq.media_contents == ["[D] mkpoli → ItMarki:"]
-    assert qq.media_references == [None]
+    assert qq.order == [
+        ("text", "[D] mkpoli → ItMarki:", None),
+        ("media", "FILEINFO", None, None),
+    ]
     store.close()
 
 
@@ -836,8 +840,10 @@ def test_sticker_reply_resolves_reference_after_target_is_sent(tmp_path):
         await relay._send_media(job)
 
     asyncio.run(go())
-    assert qq.media_contents == ["[D] mkpoli → ItMarki:"]
-    assert qq.media_references == ["REFJOIN"]
+    assert qq.order == [
+        ("text", "[D] mkpoli → ItMarki:", "REFJOIN"),
+        ("media", "FILEINFO", None, None),
+    ]
     store.close()
 
 
@@ -872,8 +878,10 @@ def test_sticker_falls_back_to_single_mention_when_reply_target_unavailable(tmp_
         await relay._send_media(job)
 
     asyncio.run(go())
-    assert qq.media_contents == ["[D] mkpoli → ItMarki:"]
-    assert qq.media_references == [None]
+    assert qq.order == [
+        ("text", "[D] mkpoli → ItMarki:", None),
+        ("media", "FILEINFO", None, None),
+    ]
     store.close()
 
 
@@ -908,8 +916,10 @@ def test_media_self_reply_keeps_reference_without_duplicating_sender_name(tmp_pa
         await relay._send_media(job)
 
     asyncio.run(go())
-    assert qq.media_contents == ["[D] mkpoli:"]
-    assert qq.media_references == ["REFSELF"]
+    assert qq.order == [
+        ("text", "[D] mkpoli:", "REFSELF"),
+        ("media", "FILEINFO", None, None),
+    ]
     store.close()
 
 
@@ -964,7 +974,7 @@ def test_sticker_text_and_unfit_fallbacks_preserve_reply_target_and_reference(tm
     store.close()
 
 
-def test_media_retries_without_reference_keeping_caption_when_qq_refuses_reference(
+def test_media_label_retries_unquoted_when_qq_refuses_reference(
     tmp_path,
 ):
     from qq_bridge.fit import QQ_IMAGE, Prepared
@@ -974,16 +984,15 @@ def test_media_retries_without_reference_keeping_caption_when_qq_refuses_referen
             super().__init__()
             self.attempts = []
 
-        async def send_group_media(
-            self, group, file_info, *, content=None, reference=None, msg_id=None, msg_seq=1
+        async def send_group_text(
+            self, group, content, *, reference=None, msg_id=None, msg_seq=1
         ):
             self.attempts.append((content, reference))
             if reference:
                 raise QQError(400, "message_reference not supported", status=400)
-            return await super().send_group_media(
+            return await super().send_group_text(
                 group,
-                file_info,
-                content=content,
+                content,
                 reference=reference,
                 msg_id=msg_id,
                 msg_seq=msg_seq,
@@ -1023,12 +1032,14 @@ def test_media_retries_without_reference_keeping_caption_when_qq_refuses_referen
         ("[D] mkpoli → ItMarki:", "REFJOIN"),
         ("[D] mkpoli → ItMarki:", None),
     ]
-    assert qq.media_contents == ["[D] mkpoli → ItMarki:"]
-    assert qq.media_references == [None]
+    assert qq.order == [
+        ("text", "[D] mkpoli → ItMarki:", None),
+        ("media", "FILEINFO", None, None),
+    ]
     store.close()
 
 
-def test_audio_reply_passes_reference_without_caption_and_retries_if_refused(tmp_path):
+def test_audio_reply_sends_label_with_reference_before_voice(tmp_path):
     from qq_bridge.fit import QQ_AUDIO, Prepared
 
     class ReferenceRefusingQQ(FakeQQ):
@@ -1036,16 +1047,15 @@ def test_audio_reply_passes_reference_without_caption_and_retries_if_refused(tmp
             super().__init__()
             self.attempts = []
 
-        async def send_group_media(
-            self, group, file_info, *, content=None, reference=None, msg_id=None, msg_seq=1
+        async def send_group_text(
+            self, group, content, *, reference=None, msg_id=None, msg_seq=1
         ):
             self.attempts.append((content, reference))
             if reference:
                 raise QQError(400, "message_reference not supported", status=400)
-            return await super().send_group_media(
+            return await super().send_group_text(
                 group,
-                file_info,
-                content=content,
+                content,
                 reference=reference,
                 msg_id=msg_id,
                 msg_seq=msg_seq,
@@ -1081,9 +1091,14 @@ def test_audio_reply_passes_reference_without_caption_and_retries_if_refused(tmp
         await relay._send_media(job)
 
     asyncio.run(go())
-    assert qq.attempts == [(None, "REFJOIN"), (None, None)]
-    assert qq.media_contents == [None]
-    assert qq.media_references == [None]
+    assert qq.attempts == [
+        ("[D] mkpoli → ItMarki:", "REFJOIN"),
+        ("[D] mkpoli → ItMarki:", None),
+    ]
+    assert qq.order == [
+        ("text", "[D] mkpoli → ItMarki:", None),
+        ("media", "FILEINFO", None, None),
+    ]
     store.close()
 
 
@@ -1121,30 +1136,23 @@ def test_media_reply_to_redacted_event_omits_reference(tmp_path):
         await relay._send_media(job)
 
     asyncio.run(go())
-    assert qq.media_contents == ["[D] mkpoli → ItMarki:"]
-    assert qq.media_references == [None]
+    assert qq.order == [
+        ("text", "[D] mkpoli → ItMarki:", None),
+        ("media", "FILEINFO", None, None),
+    ]
     store.close()
 
 
-def test_media_caption_refusal_keeps_valid_reference(tmp_path):
+def test_media_still_delivers_when_label_with_domain_name_is_refused(tmp_path):
     from qq_bridge.fit import QQ_IMAGE, Prepared
 
-    class CaptionRefusingQQ(FakeQQ):
-        async def send_group_media(
-            self, group, file_info, *, content=None, reference=None, msg_id=None, msg_seq=1
+    class LabelRefusingQQ(FakeQQ):
+        async def send_group_text(
+            self, group, content, *, reference=None, msg_id=None, msg_seq=1
         ):
-            if content:
-                raise QQError(304003, "URL not allowed", status=400)
-            return await super().send_group_media(
-                group,
-                file_info,
-                content=content,
-                reference=reference,
-                msg_id=msg_id,
-                msg_seq=msg_seq,
-            )
+            raise QQError(304003, "URL not allowed", status=400)
 
-    qq = CaptionRefusingQQ()
+    qq = LabelRefusingQQ()
     relay, store = make_relay(tmp_path, qq)
     relay.matrix.authors["$join"] = "@discord_2:example.org"
     relay.matrix.names = {
@@ -1174,8 +1182,8 @@ def test_media_caption_refusal_keeps_valid_reference(tmp_path):
         await relay._send_media(job)
 
     asyncio.run(go())
+    assert qq.media == [("G", "FILEINFO")]
     assert qq.media_contents == [None]
-    assert qq.media_references == ["REFJOIN"]
     store.close()
 
 
@@ -1264,8 +1272,10 @@ def test_reply_target_member_network_or_timeout_error_does_not_drop_media(tmp_pa
             await relay._send_media(job)
 
         asyncio.run(go())
-        assert qq.media_contents == ["[D] mkpoli:"]
-        assert qq.media_references == ["REFJOIN"]
+        assert qq.order == [
+            ("text", "[D] mkpoli:", "REFJOIN"),
+            ("media", "FILEINFO", None, None),
+        ]
         store.close()
 
 
@@ -2468,9 +2478,10 @@ def test_discord_inline_custom_emoji_sends_captioned_image(tmp_path):
     seq = store.accept_transaction("t-inline", [ev])[0]
     relay.incoming.put_nowait((seq, ev))
     asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
-    assert qq.sent == []
-    assert qq.media == [("G", "FILEINFO")]
-    assert qq.media_contents == ["[D] Alice: tte，何時加的→:fumo_reimu_lying:"]
+    assert qq.order == [
+        ("text", "[D] Alice: tte，何時加的→:fumo_reimu_lying:", None),
+        ("media", "FILEINFO", None, None),
+    ]
     assert uploaded == [("fumo_reimu_lying.png", 1)]
     store.close()
 
@@ -2503,10 +2514,10 @@ def test_discord_emoji_only_message_is_sent_as_media_with_reply_target(tmp_path)
     seq = store.accept_transaction("t-only", [ev])[0]
     relay.incoming.put_nowait((seq, ev))
     asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
-    assert qq.sent == []
-    assert qq.media == [("G", "FILEINFO")]
-    assert qq.media_contents == ["[D] Alice → Bob:"]
-    assert qq.media_references == ["REF1"]
+    assert qq.order == [
+        ("text", "[D] Alice → Bob:", "REF1"),
+        ("media", "FILEINFO", None, None),
+    ]
     assert uploaded == [("spin.gif", 1)]
     store.close()
 
@@ -2529,7 +2540,8 @@ def test_multiple_custom_emojis_are_deduped_and_capped(tmp_path):
     asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
     assert qq.sent == [("G", "[D] Alice: hi :e1::e1::e2::e3::e4::e5::e6:", None)]
     assert len(qq.media) == 4
-    assert qq.media_contents == ["[D] Alice:", "[D] Alice:", "[D] Alice:", "[D] Alice:"]
+    assert qq.media_contents == [None, None, None, None]
+    assert qq.order[0] == ("text", "[D] Alice: hi :e1::e1::e2::e3::e4::e5::e6:", None)
     store.close()
 
 
@@ -2549,7 +2561,8 @@ def test_long_text_with_custom_emoji_sends_chunks_then_emoji_media(tmp_path):
     assert len(qq.sent) == 2
     assert qq.sent[-1][1].endswith(":e1:")
     assert qq.media == [("G", "FILEINFO")]
-    assert qq.media_contents == ["[D] Alice:"]
+    assert qq.media_contents == [None]
+    assert qq.order[-1] == ("media", "FILEINFO", None, None)
     store.close()
 
 
@@ -2656,10 +2669,10 @@ def test_discord_custom_emoji_reaction_sends_image_with_shortcode_and_reference(
     seq = store.accept_transaction("t-react", [ev])[0]
     relay.incoming.put_nowait((seq, ev))
     asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
-    assert qq.sent == []
-    assert qq.media == [("G", "FILEINFO")]
-    assert qq.media_contents == ["[D] Alice reacted with :kusa_lol:"]
-    assert qq.media_references == ["REF9"]
+    assert qq.order == [
+        ("text", "[D] Alice reacted with :kusa_lol:", "REF9"),
+        ("media", "FILEINFO", None, None),
+    ]
     assert uploaded == [("kusa_lol.gif", 1)]
     store.close()
 
@@ -2678,9 +2691,11 @@ def test_custom_emoji_reaction_in_same_burst_resolves_inflight_target(tmp_path):
     relay.incoming.put_nowait((seq1, msg))
     relay.incoming.put_nowait((seq2, react))
     asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
-    assert qq.sent == [("G", "[M] Alice: hello", None)]
-    assert qq.media_contents == ["[D] Alice reacted with :kusa:"]
-    assert qq.media_references == ["REF1"]
+    assert qq.order == [
+        ("text", "[M] Alice: hello", None),
+        ("text", "[D] Alice reacted with :kusa:", "REF1"),
+        ("media", "FILEINFO", None, None),
+    ]
     store.close()
 
 
@@ -2732,9 +2747,10 @@ def test_telegram_forwarded_image_preserves_forwarder_and_quote_caption(tmp_path
     seq = store.accept_transaction("t-fwd-img", [ev])[0]
     relay.incoming.put_nowait((seq, ev))
     asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
-    assert qq.sent == []
-    assert qq.media == [("G", "FILEINFO")]
-    assert qq.media_contents == [f"[T] Alice: {body}"]
+    assert qq.order == [
+        ("text", f"[T] Alice: {body}", None),
+        ("media", "FILEINFO", None, None),
+    ]
     store.close()
 
 
@@ -2757,7 +2773,10 @@ def test_telegram_forwarded_image_without_caption_strips_empty_quote_marker(tmp_
     seq = store.accept_transaction("t-fwd-empty", [ev])[0]
     relay.incoming.put_nowait((seq, ev))
     asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
-    assert qq.media_contents == ["[T] Alice: Forwarded message from Kit Tsang"]
+    assert qq.order == [
+        ("text", "[T] Alice: Forwarded message from Kit Tsang", None),
+        ("media", "FILEINFO", None, None),
+    ]
     store.close()
 
 
@@ -2793,7 +2812,12 @@ def test_uncaptioned_image_and_sticker_keep_speaker_only_caption(tmp_path):
     relay.incoming.put_nowait((seqs[0], img_ev))
     relay.incoming.put_nowait((seqs[1], sticker_ev))
     asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
-    assert qq.media_contents == ["[T] Alice:", "[M] Alice:"]
+    assert qq.order == [
+        ("text", "[T] Alice:", None),
+        ("media", "FILEINFO", None, None),
+        ("text", "[M] Alice:", None),
+        ("media", "FILEINFO", None, None),
+    ]
     store.close()
 
 
@@ -2831,10 +2855,14 @@ def test_long_media_caption_and_audio_caption_are_sent_as_text(tmp_path):
     relay.incoming.put_nowait((seqs[0], long_ev))
     relay.incoming.put_nowait((seqs[1], audio_ev))
     asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
-    assert qq.media_contents == ["[T] Alice:", None]
+    assert qq.media_contents == [None, None]
     assert len(qq.sent) == 3
-    assert qq.sent[0][1].startswith("[T] Alice: Forwarded message from Kit Tsang")
-    assert qq.sent[2][1] == "[T] Alice: Forwarded message from Kit Tsang\n\n> voice note"
+    assert qq.order[0][0] == "text"
+    assert qq.order[0][1].startswith("[T] Alice: Forwarded message from Kit Tsang")
+    assert qq.order[1][0] == "text"
+    assert qq.order[2] == ("media", "FILEINFO", None, None)
+    assert qq.order[3] == ("text", "[T] Alice: Forwarded message from Kit Tsang\n\n> voice note", None)
+    assert qq.order[4] == ("media", "FILEINFO", None, None)
     store.close()
 
 
@@ -2873,12 +2901,12 @@ def test_forwarded_image_keeps_quote_when_media_download_fails(tmp_path):
     store.close()
 
 
-def test_audio_caption_resumes_after_restart_when_caption_send_fails(tmp_path):
-    class FailTextQQ(FakeQQ):
-        async def send_group_text(self, *args, **kwargs):
+def test_audio_media_resumes_after_restart_without_duplicating_sent_caption(tmp_path):
+    class FailMediaQQ(FakeQQ):
+        async def send_group_media(self, *args, **kwargs):
             raise QQError(502, "busy", status=502)
 
-    qq1 = FailTextQQ()
+    qq1 = FailMediaQQ()
     relay1, store = make_relay(tmp_path, qq1)
     ev = {
         "room_id": ROOM,
@@ -2895,18 +2923,19 @@ def test_audio_caption_resumes_after_restart_when_caption_send_fails(tmp_path):
     }
     (seq,) = store.accept_transaction("t-aud-resume", [ev])
     relay1.incoming.put_nowait((seq, ev))
-    asyncio.run(_run_media_loops(relay1, lambda: bool(qq1.media) and not relay1._outstanding))
-    assert len(qq1.media) == 1 and _pending(store)
+    asyncio.run(_run_media_loops(relay1, lambda: bool(qq1.sent) and not relay1._outstanding))
+    assert qq1.sent == [
+        ("G", "[T] Alice: Forwarded message from Kit Tsang\n\n> voice note", None)
+    ]
+    assert qq1.media == [] and _pending(store)
 
     qq2 = FakeQQ()
     relay2 = Relay(relay1.cfg, store, FakeMatrix(), qq2)
     relay2._labels = dict(relay1._labels)
     relay2._claim_pending(idle=0)
     asyncio.run(_run_media_loops(relay2, lambda: not _pending(store)))
-    assert qq2.media == []
-    assert qq2.sent == [
-        ("G", "[T] Alice: Forwarded message from Kit Tsang\n\n> voice note", None)
-    ]
+    assert qq2.sent == []
+    assert qq2.media == [("G", "FILEINFO")]
     store.close()
 
 
@@ -2950,7 +2979,12 @@ def test_forwarded_caption_with_emoji_preserves_quote_and_literal_gt_caption_kep
     relay.incoming.put_nowait((seqs[0], fwd_ev))
     relay.incoming.put_nowait((seqs[1], gt_ev))
     asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
-    assert qq.media_contents == [f"[T] Alice: {fwd_body}", "[D] Alice: >"]
+    assert qq.order == [
+        ("text", f"[T] Alice: {fwd_body}", None),
+        ("media", "FILEINFO", None, None),
+        ("text", "[D] Alice: >", None),
+        ("media", "FILEINFO", None, None),
+    ]
     store.close()
 
 
@@ -2963,8 +2997,6 @@ def test_captioned_media_fallback_retries_transient_bare_media_send(tmp_path):
         async def send_group_media(
             self, group, file_info, *, content=None, reference=None, msg_id=None, msg_seq=1
         ):
-            if content is not None:
-                raise QQError(304003, "caption refused", status=400)
             self.bare_attempts += 1
             if self.bare_attempts == 1:
                 raise QQError(502, "busy", status=502)
@@ -2990,8 +3022,10 @@ def test_captioned_media_fallback_retries_transient_bare_media_send(tmp_path):
     (seq,) = store.accept_transaction("t-split-retry", [ev])
     relay.incoming.put_nowait((seq, ev))
     asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
-    assert qq.sent == [("G", "[T] Alice: Forwarded message from Kit Tsang\n\n> 這是產出來的字", None)]
-    assert qq.media == [("G", "FILEINFO")]
+    assert qq.order == [
+        ("text", "[T] Alice: Forwarded message from Kit Tsang\n\n> 這是產出來的字", None),
+        ("media", "FILEINFO", None, None),
+    ]
     assert qq.bare_attempts == 2
     store.close()
 
@@ -3000,10 +3034,10 @@ def test_superseded_emoji_does_not_deadlock_image_prepare_lane(tmp_path):
     qq = FakeQQ()
     relay, store = make_relay(tmp_path, qq)
     first = text_event(
-        body="old",
+        body="",
         sender="@discord_1:example.org",
         format="org.matrix.custom.html",
-        formatted_body='old <img data-mx-emoticon src="mxc://example.org/e1" alt=":e1:"/>',
+        formatted_body='<img data-mx-emoticon src="mxc://example.org/e1" alt=":e1:"/>',
     ) | {"event_id": "$e1"}
     second = text_event(
         body="next",
@@ -3037,7 +3071,10 @@ def test_superseded_emoji_does_not_deadlock_image_prepare_lane(tmp_path):
 
     asyncio.run(go())
     assert not _pending(store)
-    assert qq.media_contents == ["[D] Alice: next :e2:"]
+    assert qq.order == [
+        ("text", "[D] Alice: next :e2:", None),
+        ("media", "FILEINFO", None, None),
+    ]
     store.close()
 
 
@@ -3045,10 +3082,10 @@ def test_redaction_during_emoji_prepare_drops_before_sending(tmp_path):
     qq = FakeQQ()
     relay, store = make_relay(tmp_path, qq)
     ev = text_event(
-        body="secret",
+        body="",
         sender="@discord_1:example.org",
         format="org.matrix.custom.html",
-        formatted_body='secret <img data-mx-emoticon src="mxc://example.org/e1" alt=":e1:"/>',
+        formatted_body='<img data-mx-emoticon src="mxc://example.org/e1" alt=":e1:"/>',
     ) | {"event_id": "$e-red"}
 
     async def slow_download(url, max_bytes=None):
@@ -3074,18 +3111,21 @@ def test_reaction_waits_for_slow_deferred_inline_emoji_target(tmp_path, monkeypa
 
     relay.matrix.download = slow_download
     msg = text_event(
-        body="hi",
+        body="",
         sender="@discord_1:example.org",
         format="org.matrix.custom.html",
-        formatted_body='hi <img data-mx-emoticon src="mxc://example.org/e1" alt=":e1:"/>',
+        formatted_body='<img data-mx-emoticon src="mxc://example.org/e1" alt=":e1:"/>',
     ) | {"event_id": "$slow"}
     react = reaction_event(target="$slow", key="👍", event_id="$r-slow")
     seq1, seq2 = store.accept_transaction("t-slow", [msg, react])
     relay.incoming.put_nowait((seq1, msg))
     relay.incoming.put_nowait((seq2, react))
     asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
-    assert qq.media_contents == ["[D] Alice: hi :e1:"]
-    assert qq.sent == [("G", "[M] Alice reacted with 👍", "QM")]
+    assert qq.order == [
+        ("text", "[D] Alice:", None),
+        ("media", "FILEINFO", None, None),
+        ("text", "[M] Alice reacted with 👍", "REF1"),
+    ]
     store.close()
 
 

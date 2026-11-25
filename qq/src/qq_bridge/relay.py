@@ -889,6 +889,10 @@ class Relay:
             or not self._inflight_events.get(ref_event)
         ):
             return False
+        if "sent" in job:
+            # Release the prepare worker so a target's forced re-encode behind this
+            # reaction can run without deadlocking the lane.
+            job["sent"].set()
         self._inflight_waiters.setdefault(ref_event, []).append(job)
         return True
 

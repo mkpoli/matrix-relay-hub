@@ -301,12 +301,13 @@ def test_extract_custom_emojis_deduplicates_adjacent_alt_and_keeps_links():
         'see <a href="https://example.com/x">link</a> '
         'and <a href="https://matrix.to/#/!room:example.org/$ev">original</a> '
         'by <a href="https://matrix.to/#/@alice:example.org">Alice</a> '
+        'and <a href="https://matrix.to/#/%40bob%3Aexample.org">Bob</a> '
         '<img data-mx-emoticon src="mxc://example.org/f" alt="[变形]"/>[变形]'
     )
     text, emojis, emoji_only = extract_custom_emojis(html_body)
     assert (
         text
-        == "see link (https://example.com/x) and original (https://matrix.to/#/!room:example.org/$ev) by Alice [变形]"
+        == "see link (https://example.com/x) and original (https://matrix.to/#/!room:example.org/$ev) by Alice and Bob [变形]"
     )
     assert len(emojis) == 1
     assert emoji_only is False

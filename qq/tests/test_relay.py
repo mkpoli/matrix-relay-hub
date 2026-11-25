@@ -2674,11 +2674,32 @@ def test_superseded_emoji_does_not_deadlock_image_prepare_lane(tmp_path):
         format="org.matrix.custom.html",
         formatted_body='next <img data-mx-emoticon src="mxc://example.org/e2" alt=":e2:"/>',
     ) | {"event_id": "$e2"}
-    store.supersede("$e1", "edited")
-    seq1, seq2 = store.accept_transaction("t-deadlock", [first, second])
-    relay.incoming.put_nowait((seq1, first))
-    relay.incoming.put_nowait((seq2, second))
-    asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
+
+    async def go():
+        seq1, seq2 = store.accept_transaction("t-deadlock", [first, second])
+        relay._current = seq1
+        relay._outstanding[seq1] = 0
+        await relay.handle_matrix_event(first)
+        relay._current = seq2
+        relay._outstanding[seq2] = 0
+        await relay.handle_matrix_event(second)
+        relay._current = None
+        # Supersede $e1 after its media job is already queued in the prepare lane.
+        store.supersede("$e1", "edited")
+        tasks = [
+            asyncio.create_task(relay._send_loop()),
+            asyncio.create_task(relay._prepare_loop(relay._images)),
+        ]
+        for _ in range(400):
+            await asyncio.sleep(0.005)
+            if not _pending(store):
+                break
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(go())
+    assert not _pending(store)
     assert qq.media_contents == ["[D] Alice: next :e2:"]
     store.close()
 

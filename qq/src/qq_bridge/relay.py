@@ -1457,7 +1457,7 @@ class Relay:
     async def _send_tweet_post(
         self, post: twitter.Post, group: str, reply_id: str | None = None
     ) -> bool:
-        """Send the post; True once its text reached QQ, whatever the pictures did.
+        """Send the post; True once its text reached QQ, whatever the media did.
 
         A QQ-origin post answers the member's message with `msg_id` and a fresh
         `msg_seq`, because the group API rejects proactive pushes and ignores
@@ -1498,23 +1498,36 @@ class Relay:
         log.info("expanded tweet %s for %s", post.link.status, group)
         if post.sensitive:
             return True
-        for url in twitter.image_urls(post):
+        for attachment in twitter.attachments(post):
             if reply_id and seq > 5:
                 break
-            downloaded = await twitter.download(self.matrix.session, url)
+            downloaded = await twitter.download(self.matrix.session, attachment)
             if downloaded is None:
                 continue
             data, content_type = downloaded
-            suffix = {
-                "image/jpeg": ".jpg",
-                "image/png": ".png",
-                "image/webp": ".webp",
-                "image/gif": ".gif",
-            }.get(content_type, ".jpg")
+            if attachment.kind == "image":
+                msgtype = "m.image"
+                mimetype = content_type
+                suffix = {
+                    "image/jpeg": ".jpg",
+                    "image/png": ".png",
+                    "image/webp": ".webp",
+                    "image/gif": ".gif",
+                }.get(content_type, ".jpg")
+                filename = f"tweet{suffix}"
+            else:
+                msgtype = "m.video"
+                mimetype = "video/mp4"
+                filename = "tweet.mp4"
             try:
-                prepared = await prepare(data, "m.image", content_type, f"tweet{suffix}")
+                prepared = await prepare(data, msgtype, mimetype, filename)
             except Unfit as exc:
-                log.info("cannot prepare tweet picture %s: %s", url, exc)
+                log.info(
+                    "cannot prepare tweet %s %s: %s",
+                    attachment.kind,
+                    attachment.url,
+                    exc,
+                )
                 continue
             if not await self._wait_limits(group):
                 return True
@@ -1528,16 +1541,30 @@ class Relay:
                     )
                 except QQError as exc:
                     if exc.code == QQ_FORMAT_REFUSED and attempt == 0:
-                        log.info("QQ refused the format of tweet picture %s; re-encoding", url)
+                        log.info(
+                            "QQ refused the format of tweet %s %s; re-encoding",
+                            attachment.kind,
+                            attachment.url,
+                        )
                         try:
                             prepared = await prepare(
-                                data, "m.image", content_type, f"tweet{suffix}", force=True
+                                data, msgtype, mimetype, filename, force=True
                             )
                         except Unfit as unfit:
-                            log.info("cannot re-encode tweet picture %s: %s", url, unfit)
+                            log.info(
+                                "cannot re-encode tweet %s %s: %s",
+                                attachment.kind,
+                                attachment.url,
+                                unfit,
+                            )
                             break
                         continue
-                    log.warning("cannot send tweet picture to %s: %s", group, exc)
+                    log.warning(
+                        "cannot send tweet %s to %s: %s",
+                        attachment.kind,
+                        group,
+                        exc,
+                    )
                     break
                 break
             if reply_id:

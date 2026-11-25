@@ -14,6 +14,7 @@ class FakeQQ:
     def __init__(self):
         self.sent = []
         self.media = []
+        self.uploads = []
         self.media_contents = []
         self.media_references = []
         self.text_replies = []
@@ -32,6 +33,7 @@ class FakeQQ:
         }
 
     async def upload_group_media(self, group, data, filename, file_type):
+        self.uploads.append((group, filename, file_type))
         return "FILEINFO"
 
     async def send_group_media(
@@ -2143,8 +2145,8 @@ def test_twitter_expansion_uploads_its_pictures(tmp_path, monkeypatch):
         b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
     )
 
-    async def fake_download(session, url, max_bytes=0):
-        assert "name=large" in url
+    async def fake_download(session, attachment, max_bytes=None):
+        assert "name=large" in attachment.url
         return png, "image/png"
 
     monkeypatch.setattr("qq_bridge.relay.twitter.download", fake_download)
@@ -2152,11 +2154,57 @@ def test_twitter_expansion_uploads_its_pictures(tmp_path, monkeypatch):
     assert qq.sent[0][1].startswith("[Twitter] Alice (@Alice)")
     assert qq.text_replies == [("Q7", 1)]
     assert qq.media == [("G", "FILEINFO")]
+    assert qq.uploads == [("G", "tweet.png", 1)]
     assert qq.media_replies == [("Q7", 2)]
     store.close()
 
 
-def test_sensitive_twitter_post_skips_its_pictures(tmp_path):
+def _video_post(kind="video"):
+    from qq_bridge import twitter
+
+    link = twitter.find("https://x.com/Alice/status/123")[0]
+    return twitter.Post(
+        handle="Alice",
+        name="Alice",
+        text="the post",
+        created=None,
+        link=link,
+        media=(
+            twitter.Media(
+                kind,
+                "https://video.twimg.com/x.mp4",
+                "https://pbs.twimg.com/thumb/1.jpg",
+            ),
+        ),
+        quote=None,
+        poll=(),
+        sensitive=False,
+        replying_to=None,
+    )
+
+
+def test_twitter_expansion_uploads_a_video(tmp_path, monkeypatch):
+    from qq_bridge import twitter
+
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    mp4 = b"\x00\x00\x00\x18ftypmp42" + b"video"
+
+    async def fake_download(session, attachment, max_bytes=None):
+        assert attachment == twitter.Attachment(
+            "video", "https://video.twimg.com/x.mp4"
+        )
+        return mp4, "video/mp4"
+
+    monkeypatch.setattr("qq_bridge.relay.twitter.download", fake_download)
+    asyncio.run(relay._send_tweet_post(_video_post("gif"), "G", "Q7"))
+    assert qq.text_replies == [("Q7", 1)]
+    assert qq.uploads == [("G", "tweet.mp4", 2)]
+    assert qq.media_replies == [("Q7", 2)]
+    store.close()
+
+
+def test_sensitive_twitter_post_skips_its_media(tmp_path):
     qq = FakeQQ()
     relay, store = make_relay(tmp_path, qq)
     post = _photo_post()
@@ -2284,7 +2332,7 @@ def test_qq_passive_reply_stops_at_five_parts(tmp_path, monkeypatch):
         replying_to=None,
     )
 
-    async def fake_download(session, url, max_bytes=0):
+    async def fake_download(session, attachment, max_bytes=None):
         return b"image", "image/jpeg"
 
     monkeypatch.setattr("qq_bridge.relay.twitter.download", fake_download)

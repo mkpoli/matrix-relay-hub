@@ -108,6 +108,71 @@ def test_odd_sized_video_transcodes(size):
     assert prepared.file_type == QQ_VIDEO
 
 
+def test_animated_webp_becomes_a_gif_when_ffmpeg_cannot_read_it(monkeypatch):
+    from PIL import ImageDraw
+
+    async def unreadable(data, limit):
+        raise Unfit("not accepted by QQ")
+
+    monkeypatch.setattr("qq_bridge.fit.fit_video", unreadable)
+    frames = [Image.new("RGBA", (160, 160), (0, 0, 0, 0)) for _ in range(4)]
+    for index, frame in enumerate(frames):
+        ImageDraw.Draw(frame).ellipse(
+            (20 + index * 20, 40, 60 + index * 20, 80), fill=(88, 101, 242, 255)
+        )
+    out = io.BytesIO()
+    frames[0].save(out, "WEBP", save_all=True, append_images=frames[1:], duration=60, loop=0)
+    data = out.getvalue()
+    prepared = asyncio.run(prepare(data, "m.image", "image/webp", "Wave", force=True))
+    assert prepared.file_type == QQ_IMAGE
+    assert prepared.filename == "Wave.gif"
+    with Image.open(io.BytesIO(prepared.data)) as gif:
+        assert gif.format == "GIF"
+        assert gif.is_animated is True
+        assert gif.n_frames == 4
+        assert gif.info["duration"] == 60
+        assert gif.convert("RGBA").getpixel((0, 0))[3] == 0
+
+
+def test_fit_gif_clamps_long_durations_skips_apng_poster_and_keeps_one_shot():
+    from qq_bridge.fit import fit_gif
+
+    # Long frame delay (> 655,350 ms) would overflow GIF's 16-bit centisecond field.
+    long_frames = [Image.new("RGB", (64, 64), color) for color in ("red", "blue")]
+    out = io.BytesIO()
+    long_frames[0].save(
+        out, "WEBP", save_all=True, append_images=long_frames[1:], duration=700_000, loop=0
+    )
+    gif_data = fit_gif(out.getvalue())
+    with Image.open(io.BytesIO(gif_data)) as gif:
+        assert gif.n_frames == 2
+        assert gif.info["duration"] == 655_350
+
+    # APNG with default_image=True puts a poster at index 0 outside the animation.
+    poster = Image.new("RGBA", (64, 64), (255, 0, 0, 255))
+    anim = [
+        Image.new("RGBA", (64, 64), (0, 0, 255, 255)),
+        Image.new("RGBA", (64, 64), (0, 255, 0, 255)),
+    ]
+    out_apng = io.BytesIO()
+    poster.save(
+        out_apng, "PNG", save_all=True, append_images=anim, default_image=True, duration=80
+    )
+    apng_gif = fit_gif(out_apng.getvalue())
+    with Image.open(io.BytesIO(apng_gif)) as gif:
+        assert gif.n_frames == 2
+        assert gif.convert("RGB").getpixel((0, 0)) == (0, 0, 255)
+
+    # One-shot GIF (no loop metadata) must not become an infinite loop.
+    out_once = io.BytesIO()
+    long_frames[0].save(
+        out_once, "GIF", save_all=True, append_images=long_frames[1:], duration=80
+    )
+    once_gif = fit_gif(out_once.getvalue())
+    with Image.open(io.BytesIO(once_gif)) as gif:
+        assert "loop" not in gif.info
+
+
 def test_animation_ffmpeg_cannot_read_falls_back_to_a_frame(monkeypatch):
     async def unreadable(data, limit):
         raise Unfit("not accepted by QQ")

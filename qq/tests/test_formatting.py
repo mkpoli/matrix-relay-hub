@@ -1,5 +1,7 @@
 from qq_bridge.formatting import (
+    CustomEmoji,
     chunk,
+    extract_custom_emojis,
     extract_face_ids,
     format_reaction_key,
     render_qq_text,
@@ -19,6 +21,19 @@ def test_mention_becomes_pill():
     assert body == "你好 @小明"
     assert "matrix.to/#/@qq_7a3b9c1d5e2f4a6b8c0d1e3f5a7b9c2d:example.org" in html
     assert "@小明" in html
+
+
+def test_bot_mention_is_left_out():
+    mentions = [
+        {"member_openid": "B0T", "username": "Glyph Atlas Matrix", "is_you": True},
+        {"member_openid": "OTHER", "username": "Helper", "bot": True},
+        {"member_openid": "M1", "username": "小明"},
+    ]
+    body, html = render_qq_text("<@B0T> 是 <@OTHER>，<@M1>", mentions, "example.org")
+    assert body == "是 ，@小明"
+    assert "Glyph Atlas" not in html and "Helper" not in html
+    assert render_qq_text("<@B0T>", mentions, "example.org") == ("", "")
+    assert render_qq_text("看这个 <@B0T>\n\n下一段", mentions, "example.org")[0] == "看这个 \n\n下一段"
 
 
 def test_mention_all():
@@ -52,6 +67,20 @@ def test_strip_reply_fallback():
 def test_strip_reply_fallback_leaves_quotes_in_text():
     body = ">not a fallback\nstill here"
     assert strip_reply_fallback(body) == body
+
+
+def test_a_message_that_is_a_quote_is_kept():
+    body = "> 자음\n> \n> ㄱ  1획\n> ㅋ  2획  *ㄱ에 1획을 더한 글자\n\n"
+    assert strip_reply_fallback(body) == body
+
+
+def test_a_crlf_or_indented_reply_fallback_is_dropped():
+    assert strip_reply_fallback("> <@a:b.org> hi\r\n\r\nreply") == "reply"
+    assert strip_reply_fallback(" > <@a:b.org> hi\n\nreply") == "reply"
+
+
+def test_an_emote_reply_fallback_is_dropped():
+    assert strip_reply_fallback("> * <@alice:example.org> waves\n\nhi") == "hi"
 
 
 def test_chunk_keeps_all_text():
@@ -189,7 +218,93 @@ def test_format_reaction_key_handles_emojis_shortcodes_and_mxc():
         )
         == ":blob:"
     )
+    assert (
+        format_reaction_key(
+            "mxc://example.org/abc",
+            content={"com.beeper.reaction.shortcode": ":kusa_lol:"},
+        )
+        == ":kusa_lol:"
+    )
+    assert (
+        format_reaction_key(
+            "mxc://example.org/abc",
+            content={"fi.mau.discord.reaction": {"name": "kusa_lol", "id": "123"}},
+        )
+        == ":kusa_lol:"
+    )
     assert format_reaction_key("x" * 150) == ("x" * 100) + "..."
+
+
+def test_extract_custom_emojis_inline_discord_payload():
+    html_body = (
+        'tte，何時加的→<img data-mx-emoticon '
+        'src="mxc://glyphatlas.org/H4m00AqFfV3mR7dDaaExFXPOxZgmq24Q" '
+        'alt=":fumo_reimu_lying:" title=":fumo_reimu_lying:" height="32"/>'
+    )
+    text, emojis, emoji_only = extract_custom_emojis(html_body)
+    assert text == "tte，何時加的→:fumo_reimu_lying:"
+    assert emojis == [
+        CustomEmoji(
+            mxc="mxc://glyphatlas.org/H4m00AqFfV3mR7dDaaExFXPOxZgmq24Q",
+            shortcode=":fumo_reimu_lying:",
+            animated=False,
+        )
+    ]
+    assert emoji_only is False
+
+
+def test_extract_custom_emojis_emoji_only_and_animated():
+    html_body = (
+        '<img data-mx-emoticon data-mau-animated-emoji '
+        'src="mxc://example.org/a1" alt=":spin:" title=":spin:" height="32"/> '
+        '<img data-mx-emoticon data-mau-animated-emoji '
+        'src="mxc://example.org/a1" alt=":spin:" title=":spin:" height="32"/>'
+    )
+    text, emojis, emoji_only = extract_custom_emojis(html_body)
+    assert text == ":spin: :spin:"
+    assert emojis == [
+        CustomEmoji(mxc="mxc://example.org/a1", shortcode=":spin:", animated=True)
+    ]
+    assert emoji_only is True
+
+
+def test_extract_custom_emojis_ignores_mx_reply_and_author_icon():
+    html_body = (
+        '<mx-reply><blockquote><a href="https://matrix.to/#/!r/$e">In reply to</a> '
+        '<img data-mx-emoticon src="mxc://example.org/quoted" alt=":old:"/>'
+        "</blockquote></mx-reply>"
+        '<p class="discord-embed-author">'
+        '<img data-mx-emoticon height="24" src="mxc://example.org/avatar" title="Author icon" alt="">'
+        "<span>Author</span></p>"
+        'hello <img data-mx-emoticon src="mxc://example.org/new" alt=":wave:"/>'
+    )
+    text, emojis, emoji_only = extract_custom_emojis(html_body)
+    assert emojis == [
+        CustomEmoji(mxc="mxc://example.org/new", shortcode=":wave:", animated=False)
+    ]
+    assert ":old:" not in text
+    assert ":wave:" in text
+    assert emoji_only is False
+
+
+def test_extract_custom_emojis_ignores_only_author_icon():
+    html_body = (
+        '<p class="discord-embed-author">'
+        '<img data-mx-emoticon height="24" src="mxc://example.org/avatar" title="Author icon" alt="">'
+        "<span>Author</span></p>"
+    )
+    assert extract_custom_emojis(html_body) == ("", [], False)
+
+
+def test_extract_custom_emojis_deduplicates_adjacent_alt_and_keeps_links():
+    html_body = (
+        'see <a href="https://example.com/x">link</a> '
+        '<img data-mx-emoticon src="mxc://example.org/f" alt="[变形]"/>[变形]'
+    )
+    text, emojis, emoji_only = extract_custom_emojis(html_body)
+    assert text == "see link (https://example.com/x) [变形]"
+    assert len(emojis) == 1
+    assert emoji_only is False
 
 
 def test_chunk_measures_utf16_code_units():

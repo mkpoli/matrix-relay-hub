@@ -211,6 +211,18 @@ class MatrixClient:
                 return await _read_capped(response, max_bytes)
         raise MatrixError(404, "media not found")
 
+    async def event(self, room_id: str, event_id: str, user_id: str | None = None) -> dict | None:
+        try:
+            return await self.request(
+                "GET",
+                f"/_matrix/client/v3/rooms/{_q(room_id)}/event/{_q(event_id)}",
+                user_id=user_id,
+            )
+        except MatrixError as exc:
+            if exc.status in (403, 404):
+                return None
+            raise
+
     async def member(self, room_id: str, user_id: str) -> dict | None:
         try:
             return await self.request(

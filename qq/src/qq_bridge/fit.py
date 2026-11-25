@@ -16,7 +16,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +33,8 @@ QQ_VIDEO_TYPES = {"video/mp4", "video/quicktime"}
 MAX_PIXELS = 32_000_000
 IMAGE_SIDES = (2560, 2048, 1600, 1280)
 IMAGE_QUALITIES = (88, 80, 70)
+GIF_SIDES = (512, 320)
+MAX_GIF_FRAMES = 300
 
 AUDIO_KBPS = 64
 MIN_VIDEO_KBPS = 120
@@ -232,12 +234,85 @@ async def fit_video(data: bytes, limit: int = TARGET) -> bytes:
     raise Unfit(TOO_LARGE)
 
 
+def fit_gif(data: bytes, limit: int = TARGET) -> bytes:
+    """Re-encode an animated image as an animated GIF under `limit`."""
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if not getattr(image, "is_animated", False):
+                raise Unfit(UNREADABLE)
+            n_frames = int(getattr(image, "n_frames", 1))
+            if n_frames < 2 or n_frames > MAX_GIF_FRAMES:
+                raise Unfit(TOO_LARGE if n_frames > MAX_GIF_FRAMES else UNREADABLE)
+            if image.width * image.height > MAX_PIXELS:
+                raise Unfit(TOO_LARGE)
+            loop = image.info.get("loop")
+            skip_poster = bool(image.info.get("default_image"))
+            raw_frames: list[Image.Image] = []
+            durations: list[int] = []
+            for index, frame in enumerate(ImageSequence.Iterator(image)):
+                if skip_poster and index == 0:
+                    continue
+                rgba = frame.convert("RGBA")
+                # WebP populates frame duration lazily on load(), so read it after convert().
+                # GIF stores frame delay as a 16-bit centisecond integer (max 655,350 ms).
+                duration = frame.info.get("duration") or image.info.get("duration") or 100
+                durations.append(min(655_350, max(20, int(duration))))
+                rgba.thumbnail((GIF_SIDES[0], GIF_SIDES[0]), Image.Resampling.LANCZOS)
+                raw_frames.append(rgba)
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError, ValueError) as exc:
+        log.info("cannot decode animated image: %s", exc)
+        raise Unfit(UNREADABLE) from exc
+    if len(raw_frames) < 2:
+        raise Unfit(UNREADABLE)
+    save_kwargs: dict = {
+        "save_all": True,
+        "duration": durations,
+        "transparency": 255,
+        "disposal": 2,
+        "optimize": False,
+    }
+    if loop is not None:
+        save_kwargs["loop"] = int(loop)
+    try:
+        for side in GIF_SIDES:
+            palette_frames: list[Image.Image] = []
+            for frame in raw_frames:
+                scaled = frame.copy()
+                scaled.thumbnail((side, side), Image.Resampling.LANCZOS)
+                alpha = scaled.getchannel("A")
+                quantized = scaled.convert("RGB").quantize(
+                    colors=255, method=Image.Quantize.MEDIANCUT
+                )
+                quantized.paste(
+                    255, mask=alpha.point(lambda value: 255 if value < 128 else 0)
+                )
+                palette_frames.append(quantized)
+            out = io.BytesIO()
+            palette_frames[0].save(
+                out,
+                "GIF",
+                append_images=palette_frames[1:],
+                **save_kwargs,
+            )
+            if out.tell() <= limit:
+                return out.getvalue()
+    except (OSError, ValueError, OverflowError) as exc:
+        log.info("cannot encode animated GIF: %s", exc)
+        raise Unfit(UNREADABLE) from exc
+    raise Unfit(TOO_LARGE)
+
+
 async def _fit_animation(data: bytes, filename: str, limit: int) -> Prepared:
     try:
         video = await fit_video(data, limit)
         return Prepared(video, _renamed(filename, ".mp4"), QQ_VIDEO)
     except Unfit:
-        # ffmpeg cannot read every animation (animated WebP before 8.0).
+        pass
+    try:
+        # ffmpeg < 8.0 cannot decode animated WebP; convert to GIF to keep animation.
+        gif = await asyncio.to_thread(fit_gif, data, limit)
+        return Prepared(gif, _renamed(filename, ".gif"), QQ_IMAGE)
+    except Unfit:
         log.info("sending the first frame of %s instead", filename)
         image = await asyncio.to_thread(fit_image, data, limit)
         return Prepared(image, _renamed(filename, ".jpg"), QQ_IMAGE)

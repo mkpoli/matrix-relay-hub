@@ -151,10 +151,16 @@ class QQClient:
         group_openid: str,
         file_info: str,
         *,
+        content: str | None = None,
+        reference: str | None = None,
         msg_id: str | None = None,
         msg_seq: int = 1,
     ) -> dict:
         payload: dict = {"msg_type": 7, "media": {"file_info": file_info}}
+        if content:
+            payload["content"] = content
+        if reference:
+            payload["message_reference"] = {"message_id": reference}
         if msg_id:
             payload["msg_id"] = msg_id
             payload["msg_seq"] = msg_seq

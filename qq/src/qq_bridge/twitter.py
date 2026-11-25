@@ -204,6 +204,7 @@ def _video_url(url: Any) -> str | None:
 def _variants(item: dict[str, Any]) -> tuple[tuple[int, bool, str], ...]:
     """The H.264 MP4 variants of a video or GIF: (bitrate, is_h264, url)."""
     variants: list[tuple[int, bool, str]] = []
+    rejected: set[str] = set()
     formats = item.get("formats")
     if isinstance(formats, list):
         for fmt in formats:
@@ -211,6 +212,9 @@ def _variants(item: dict[str, Any]) -> tuple[tuple[int, bool, str], ...]:
                 continue
             codec = str(fmt.get("codec") or "").lower()
             if codec and codec not in ("h264", "avc1"):
+                url = fmt.get("url")
+                if isinstance(url, str):
+                    rejected.add(url)
                 continue
             url = _video_url(fmt.get("url"))
             if url is None:
@@ -222,7 +226,7 @@ def _variants(item: dict[str, Any]) -> tuple[tuple[int, bool, str], ...]:
             variants.append((int(bitrate), h264, url))
     if not variants:
         url = _video_url(item.get("url"))
-        if url:
+        if url and url not in rejected:
             variants.append((0, True, url))
     return tuple(variants)
 
@@ -451,7 +455,12 @@ async def _ranked(
         if size is not None and size <= budget
     ]
     if fitting:
-        return fitting + [url for url in candidates if url not in fitting]
+        measured = {
+            url: size for url, size in zip(candidates, sizes) if size is not None
+        }
+        rest = [url for url in candidates if url not in fitting]
+        rest.sort(key=lambda url: (url not in measured, measured.get(url, 0)))
+        return fitting + rest
     known = sorted(
         (size, url) for url, size in zip(candidates, sizes) if size is not None
     )
@@ -530,8 +539,14 @@ async def download(
         if attachment.kind == "video" and candidates
         else [attachment.url]
     )
+    budget = min(QQ_TARGET, limit)
+    oversized: tuple[bytes, str] | None = None
     for url in urls:
         fetched = await _fetch(session, url, attachment.kind, hosts, prefix, limit)
-        if fetched is not None:
+        if fetched is None:
+            continue
+        if len(fetched[0]) <= budget:
             return fetched
-    return None
+        if oversized is None:
+            oversized = fetched
+    return oversized

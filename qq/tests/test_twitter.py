@@ -301,6 +301,18 @@ def test_the_best_variant_that_fits_qq_is_tried_first(monkeypatch):
     ) == ["https://video.twimg.com/4k.mp4", "https://video.twimg.com/hd.mp4"]
 
 
+def test_the_smallest_remaining_variant_follows_a_fitting_one(monkeypatch):
+    high = "https://video.twimg.com/4k.mp4"
+    mid = "https://video.twimg.com/hd.mp4"
+    low = "https://video.twimg.com/sd.mp4"
+    _sizes(monkeypatch, {high: 40_000_000, mid: 12_000_000, low: 8_000_000})
+    assert asyncio.run(twitter._ranked(object(), (high, mid, low))) == [
+        low,
+        mid,
+        high,
+    ]
+
+
 def test_the_smallest_variant_is_tried_first_when_none_fit(monkeypatch):
     _sizes(
         monkeypatch,
@@ -353,6 +365,69 @@ def test_download_falls_back_to_the_next_variant(monkeypatch):
         twitter.download(object(), twitter.Attachment("video", big, (big, small)))
     )
     assert got == (b"mp4", "video/mp4")
+
+
+def test_download_skips_an_oversized_variant_for_a_fitting_one(monkeypatch):
+    big = "https://video.twimg.com/4k.mp4"
+    small = "https://video.twimg.com/sd.mp4"
+
+    async def ranked(session, candidates, limit=0):
+        return [big, small]
+
+    async def fetch(session, url, kind, hosts, prefix, limit):
+        size = 11 * 1024 * 1024 if url == big else 3
+        return b"x" * size, "video/mp4"
+
+    monkeypatch.setattr("qq_bridge.twitter._ranked", ranked)
+    monkeypatch.setattr("qq_bridge.twitter._fetch", fetch)
+    got = asyncio.run(
+        twitter.download(object(), twitter.Attachment("video", big, (big, small)))
+    )
+    assert got == (b"xxx", "video/mp4")
+
+
+def test_download_keeps_an_oversized_variant_as_the_fallback(monkeypatch):
+    big = "https://video.twimg.com/4k.mp4"
+    other = "https://video.twimg.com/sd.mp4"
+
+    async def ranked(session, candidates, limit=0):
+        return [big, other]
+
+    async def fetch(session, url, kind, hosts, prefix, limit):
+        size = 11 * 1024 * 1024 if url == big else 12 * 1024 * 1024
+        return b"x" * size, "video/mp4"
+
+    monkeypatch.setattr("qq_bridge.twitter._ranked", ranked)
+    monkeypatch.setattr("qq_bridge.twitter._fetch", fetch)
+    got = asyncio.run(
+        twitter.download(object(), twitter.Attachment("video", big, (big, other)))
+    )
+    assert got is not None
+    assert len(got[0]) == 11 * 1024 * 1024
+
+
+def test_a_codec_rejected_url_is_not_readded_as_h264():
+    link = twitter.find("https://x.com/a/status/1")[0]
+    url = "https://video.twimg.com/tweet_video/a.mp4"
+    tweet = {
+        "id": "1",
+        "author": {"screen_name": "a", "name": "a"},
+        "media": {
+            "all": [
+                {
+                    "type": "video",
+                    "url": url,
+                    "thumbnail_url": "https://pbs.twimg.com/thumb/a.jpg",
+                    "formats": [{"url": url, "codec": "av1"}],
+                }
+            ]
+        },
+    }
+    post = twitter.parse(tweet, link)
+    assert post.media[0].variants == ()
+    assert twitter.attachments(post) == [
+        twitter.Attachment("image", "https://pbs.twimg.com/thumb/a.jpg?name=large")
+    ]
 
 
 def test_hevc_av1_vp9_and_playlists_are_skipped_for_a_takeable_mp4():

@@ -123,22 +123,26 @@ def _media_caption(content: dict) -> str:
     filename = str(content.get("filename") or "").strip()
     if not filename:
         return ""
+    plain_body = strip_reply_fallback(str(content.get("body") or "")).strip()
     html_body, custom_emojis, _ = _extract_message_emojis(content)
-    raw_body = (
-        html_body
-        if custom_emojis
-        else strip_reply_fallback(str(content.get("body") or ""))
-    )
-    body = raw_body.strip()
+    if custom_emojis and (
+        not plain_body or any(e.shortcode not in plain_body for e in custom_emojis)
+    ):
+        body = html_body.strip()
+    else:
+        body = plain_body
     if not body or body == filename:
         return ""
     # mautrix-telegram emits `Forwarded message from Name\n\n> ` for captionless forwarded media.
-    lines = [line.rstrip() for line in body.splitlines()]
-    while lines and lines[-1] == ">":
-        lines.pop()
-    while lines and not lines[-1]:
-        lines.pop()
-    return "\n".join(lines).strip()
+    formatted = str(content.get("formatted_body") or "")
+    if body.startswith("Forwarded message from ") or "data-telegram-forward" in formatted:
+        lines = [line.rstrip() for line in body.splitlines()]
+        while lines and lines[-1] == ">":
+            lines.pop()
+        while lines and not lines[-1]:
+            lines.pop()
+        return "\n".join(lines).strip()
+    return body
 
 
 def _transient(exc: QQError) -> bool:
@@ -446,13 +450,38 @@ class Relay:
         if event_id and self.store.superseded(event_id):
             log.debug("ignoring %s, edited or redacted since", event_id)
             return
-        # A long text posts several QQ messages; after a restart only the parts
-        # not yet posted are sent.
+        # A long text or captioned media event posts several QQ messages; after a
+        # restart only the parts not yet posted are sent.
         sent = self.store.sent_count(event_id) if event_id else 0
-        if event_id and (
-            self.store.relayed_qq(event_id)
-            or (sent and msgtype not in ("m.text", "m.emote"))
-        ):
+        if event_id and self.store.relayed_qq(event_id):
+            log.debug("ignoring an event already carried to QQ: %s", event_id)
+            return
+        if event_id and sent and msgtype not in ("m.text", "m.emote"):
+            media_caption = "" if sticker else _media_caption(content)
+            if media_caption:
+                if self.cfg.twitter and twitter.find(media_caption):
+                    media_caption = twitter.rewrite(media_caption)
+                prefix = await self._sender_prefix(room_id, sender)
+                reply_name = await self._reply_target_name(room_id, sender, content)
+                speaker = f"{prefix} → {reply_name}" if reply_name else prefix
+                caption_parts = chunk(f"{speaker}: {media_caption}")
+                if msgtype == "m.audio" or len(caption_parts) > 1:
+                    reference = self._reply_reference(event)
+                    for idx, part in enumerate(caption_parts, start=1):
+                        if idx < sent:
+                            continue
+                        self._put(
+                            {
+                                "kind": "text",
+                                "group": self.cfg.qq.group,
+                                "room": room_id,
+                                "event_id": event_id,
+                                "text": part,
+                                "reference": reference if idx == 1 and msgtype == "m.audio" else None,
+                                "fallback_unquoted": True,
+                            }
+                        )
+                    return
             log.debug("ignoring an event already carried to QQ: %s", event_id)
             return
 
@@ -1114,7 +1143,12 @@ class Relay:
         fallback_text = job.get("fallback_text")
         text_required = bool(job.get("text_required") and fallback_text)
         media_caption = ""
-        if custom_caption is None and not job.get("sticker") and not job.get("custom_emoji"):
+        if (
+            custom_caption is None
+            and not job.get("sticker")
+            and not job.get("custom_emoji")
+            and not job.get("skip_media_caption")
+        ):
             media_caption = _media_caption(job["content"])
             if media_caption and self.cfg.twitter and twitter.find(media_caption):
                 media_caption = twitter.rewrite(media_caption)
@@ -1276,17 +1310,43 @@ class Relay:
                     )
                     if job.get("pending") in self._keep:
                         return
-                    try:
-                        response = await self.qq.send_group_media(
-                            job["group"], file_info, content=None, reference=None
-                        )
-                    except QQError as media_exc:
-                        log.warning(
-                            "cannot send uncaptioned emoji media for %s: %s",
-                            job["event_id"],
-                            media_exc,
-                        )
-                        return
+                    for bare_attempt in range(3):
+                        try:
+                            response = await self.qq.send_group_media(
+                                job["group"], file_info, content=None, reference=None
+                            )
+                            break
+                        except QQError as media_exc:
+                            if media_exc.code == QQ_FORMAT_REFUSED and not job.get("force"):
+                                retry = {
+                                    key: value
+                                    for key, value in job.items()
+                                    if key
+                                    not in (
+                                        "ready",
+                                        "sent",
+                                        "caption",
+                                        "fallback_text",
+                                        "text_required",
+                                    )
+                                }
+                                self._enqueue_media(
+                                    {**retry, "force": True, "skip_media_caption": True}
+                                )
+                                return
+                            if _transient(media_exc) and bare_attempt < 2:
+                                await asyncio.sleep(
+                                    3 * (bare_attempt + 1)
+                                    if media_exc.rate_limited
+                                    else 0.5
+                                )
+                                continue
+                            log.warning(
+                                "cannot send uncaptioned media for %s: %s",
+                                job["event_id"],
+                                media_exc,
+                            )
+                            return
                     break
             assert response is not None
             self._remember_sent(job["group"], job["room"], job["event_id"], response)

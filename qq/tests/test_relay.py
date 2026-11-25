@@ -2871,3 +2871,126 @@ def test_forwarded_image_keeps_quote_when_media_download_fails(tmp_path):
         )
     ]
     store.close()
+
+
+def test_audio_caption_resumes_after_restart_when_caption_send_fails(tmp_path):
+    class FailTextQQ(FakeQQ):
+        async def send_group_text(self, *args, **kwargs):
+            raise QQError(502, "busy", status=502)
+
+    qq1 = FailTextQQ()
+    relay1, store = make_relay(tmp_path, qq1)
+    ev = {
+        "room_id": ROOM,
+        "sender": "@telegram_1:example.org",
+        "type": "m.room.message",
+        "event_id": "$aud-resume",
+        "content": {
+            "msgtype": "m.audio",
+            "url": "mxc://example.org/a",
+            "filename": "voice.ogg",
+            "body": "Forwarded message from Kit Tsang\n\n> voice note",
+            "info": {"mimetype": "audio/ogg"},
+        },
+    }
+    (seq,) = store.accept_transaction("t-aud-resume", [ev])
+    relay1.incoming.put_nowait((seq, ev))
+    asyncio.run(_run_media_loops(relay1, lambda: bool(qq1.media) and not relay1._outstanding))
+    assert len(qq1.media) == 1 and _pending(store)
+
+    qq2 = FakeQQ()
+    relay2 = Relay(relay1.cfg, store, FakeMatrix(), qq2)
+    relay2._labels = dict(relay1._labels)
+    relay2._claim_pending(idle=0)
+    asyncio.run(_run_media_loops(relay2, lambda: not _pending(store)))
+    assert qq2.media == []
+    assert qq2.sent == [
+        ("G", "[T] Alice: Forwarded message from Kit Tsang\n\n> voice note", None)
+    ]
+    store.close()
+
+
+def test_forwarded_caption_with_emoji_preserves_quote_and_literal_gt_caption_kept(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    fwd_body = "Forwarded message from Kit Tsang\n\n> hi :wave:"
+    fwd_ev = {
+        "room_id": ROOM,
+        "sender": "@telegram_1:example.org",
+        "type": "m.room.message",
+        "event_id": "$fwd-emoji",
+        "content": {
+            "msgtype": "m.image",
+            "url": "mxc://example.org/img",
+            "filename": "image.jpg",
+            "body": fwd_body,
+            "format": "org.matrix.custom.html",
+            "formatted_body": (
+                "Forwarded message from <strong>Kit Tsang</strong><br>"
+                '<blockquote data-telegram-forward>hi '
+                '<img data-mx-emoticon src="mxc://example.org/w" alt=":wave:"/></blockquote>'
+            ),
+            "info": {"mimetype": "image/jpeg"},
+        },
+    }
+    gt_ev = {
+        "room_id": ROOM,
+        "sender": "@discord_1:example.org",
+        "type": "m.room.message",
+        "event_id": "$gt-cap",
+        "content": {
+            "msgtype": "m.image",
+            "url": "mxc://example.org/img2",
+            "filename": "pic.png",
+            "body": ">",
+            "info": {"mimetype": "image/png"},
+        },
+    }
+    seqs = store.accept_transaction("t-quote-gt", [fwd_ev, gt_ev])
+    relay.incoming.put_nowait((seqs[0], fwd_ev))
+    relay.incoming.put_nowait((seqs[1], gt_ev))
+    asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
+    assert qq.media_contents == [f"[T] Alice: {fwd_body}", "[D] Alice: >"]
+    store.close()
+
+
+def test_captioned_media_fallback_retries_transient_bare_media_send(tmp_path):
+    class FlakySplitQQ(FakeQQ):
+        def __init__(self):
+            super().__init__()
+            self.bare_attempts = 0
+
+        async def send_group_media(
+            self, group, file_info, *, content=None, reference=None, msg_id=None, msg_seq=1
+        ):
+            if content is not None:
+                raise QQError(304003, "caption refused", status=400)
+            self.bare_attempts += 1
+            if self.bare_attempts == 1:
+                raise QQError(502, "busy", status=502)
+            return await super().send_group_media(
+                group, file_info, content=content, reference=reference, msg_id=msg_id, msg_seq=msg_seq
+            )
+
+    qq = FlakySplitQQ()
+    relay, store = make_relay(tmp_path, qq)
+    ev = {
+        "room_id": ROOM,
+        "sender": "@telegram_1:example.org",
+        "type": "m.room.message",
+        "event_id": "$split-retry",
+        "content": {
+            "msgtype": "m.image",
+            "url": "mxc://example.org/img",
+            "filename": "image.jpg",
+            "body": "Forwarded message from Kit Tsang\n\n> 這是產出來的字",
+            "info": {"mimetype": "image/jpeg"},
+        },
+    }
+    (seq,) = store.accept_transaction("t-split-retry", [ev])
+    relay.incoming.put_nowait((seq, ev))
+    asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
+    assert qq.sent == [("G", "[T] Alice: Forwarded message from Kit Tsang\n\n> 這是產出來的字", None)]
+    assert qq.media == [("G", "FILEINFO")]
+    assert qq.bare_attempts == 2
+    store.close()

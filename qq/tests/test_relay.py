@@ -2527,9 +2527,9 @@ def test_multiple_custom_emojis_are_deduped_and_capped(tmp_path):
     seq = store.accept_transaction("t-many", [ev])[0]
     relay.incoming.put_nowait((seq, ev))
     asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
+    assert qq.sent == [("G", "[D] Alice: hi :e1::e1::e2::e3::e4::e5::e6:", None)]
     assert len(qq.media) == 4
-    assert qq.media_contents[0] == "[D] Alice: hi :e1::e1::e2::e3::e4::e5::e6:"
-    assert qq.media_contents[1:] == ["[D] Alice:", "[D] Alice:", "[D] Alice:"]
+    assert qq.media_contents == ["[D] Alice:", "[D] Alice:", "[D] Alice:", "[D] Alice:"]
     store.close()
 
 
@@ -2993,4 +2993,144 @@ def test_captioned_media_fallback_retries_transient_bare_media_send(tmp_path):
     assert qq.sent == [("G", "[T] Alice: Forwarded message from Kit Tsang\n\n> 這是產出來的字", None)]
     assert qq.media == [("G", "FILEINFO")]
     assert qq.bare_attempts == 2
+    store.close()
+
+
+def test_superseded_emoji_does_not_deadlock_image_prepare_lane(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    first = text_event(
+        body="old",
+        sender="@discord_1:example.org",
+        format="org.matrix.custom.html",
+        formatted_body='old <img data-mx-emoticon src="mxc://example.org/e1" alt=":e1:"/>',
+    ) | {"event_id": "$e1"}
+    second = text_event(
+        body="next",
+        sender="@discord_1:example.org",
+        format="org.matrix.custom.html",
+        formatted_body='next <img data-mx-emoticon src="mxc://example.org/e2" alt=":e2:"/>',
+    ) | {"event_id": "$e2"}
+
+    async def go():
+        seq1, seq2 = store.accept_transaction("t-deadlock", [first, second])
+        relay._current = seq1
+        relay._outstanding[seq1] = 0
+        await relay.handle_matrix_event(first)
+        relay._current = seq2
+        relay._outstanding[seq2] = 0
+        await relay.handle_matrix_event(second)
+        relay._current = None
+        # Supersede $e1 after its media job is already queued in the prepare lane.
+        store.supersede("$e1", "edited")
+        tasks = [
+            asyncio.create_task(relay._send_loop()),
+            asyncio.create_task(relay._prepare_loop(relay._images)),
+        ]
+        for _ in range(400):
+            await asyncio.sleep(0.005)
+            if not _pending(store):
+                break
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(go())
+    assert not _pending(store)
+    assert qq.media_contents == ["[D] Alice: next :e2:"]
+    store.close()
+
+
+def test_redaction_during_emoji_prepare_drops_before_sending(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    ev = text_event(
+        body="secret",
+        sender="@discord_1:example.org",
+        format="org.matrix.custom.html",
+        formatted_body='secret <img data-mx-emoticon src="mxc://example.org/e1" alt=":e1:"/>',
+    ) | {"event_id": "$e-red"}
+
+    async def slow_download(url, max_bytes=None):
+        store.supersede("$e-red", "redacted")
+        return b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+    relay.matrix.download = slow_download
+    seq = store.accept_transaction("t-red", [ev])[0]
+    relay.incoming.put_nowait((seq, ev))
+    asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
+    assert qq.media == [] and qq.sent == []
+    store.close()
+
+
+def test_reaction_waits_for_slow_deferred_inline_emoji_target(tmp_path, monkeypatch):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    monkeypatch.setattr("qq_bridge.relay.MEDIA_WAIT", 0.01)
+
+    async def slow_download(url, max_bytes=None):
+        await asyncio.sleep(0.05)
+        return b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+    relay.matrix.download = slow_download
+    msg = text_event(
+        body="hi",
+        sender="@discord_1:example.org",
+        format="org.matrix.custom.html",
+        formatted_body='hi <img data-mx-emoticon src="mxc://example.org/e1" alt=":e1:"/>',
+    ) | {"event_id": "$slow"}
+    react = reaction_event(target="$slow", key="👍", event_id="$r-slow")
+    seq1, seq2 = store.accept_transaction("t-slow", [msg, react])
+    relay.incoming.put_nowait((seq1, msg))
+    relay.incoming.put_nowait((seq2, react))
+    asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
+    assert qq.media_contents == ["[D] Alice: hi :e1:"]
+    assert qq.sent == [("G", "[M] Alice reacted with 👍", "QM")]
+    store.close()
+
+
+def test_reaction_does_not_send_orphan_bare_image_when_text_fallback_fails(tmp_path):
+    class RejectBothQQ(FakeQQ):
+        async def send_group_media(self, group, file_info, *, content=None, reference=None, **kwargs):
+            if content is not None:
+                raise QQError(40034001, "caption refused", status=400)
+            return await super().send_group_media(group, file_info, content=content, reference=reference, **kwargs)
+
+        async def send_group_text(self, group, content, *, reference=None, **kwargs):
+            raise QQError(400, "reference refused", status=400)
+
+    qq = RejectBothQQ()
+    relay, store = make_relay(tmp_path, qq)
+    store.add_message("Q9", "G", ROOM, "$orig", "REF9", "matrix")
+    ev = reaction_event(
+        target="$orig",
+        key="mxc://example.org/kusa",
+        sender="@discord_1:example.org",
+        **{"com.beeper.reaction.shortcode": ":kusa:"},
+    )
+    seq = store.accept_transaction("t-orphan", [ev])[0]
+    relay.incoming.put_nowait((seq, ev))
+    asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
+    assert qq.media == [] and qq.sent == []
+    store.close()
+
+
+def test_emoji_only_permanent_upload_failure_falls_back_to_shortcode_text(tmp_path):
+    class RejectUploadQQ(FakeQQ):
+        async def upload_group_media(self, group, data, filename, file_type):
+            raise QQError(400, "bad image", status=400)
+
+    qq = RejectUploadQQ()
+    relay, store = make_relay(tmp_path, qq)
+    ev = text_event(
+        body="",
+        sender="@discord_1:example.org",
+        format="org.matrix.custom.html",
+        formatted_body='<img data-mx-emoticon src="mxc://example.org/x" alt=":fumo:"/>',
+    )
+    seq = store.accept_transaction("t-emoji-fail", [ev])[0]
+    relay.incoming.put_nowait((seq, ev))
+    asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
+    assert qq.media == []
+    assert qq.sent == [("G", "[D] Alice: :fumo:", None)]
     store.close()

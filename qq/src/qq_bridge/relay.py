@@ -16,7 +16,9 @@ from . import twitter
 from .config import Config
 from .fit import QQ_AUDIO, QQ_FILE_TYPES, TOO_LARGE, UNREADABLE, Prepared, Unfit, prepare, sweep_temp
 from .formatting import (
+    CustomEmoji,
     chunk,
+    extract_custom_emojis,
     extract_face_ids,
     format_reaction_key,
     render_qq_text,
@@ -64,6 +66,56 @@ FACE_SOURCE = "apng"
 # An edit of a text that never reached QQ (its send is still being retried) is relayed when the
 # original is at most this old; an older one predates the bridge or was never meant for QQ.
 EDIT_WINDOW_MS = 86_400_000
+# Cap distinct inline custom emojis relayed as media per message to stay within QQ rate limits.
+MAX_CUSTOM_EMOJIS = 4
+
+
+def _emoji_media_content(
+    emoji: CustomEmoji,
+    *,
+    reply_to: str | None = None,
+    mentions: dict | None = None,
+) -> dict:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", emoji.shortcode.strip(":")).strip("_") or "emoji"
+    ext = ".gif" if emoji.animated else ".png"
+    mimetype = "image/gif" if emoji.animated else "image/png"
+    media_content: dict = {
+        "msgtype": "m.image",
+        "url": emoji.mxc,
+        "body": emoji.shortcode,
+        "filename": f"{slug}{ext}",
+        "info": {"mimetype": mimetype},
+    }
+    if reply_to:
+        media_content["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_to}}
+    if mentions:
+        media_content["m.mentions"] = mentions
+    return media_content
+
+
+def _sniff_image_format(data: bytes, mimetype: str, filename: str) -> tuple[str, str]:
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        detected_mime, ext = "image/gif", ".gif"
+    elif data.startswith(b"\x89PNG\r\n\x1a\n"):
+        detected_mime, ext = "image/png", ".png"
+    elif data.startswith(b"\xff\xd8\xff"):
+        detected_mime, ext = "image/jpeg", ".jpg"
+    elif len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        detected_mime, ext = "image/webp", ".webp"
+    else:
+        return mimetype, filename
+    stem = Path(filename).stem or "emoji"
+    return detected_mime, f"{stem}{ext}"
+
+
+def _extract_message_emojis(content: dict) -> tuple[str, list[CustomEmoji], bool]:
+    if content.get("format") != "org.matrix.custom.html":
+        return "", [], False
+    formatted = content.get("formatted_body")
+    if not isinstance(formatted, str) or not formatted:
+        return "", [], False
+    html_body, emojis, emoji_only = extract_custom_emojis(formatted)
+    return html_body, emojis[:MAX_CUSTOM_EMOJIS], emoji_only
 
 
 def _transient(exc: QQError) -> bool:
@@ -382,7 +434,41 @@ class Relay:
             return
 
         if msgtype in ("m.text", "m.emote"):
-            body = strip_reply_fallback(str(content.get("body", "")))
+            html_body, custom_emojis, emoji_only = _extract_message_emojis(content)
+            if emoji_only:
+                reply_to = self._reply_event_id(content)
+                mentions = (
+                    content.get("m.mentions")
+                    if isinstance(content.get("m.mentions"), dict)
+                    else None
+                )
+                for index, emoji in enumerate(custom_emojis):
+                    if index < sent:
+                        continue
+                    self._enqueue_media(
+                        {
+                            "kind": "media",
+                            "group": self.cfg.qq.group,
+                            "room": room_id,
+                            "event_id": event_id,
+                            "sender": sender,
+                            "content": _emoji_media_content(
+                                emoji,
+                                reply_to=reply_to if index == 0 else None,
+                                mentions=mentions if index == 0 else None,
+                            ),
+                            "sticker": True,
+                            "custom_emoji": True,
+                            "sniff_image": True,
+                            "reply_to": reply_to if index == 0 else None,
+                        }
+                    )
+                return
+            body = (
+                html_body
+                if custom_emojis
+                else strip_reply_fallback(str(content.get("body", "")))
+            )
             if not body.strip():
                 return
             links = twitter.find(body) if self.cfg.twitter else []
@@ -403,20 +489,77 @@ class Relay:
                 else f"{source}{tag}{name}: {body}"
             )
             reference = self._reply_reference(event)
-            for index, part in enumerate(chunk(text)):
-                if index < sent:
-                    continue
-                self._put(
-                    {
-                        "kind": "text",
-                        "group": self.cfg.qq.group,
-                        "room": room_id,
-                        "event_id": event_id,
-                        "text": part,
-                        "reference": reference if index == 0 else None,
-                        "fallback_unquoted": sticker,
-                    }
-                )
+            parts = chunk(text)
+            if custom_emojis and len(parts) == 1:
+                reply_to = self._reply_event_id(content)
+                if sent == 0:
+                    self._enqueue_media(
+                        {
+                            "kind": "media",
+                            "group": self.cfg.qq.group,
+                            "room": room_id,
+                            "event_id": event_id,
+                            "sender": sender,
+                            "content": _emoji_media_content(
+                                custom_emojis[0], reply_to=reply_to
+                            ),
+                            "custom_emoji": True,
+                            "sniff_image": True,
+                            "caption": parts[0],
+                            "fallback_text": parts[0],
+                            "text_required": True,
+                            "reply_to": reply_to,
+                        }
+                    )
+                for index, emoji in enumerate(custom_emojis[1:], start=1):
+                    if index < sent:
+                        continue
+                    self._enqueue_media(
+                        {
+                            "kind": "media",
+                            "group": self.cfg.qq.group,
+                            "room": room_id,
+                            "event_id": event_id,
+                            "sender": sender,
+                            "content": _emoji_media_content(emoji),
+                            "sticker": True,
+                            "custom_emoji": True,
+                            "sniff_image": True,
+                            "reply_to": None,
+                        }
+                    )
+            else:
+                for index, part in enumerate(parts):
+                    if index < sent:
+                        continue
+                    self._put(
+                        {
+                            "kind": "text",
+                            "group": self.cfg.qq.group,
+                            "room": room_id,
+                            "event_id": event_id,
+                            "text": part,
+                            "reference": reference if index == 0 else None,
+                            "fallback_unquoted": sticker,
+                        }
+                    )
+                for index, emoji in enumerate(custom_emojis, start=len(parts)):
+                    if index < sent:
+                        continue
+                    self._enqueue_media(
+                        {
+                            "kind": "media",
+                            "group": self.cfg.qq.group,
+                            "room": room_id,
+                            "event_id": event_id,
+                            "sender": sender,
+                            "content": _emoji_media_content(emoji),
+                            "sticker": True,
+                            "custom_emoji": True,
+                            "sniff_image": True,
+                            "reply_to": None,
+                        }
+                    )
             if links:
                 self._queue_twitter(
                     {
@@ -457,7 +600,8 @@ class Relay:
         target = relates.get("event_id")
         if not isinstance(target, str) or not target:
             return
-        emoji = format_reaction_key(relates.get("key"), content=content, relates=relates)
+        raw_key = relates.get("key")
+        emoji = format_reaction_key(raw_key, content=content, relates=relates)
         if not emoji:
             return
         reference = None if self.store.superseded(target) else self._reference_for_event(target)
@@ -471,6 +615,34 @@ class Relay:
         source = f"[{source_tag(sender)}] "
         tag = f"[{label}] " if self._tagged else ""
         text = chunk(f"{source}{tag}{name} reacted with {emoji}")[0]
+        mxc = raw_key.strip() if isinstance(raw_key, str) else ""
+        if mxc.startswith("mxc://"):
+            discord_meta = content.get("fi.mau.discord.reaction")
+            animated = bool(
+                isinstance(discord_meta, dict) and discord_meta.get("animated")
+            )
+            self._enqueue_media(
+                {
+                    "kind": "media",
+                    "group": self.cfg.qq.group,
+                    "room": room_id,
+                    "event_id": event_id,
+                    "sender": sender,
+                    "content": _emoji_media_content(
+                        CustomEmoji(mxc=mxc, shortcode=emoji, animated=animated)
+                    ),
+                    "custom_emoji": True,
+                    "sniff_image": True,
+                    "reaction": True,
+                    "caption": text,
+                    "fallback_text": text,
+                    "text_required": True,
+                    "reference": reference,
+                    "reference_event": reference_event,
+                    "reply_to": None,
+                }
+            )
+            return
         self._put(
             {
                 "kind": "text",
@@ -653,7 +825,8 @@ class Relay:
         if not known:
             log.debug("ignoring an edit of %s, which is not on QQ", target)
             return
-        body = str(new.get("body") or "")
+        html_body, custom_emojis, _ = _extract_message_emojis(new)
+        body = html_body if custom_emojis else str(new.get("body") or "")
         if not body.strip():
             return
         if self.cfg.twitter and twitter.find(body):
@@ -827,11 +1000,15 @@ class Relay:
         except MediaTooLarge as exc:
             raise Unfit(TOO_LARGE) from exc
         info = content.get("info") or {}
+        mimetype = str(info.get("mimetype") or "")
+        filename = str(content.get("filename") or content.get("body") or "file")
+        if job.get("sniff_image"):
+            mimetype, filename = _sniff_image_format(data, mimetype, filename)
         prepared = await prepare(
             data,
             str(content.get("msgtype")),
-            str(info.get("mimetype") or ""),
-            str(content.get("filename") or content.get("body") or "file"),
+            mimetype,
+            filename,
             force=bool(job.get("force")),
         )
         if len(prepared.data) != len(data):
@@ -843,9 +1020,12 @@ class Relay:
     async def _send_media(self, job: dict) -> bool:
         """Send prepared media; True when it was put back to wait for preparation. Media redacted
         while it waited is dropped."""
-        if job.get("event_id") and self.store.superseded(job["event_id"]) == "redacted":
-            log.debug("dropping media %s, redacted since", job["event_id"])
-            return False
+        event_id = job.get("event_id")
+        if event_id:
+            superseded = self.store.superseded(event_id)
+            if superseded == "redacted" or (superseded and job.get("custom_emoji")):
+                log.debug("dropping media %s, %s since", event_id, superseded)
+                return False
         ready: asyncio.Future = job["ready"]
         if not ready.done():
             await asyncio.wait({ready}, timeout=MEDIA_WAIT)
@@ -866,7 +1046,8 @@ class Relay:
         tag = f"[{label}] " if self._tagged and label else ""
         return f"{source}{tag}{name}"
 
-    def _handle_media_error(self, job: dict, exc: QQError, action: str) -> None:
+    def _handle_media_error(self, job: dict, exc: QQError, action: str) -> bool:
+        """Return True when the failure triggered a re-encode or retry, False if permanent."""
         if exc.code == QQ_FORMAT_REFUSED and not job.get("force"):
             log.info("QQ refused the format of %s; re-encoding", job["event_id"])
             retry = {
@@ -875,7 +1056,7 @@ class Relay:
                 if key not in ("ready", "sent")
             }
             self._enqueue_media({**retry, "force": True})
-            return
+            return True
         log.warning(
             "cannot %s media to %s: %s (trace %s)",
             action,
@@ -885,41 +1066,64 @@ class Relay:
         )
         if _transient(exc):
             self._retry_later(job)
+            return True
+        return False
 
     async def _deliver_media(self, job: dict, result: Prepared | str) -> None:
-        prefix = await self._sender_prefix(job["room"], job["sender"])
-        reply_to = job.get("reply_to") or self._reply_event_id(job["content"])
-        reference = (
-            self._reference_for_event(reply_to)
-            if reply_to and self.store.superseded(reply_to) != "redacted"
-            else None
-        )
-        needs_caption = isinstance(result, str) or result.file_type != QQ_AUDIO
-        reply_name = (
-            await self._reply_target_name(
-                job["room"],
-                job["sender"],
-                job["content"],
-                sticker=bool(job.get("sticker")),
+        reference = job.get("reference")
+        if reference is None and job.get("reference_event"):
+            reference = self._reference_for_event(job["reference_event"])
+            if reference is None:
+                log.debug(
+                    "skipping reaction; target %s was not delivered to QQ",
+                    job["reference_event"],
+                )
+                return
+        elif reference is None and not job.get("reaction"):
+            reply_to = job.get("reply_to") or self._reply_event_id(job["content"])
+            reference = (
+                self._reference_for_event(reply_to)
+                if reply_to and self.store.superseded(reply_to) != "redacted"
+                else None
             )
-            if needs_caption
-            else None
-        )
-        speaker = f"{prefix} → {reply_name}" if reply_name else prefix
+
+        custom_caption = job.get("caption")
+        fallback_text = job.get("fallback_text")
+        text_required = bool(job.get("text_required") and fallback_text)
+
+        speaker = ""
+        if custom_caption is None:
+            prefix = await self._sender_prefix(job["room"], job["sender"])
+            needs_caption = isinstance(result, str) or result.file_type != QQ_AUDIO
+            reply_name = (
+                await self._reply_target_name(
+                    job["room"],
+                    job["sender"],
+                    job["content"],
+                    sticker=bool(job.get("sticker")),
+                )
+                if needs_caption
+                else None
+            )
+            speaker = f"{prefix} → {reply_name}" if reply_name else prefix
+
         if isinstance(result, str):
-            if job.get("sticker"):
+            if fallback_text:
+                text = fallback_text
+            elif job.get("sticker"):
                 notice = _sticker_label(job["content"].get("body"), reason=result)
+                text = chunk(f"{speaker}: {notice}")[0]
             else:
                 kind = str(job["content"].get("msgtype", "m.file"))[2:]
-                notice = f"[{kind} {result}]"
+                text = chunk(f"{speaker}: [{kind} {result}]")[0]
             await self._send_text(
                 {
                     "group": job["group"],
                     "room": job["room"],
                     "event_id": job["event_id"],
-                    "text": chunk(f"{speaker}: {notice}")[0],
+                    "text": text,
                     "reference": reference,
-                    "fallback_unquoted": True,
+                    "fallback_unquoted": not job.get("reaction"),
                     "pending": job.get("pending"),
                 }
             )
@@ -929,22 +1133,107 @@ class Relay:
             return
         # QQ's official SDK passes `content` alongside `media` for image/video/file
         # (msg_type 7) to embed text and media in one message, and omits it for voice.
-        caption = chunk(f"{speaker}:")[0] if result.file_type != QQ_AUDIO else None
+        if custom_caption is not None:
+            caption: str | None = custom_caption
+        else:
+            caption = chunk(f"{speaker}:")[0] if result.file_type != QQ_AUDIO else None
         try:
             file_info = await self.qq.upload_group_media(
                 job["group"], result.data, result.filename, result.file_type
             )
         except QQError as exc:
-            self._handle_media_error(job, exc, "upload")
+            if not self._handle_media_error(job, exc, "upload") and text_required:
+                await self._send_text(
+                    {
+                        "group": job["group"],
+                        "room": job["room"],
+                        "event_id": job["event_id"],
+                        "text": fallback_text,
+                        "reference": reference,
+                        "fallback_unquoted": not job.get("reaction"),
+                        "pending": job.get("pending"),
+                    }
+                )
             return
-        attempts: list[tuple[str | None, str | None]] = [(caption, reference)]
+
+        if text_required:
+            attempts: list[tuple[str | None, str | None]] = [(caption, reference)]
+            if reference is not None and not job.get("reaction"):
+                attempts.append((caption, None))
+            response: dict | None = None
+            for index, (send_content, send_ref) in enumerate(attempts):
+                try:
+                    response = await self.qq.send_group_media(
+                        job["group"], file_info, content=send_content, reference=send_ref
+                    )
+                    break
+                except QQError as exc:
+                    if _transient(exc) or exc.code == QQ_FORMAT_REFUSED:
+                        if not self._handle_media_error(job, exc, "send"):
+                            await self._send_text(
+                                {
+                                    "group": job["group"],
+                                    "room": job["room"],
+                                    "event_id": job["event_id"],
+                                    "text": fallback_text,
+                                    "reference": reference,
+                                    "fallback_unquoted": not job.get("reaction"),
+                                    "pending": job.get("pending"),
+                                }
+                            )
+                        return
+                    if index < len(attempts) - 1:
+                        log.info(
+                            "QQ refused media send for %s (caption=%s, reference=%s): %s; retrying",
+                            job["event_id"],
+                            bool(send_content),
+                            bool(send_ref),
+                            exc,
+                        )
+                        continue
+                    log.info(
+                        "QQ refused captioned media for %s (%s); sending text and image separately",
+                        job["event_id"],
+                        exc,
+                    )
+                    await self._send_text(
+                        {
+                            "group": job["group"],
+                            "room": job["room"],
+                            "event_id": job["event_id"],
+                            "text": fallback_text,
+                            "reference": reference,
+                            "fallback_unquoted": not job.get("reaction"),
+                            "pending": job.get("pending"),
+                        }
+                    )
+                    if job.get("pending") in self._keep:
+                        return
+                    try:
+                        response = await self.qq.send_group_media(
+                            job["group"], file_info, content=None, reference=None
+                        )
+                    except QQError as media_exc:
+                        log.warning(
+                            "cannot send uncaptioned emoji media for %s: %s",
+                            job["event_id"],
+                            media_exc,
+                        )
+                        return
+                    break
+            assert response is not None
+            self._remember_sent(job["group"], job["room"], job["event_id"], response)
+            log.info("sent media to QQ group %s: %s", job["group"], response.get("id"))
+            return
+
+        attempts = [(caption, reference)]
         if caption is not None and reference is not None:
             attempts.append((caption, None))
             attempts.append((None, reference))
             attempts.append((None, None))
         elif reference is not None or caption is not None:
             attempts.append((None, None))
-        response: dict | None = None
+        response = None
         for index, (send_content, send_ref) in enumerate(attempts):
             try:
                 response = await self.qq.send_group_media(

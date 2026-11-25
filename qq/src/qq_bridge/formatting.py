@@ -6,6 +6,8 @@ import base64
 import html
 import json
 import re
+from dataclasses import dataclass
+from html.parser import HTMLParser
 
 SPACE_RE = re.compile(r"[ \t]*")
 FACE_RE = re.compile(r'<faceType=(\d+),faceId="([^"]*)"?,ext="([^"]*)"\s*/?>')
@@ -253,6 +255,13 @@ def strip_leading_mentions(text: str) -> str:
     return re.sub(r"^(?:\s*(?:<@[^>]+>|@[^\s@]+))+\s*", "", text).strip()
 
 
+def _clean_shortcode(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    code = " ".join(value.split()).strip(":")
+    return f":{code[:64]}:" if code else ""
+
+
 def format_reaction_key(
     key: object,
     *,
@@ -266,14 +275,157 @@ def format_reaction_key(
     if not cleaned:
         return ""
     if cleaned.startswith("mxc://"):
-        for source in (relates, content):
-            if isinstance(source, dict):
-                shortcode = source.get("shortcode")
-                if isinstance(shortcode, str):
-                    code = " ".join(shortcode.split()).strip(":")
-                    if code:
-                        return f":{code[:64]}:"
+        candidates: list[object] = []
+        if isinstance(relates, dict):
+            candidates.append(relates.get("shortcode"))
+        if isinstance(content, dict):
+            candidates.append(content.get("shortcode"))
+            candidates.append(content.get("com.beeper.reaction.shortcode"))
+            discord_reaction = content.get("fi.mau.discord.reaction")
+            if isinstance(discord_reaction, dict):
+                candidates.append(discord_reaction.get("name"))
+        for candidate in candidates:
+            formatted = _clean_shortcode(candidate)
+            if formatted:
+                return formatted
         return "[custom emoji]"
     if len(cleaned) > 100:
         return cleaned[:100] + "..."
     return cleaned
+
+
+@dataclass(frozen=True)
+class CustomEmoji:
+    mxc: str
+    shortcode: str
+    animated: bool = False
+
+
+_BLOCK_TAGS = frozenset(
+    {"p", "div", "blockquote", "pre", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr"}
+)
+
+
+class _EmoticonHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.non_emoji_parts: list[str] = []
+        self.emojis: list[CustomEmoji] = []
+        self._seen_mxc: set[str] = set()
+        self._mx_reply_depth = 0
+        self._link_stack: list[tuple[str, int]] = []
+        self._last_emoji_alt: str | None = None
+
+    def _append_break(self) -> None:
+        if self.parts and not self.parts[-1].endswith("\n"):
+            self.parts.append("\n")
+        if self.non_emoji_parts and not self.non_emoji_parts[-1].endswith("\n"):
+            self.non_emoji_parts.append("\n")
+        self._last_emoji_alt = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag == "mx-reply":
+            self._mx_reply_depth += 1
+            return
+        if self._mx_reply_depth:
+            return
+        attr_map = {k.lower(): v for k, v in attrs}
+        if tag == "br":
+            self.parts.append("\n")
+            self.non_emoji_parts.append("\n")
+            self._last_emoji_alt = None
+            return
+        if tag in _BLOCK_TAGS:
+            self._append_break()
+        if tag == "a":
+            href = (attr_map.get("href") or "").strip()
+            self._link_stack.append((href, len(self.parts)))
+        elif tag == "img":
+            self._handle_img(attr_map)
+
+    def handle_startendtag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        tag = tag.lower()
+        if tag == "mx-reply" or self._mx_reply_depth:
+            return
+        if tag == "br":
+            self.parts.append("\n")
+            self.non_emoji_parts.append("\n")
+            self._last_emoji_alt = None
+            return
+        if tag == "img":
+            self._handle_img({k.lower(): v for k, v in attrs})
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag == "mx-reply":
+            self._mx_reply_depth = max(0, self._mx_reply_depth - 1)
+            return
+        if self._mx_reply_depth:
+            return
+        if tag == "a" and self._link_stack:
+            href, start_index = self._link_stack.pop()
+            if href.startswith(("http://", "https://")) and not href.startswith(
+                "https://matrix.to/#/"
+            ):
+                inner = "".join(self.parts[start_index:]).strip()
+                if inner and href not in inner:
+                    suffix = f" ({href})"
+                    self.parts.append(suffix)
+                    self.non_emoji_parts.append(suffix)
+            self._last_emoji_alt = None
+        elif tag in _BLOCK_TAGS:
+            self._append_break()
+
+    def handle_data(self, data: str) -> None:
+        if self._mx_reply_depth or not data:
+            return
+        text = data
+        if self._last_emoji_alt and text.startswith(self._last_emoji_alt):
+            # Avoid duplicating the shortcode when HTML already repeats it right after <img>.
+            text = text[len(self._last_emoji_alt) :]
+        self._last_emoji_alt = None
+        if text:
+            self.parts.append(text)
+            self.non_emoji_parts.append(text)
+
+    def _handle_img(self, attrs: dict[str, str | None]) -> None:
+        src = (attrs.get("src") or "").strip()
+        alt = (attrs.get("alt") or "").strip()
+        is_emoticon = "data-mx-emoticon" in attrs
+        if is_emoticon and src.startswith("mxc://") and alt:
+            animated = "data-mau-animated-emoji" in attrs
+            if src not in self._seen_mxc:
+                self._seen_mxc.add(src)
+                self.emojis.append(
+                    CustomEmoji(mxc=src, shortcode=alt, animated=animated)
+                )
+            self.parts.append(alt)
+            self._last_emoji_alt = alt
+            return
+        if alt:
+            self.parts.append(alt)
+            self.non_emoji_parts.append(alt)
+            self._last_emoji_alt = None
+
+
+def extract_custom_emojis(formatted_body: str) -> tuple[str, list[CustomEmoji], bool]:
+    """Extract Matrix custom emoticons (`<img data-mx-emoticon>`) from HTML.
+
+    Returns `(plain_text, unique_emojis, emoji_only)` while ignoring `<mx-reply>`
+    fallback blocks and empty-alt decorative icons such as Discord embed author
+    avatars.
+    """
+    if not formatted_body or "data-mx-emoticon" not in formatted_body.lower():
+        return "", [], False
+    parser = _EmoticonHTMLParser()
+    parser.feed(formatted_body)
+    parser.close()
+    if not parser.emojis:
+        return "", [], False
+    text = re.sub(r"\n{3,}", "\n\n", "".join(parser.parts)).strip()
+    non_emoji = "".join(parser.non_emoji_parts).strip()
+    return text, parser.emojis, not non_emoji

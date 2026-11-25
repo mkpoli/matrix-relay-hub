@@ -159,6 +159,7 @@ class Relay:
         self._current: int | None = None
         self._outstanding: dict[int, int] = {}
         self._inflight_events: dict[str, int] = {}
+        self._inflight_waiters: dict[str, list[dict]] = {}
         self._keep: set[int] = set()
         self._claimed: set[int] = set()
         self._rooms: dict[str, str] = {}
@@ -344,6 +345,8 @@ class Relay:
                 self._inflight_events[event_id] = left_event
             else:
                 self._inflight_events.pop(event_id, None)
+                for waiter in self._inflight_waiters.pop(event_id, ()):
+                    self._queue.put_nowait(waiter)
         seq = job.get("pending")
         if seq is None:
             return
@@ -459,6 +462,7 @@ class Relay:
                             ),
                             "sticker": True,
                             "custom_emoji": True,
+                            "emoji_only": True,
                             "sniff_image": True,
                             "reply_to": reply_to if index == 0 else None,
                         }
@@ -490,7 +494,7 @@ class Relay:
             )
             reference = self._reply_reference(event)
             parts = chunk(text)
-            if custom_emojis and len(parts) == 1:
+            if len(custom_emojis) == 1 and len(parts) == 1:
                 reply_to = self._reply_event_id(content)
                 if sent == 0:
                     self._enqueue_media(
@@ -509,23 +513,6 @@ class Relay:
                             "fallback_text": parts[0],
                             "text_required": True,
                             "reply_to": reply_to,
-                        }
-                    )
-                for index, emoji in enumerate(custom_emojis[1:], start=1):
-                    if index < sent:
-                        continue
-                    self._enqueue_media(
-                        {
-                            "kind": "media",
-                            "group": self.cfg.qq.group,
-                            "room": room_id,
-                            "event_id": event_id,
-                            "sender": sender,
-                            "content": _emoji_media_content(emoji),
-                            "sticker": True,
-                            "custom_emoji": True,
-                            "sniff_image": True,
-                            "reply_to": None,
                         }
                     )
             else:
@@ -892,13 +879,34 @@ class Relay:
 
     # -- outbound queue ---------------------------------------------------
 
+    def _defer_for_target(self, job: dict) -> bool:
+        """Hold a reaction until an in-flight target message finishes delivering."""
+        ref_event = job.get("reference_event")
+        if (
+            not ref_event
+            or job.get("reference") is not None
+            or self._reference_for_event(ref_event) is not None
+            or not self._inflight_events.get(ref_event)
+        ):
+            return False
+        if "sent" in job:
+            # Release the prepare worker so a target's forced re-encode behind this
+            # reaction can run without deadlocking the lane.
+            job["sent"].set()
+        self._inflight_waiters.setdefault(ref_event, []).append(job)
+        return True
+
     async def _send_loop(self) -> None:
         while True:
             job = await self._queue.get()
             if job.get("pending") in self._keep:
                 # An earlier part of this event failed; parts must reach QQ in
                 # order, so the rest waits for the event's retry.
+                if "sent" in job:
+                    job["sent"].set()
                 self._finish(job)
+                continue
+            if self._defer_for_target(job):
                 continue
             deferred = False
             try:
@@ -924,11 +932,11 @@ class Relay:
             return False
         return True
 
-    async def _send_text(self, job: dict) -> None:
+    async def _send_text(self, job: dict) -> bool:
         event_id = job.get("event_id")
         if event_id and not job.get("edit") and self.store.superseded(event_id):
             log.debug("dropping a queued part of %s, edited or redacted since", event_id)
-            return
+            return False
         reference = job.get("reference")
         if reference is None and job.get("reference_event"):
             reference = self._reference_for_event(job["reference_event"])
@@ -937,10 +945,10 @@ class Relay:
                     "skipping reaction; target %s was not delivered to QQ",
                     job["reference_event"],
                 )
-                return
+                return False
         if not await self._wait_limits(job["group"]):
             self._retry_later(job)
-            return
+            return False
         while True:
             for attempt in range(3):
                 try:
@@ -969,10 +977,10 @@ class Relay:
                     log.warning("cannot send to %s: %s", job["group"], exc)
                     if _transient(exc):
                         self._retry_later(job)
-                    return
+                    return False
                 self._remember_sent(job["group"], job["room"], job["event_id"], response)
                 log.info("sent to QQ group %s: %s", job["group"], response.get("id"))
-                return
+                return True
 
     async def _prepare_loop(self, lane: asyncio.Queue[dict]) -> None:
         while True:
@@ -1017,15 +1025,22 @@ class Relay:
             )
         return prepared
 
+    def _superseded_media(self, job: dict) -> str | None:
+        event_id = job.get("event_id")
+        if not event_id:
+            return None
+        superseded = self.store.superseded(event_id)
+        if superseded == "redacted" or (superseded and job.get("custom_emoji")):
+            return superseded
+        return None
+
     async def _send_media(self, job: dict) -> bool:
         """Send prepared media; True when it was put back to wait for preparation. Media redacted
         while it waited is dropped."""
-        event_id = job.get("event_id")
-        if event_id:
-            superseded = self.store.superseded(event_id)
-            if superseded == "redacted" or (superseded and job.get("custom_emoji")):
-                log.debug("dropping media %s, %s since", event_id, superseded)
-                return False
+        if reason := self._superseded_media(job):
+            log.debug("dropping media %s, %s since", job.get("event_id"), reason)
+            job["sent"].set()
+            return False
         ready: asyncio.Future = job["ready"]
         if not ready.done():
             await asyncio.wait({ready}, timeout=MEDIA_WAIT)
@@ -1034,6 +1049,9 @@ class Relay:
             ready.add_done_callback(lambda _: self._queue.put_nowait(job))
             return True
         try:
+            if reason := self._superseded_media(job):
+                log.debug("dropping media %s, %s while preparing", job.get("event_id"), reason)
+                return False
             await self._deliver_media(job, ready.result())
         finally:
             job["sent"].set()
@@ -1131,6 +1149,11 @@ class Relay:
         if not await self._wait_limits(job["group"]):
             self._retry_later(job)
             return
+        emoji_only_fallback = (
+            chunk(f"{speaker}: {job['content'].get('body') or '[custom emoji]'}")[0]
+            if job.get("emoji_only") and speaker
+            else None
+        )
         # QQ's official SDK passes `content` alongside `media` for image/video/file
         # (msg_type 7) to embed text and media in one message, and omits it for voice.
         if custom_caption is not None:
@@ -1142,18 +1165,20 @@ class Relay:
                 job["group"], result.data, result.filename, result.file_type
             )
         except QQError as exc:
-            if not self._handle_media_error(job, exc, "upload") and text_required:
-                await self._send_text(
-                    {
-                        "group": job["group"],
-                        "room": job["room"],
-                        "event_id": job["event_id"],
-                        "text": fallback_text,
-                        "reference": reference,
-                        "fallback_unquoted": not job.get("reaction"),
-                        "pending": job.get("pending"),
-                    }
-                )
+            if not self._handle_media_error(job, exc, "upload"):
+                permanent_fallback = fallback_text if text_required else emoji_only_fallback
+                if permanent_fallback:
+                    await self._send_text(
+                        {
+                            "group": job["group"],
+                            "room": job["room"],
+                            "event_id": job["event_id"],
+                            "text": permanent_fallback,
+                            "reference": reference,
+                            "fallback_unquoted": not job.get("reaction"),
+                            "pending": job.get("pending"),
+                        }
+                    )
             return
 
         if text_required:
@@ -1196,7 +1221,7 @@ class Relay:
                         job["event_id"],
                         exc,
                     )
-                    await self._send_text(
+                    sent_ok = await self._send_text(
                         {
                             "group": job["group"],
                             "room": job["room"],
@@ -1207,19 +1232,28 @@ class Relay:
                             "pending": job.get("pending"),
                         }
                     )
-                    if job.get("pending") in self._keep:
+                    if not sent_ok or job.get("pending") in self._keep:
                         return
-                    try:
-                        response = await self.qq.send_group_media(
-                            job["group"], file_info, content=None, reference=None
-                        )
-                    except QQError as media_exc:
-                        log.warning(
-                            "cannot send uncaptioned emoji media for %s: %s",
-                            job["event_id"],
-                            media_exc,
-                        )
-                        return
+                    for bare_attempt in range(3):
+                        try:
+                            response = await self.qq.send_group_media(
+                                job["group"], file_info, content=None, reference=None
+                            )
+                            break
+                        except QQError as media_exc:
+                            if _transient(media_exc) and bare_attempt < 2:
+                                await asyncio.sleep(
+                                    3 * (bare_attempt + 1)
+                                    if media_exc.rate_limited
+                                    else 0.5
+                                )
+                                continue
+                            log.warning(
+                                "cannot send uncaptioned emoji media for %s: %s",
+                                job["event_id"],
+                                media_exc,
+                            )
+                            return
                     break
             assert response is not None
             self._remember_sent(job["group"], job["room"], job["event_id"], response)
@@ -1246,7 +1280,18 @@ class Relay:
                     or _transient(exc)
                     or exc.code == QQ_FORMAT_REFUSED
                 ):
-                    self._handle_media_error(job, exc, "send")
+                    if not self._handle_media_error(job, exc, "send") and emoji_only_fallback:
+                        await self._send_text(
+                            {
+                                "group": job["group"],
+                                "room": job["room"],
+                                "event_id": job["event_id"],
+                                "text": emoji_only_fallback,
+                                "reference": reference,
+                                "fallback_unquoted": True,
+                                "pending": job.get("pending"),
+                            }
+                        )
                     return
                 log.info(
                     "QQ refused media send for %s (caption=%s, reference=%s): %s; retrying",

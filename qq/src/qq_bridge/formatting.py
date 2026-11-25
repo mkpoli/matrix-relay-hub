@@ -8,6 +8,7 @@ import json
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
+from urllib.parse import unquote
 
 SPACE_RE = re.compile(r"[ \t]*")
 FACE_RE = re.compile(r'<faceType=(\d+),faceId="([^"]*)"?,ext="([^"]*)"\s*/?>')
@@ -368,14 +369,16 @@ class _EmoticonHTMLParser(HTMLParser):
             return
         if tag == "a" and self._link_stack:
             href, start_index = self._link_stack.pop()
-            if href.startswith(("http://", "https://")) and not href.startswith(
-                "https://matrix.to/#/"
-            ):
-                inner = "".join(self.parts[start_index:]).strip()
-                if inner and href not in inner:
-                    suffix = f" ({href})"
-                    self.parts.append(suffix)
-                    self.non_emoji_parts.append(suffix)
+            if href.startswith(("http://", "https://")):
+                is_user_pill = href.startswith("https://matrix.to/#/") and unquote(
+                    href[len("https://matrix.to/#/") :]
+                ).startswith("@")
+                if not is_user_pill:
+                    inner = "".join(self.parts[start_index:]).strip()
+                    if inner and href not in inner:
+                        suffix = f" ({href})"
+                        self.parts.append(suffix)
+                        self.non_emoji_parts.append(suffix)
             self._last_emoji_alt = None
         elif tag in _BLOCK_TAGS:
             self._append_break()

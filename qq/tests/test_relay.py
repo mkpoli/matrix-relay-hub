@@ -687,13 +687,33 @@ def test_format_refusal_after_label_reencodes_without_repeating_label(tmp_path):
     from qq_bridge.fit import QQ_IMAGE, Prepared
 
     class FormatRefusingMediaQQ(FakeQQ):
+        def __init__(self):
+            super().__init__()
+            self.send_attempts = 0
+
+        async def upload_group_media(self, group, data, filename, file_type):
+            self.uploads.append((group, filename, file_type))
+            return f"FILE:{filename}"
+
         async def send_group_media(
             self, group, file_info, *, content=None, reference=None, msg_id=None, msg_seq=1
         ):
-            raise QQError(40034002, "富媒体文件格式不支持", status=400)
+            self.send_attempts += 1
+            if self.send_attempts == 1:
+                raise QQError(40034002, "富媒体文件格式不支持", status=400)
+            return await super().send_group_media(
+                group, file_info, content=content, reference=reference, msg_id=msg_id, msg_seq=msg_seq
+            )
 
     qq = FormatRefusingMediaQQ()
     relay, store = make_relay(tmp_path, qq)
+    reencoded: list[bool] = []
+
+    async def fake_prepare(job):
+        reencoded.append(bool(job.get("force")))
+        return Prepared(b"jpg", "a.jpg", QQ_IMAGE)
+
+    relay._prepare_media = fake_prepare
 
     async def go():
         relay._enqueue_media(
@@ -710,13 +730,14 @@ def test_format_refusal_after_label_reencodes_without_repeating_label(tmp_path):
         relay._images.get_nowait()
         job["ready"].set_result(Prepared(b"img", "a.webp", QQ_IMAGE))
         await relay._send_media(job)
-        retry = relay._queue.get_nowait()
-        assert retry["force"] is True
-        assert retry["skip_labels"] == 1
-        assert relay._images.get_nowait() is retry
+        assert relay._queue.empty()
 
     asyncio.run(go())
-    assert qq.sent == [("G", "[M] Alice:", None)]
+    assert reencoded == [True]
+    assert qq.order == [
+        ("text", "[M] Alice:", None),
+        ("media", "FILE:a.jpg", None, None),
+    ]
     store.close()
 
 
@@ -3173,4 +3194,340 @@ def test_emoji_only_permanent_upload_failure_falls_back_to_shortcode_text(tmp_pa
     asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
     assert qq.media == []
     assert qq.sent == [("G", "[D] Alice: :fumo:", None)]
+    store.close()
+
+
+def test_redacted_media_after_label_does_not_send_attachment(tmp_path):
+    from qq_bridge.fit import QQ_IMAGE, Prepared
+
+    class RedactDuringLabelQQ(FakeQQ):
+        async def send_group_text(self, group, content, *, reference=None, msg_id=None, msg_seq=1):
+            res = await super().send_group_text(
+                group, content, reference=reference, msg_id=msg_id, msg_seq=msg_seq
+            )
+            store.supersede("$img", "redacted")
+            return res
+
+    qq = RedactDuringLabelQQ()
+    relay, store = make_relay(tmp_path, qq)
+    _run_media(
+        relay,
+        {"msgtype": "m.image", "url": "mxc://x/y"},
+        Prepared(b"img", "a.png", QQ_IMAGE),
+    )
+    assert qq.sent == [("G", "[M] Alice:", None)]
+    assert qq.media == []
+    store.close()
+
+
+def test_custom_reaction_resumes_image_after_label_sent(tmp_path):
+    class FlakyMediaQQ(FakeQQ):
+        def __init__(self):
+            super().__init__()
+            self.fail_media = True
+
+        async def send_group_media(self, group, file_info, *, content=None, reference=None, **kwargs):
+            if self.fail_media:
+                raise QQError(500, "down", status=500)
+            return await super().send_group_media(
+                group, file_info, content=content, reference=reference, **kwargs
+            )
+
+    qq = FlakyMediaQQ()
+    relay, store = make_relay(tmp_path, qq)
+    store.add_message("Q9", "G", ROOM, "$orig", "REF9", "matrix")
+    ev = reaction_event(
+        target="$orig",
+        key="mxc://example.org/kusa",
+        sender="@discord_1:example.org",
+        event_id="$rx-resume",
+        **{"com.beeper.reaction.shortcode": ":kusa:"},
+    )
+    seq = store.accept_transaction("t-rx-resume", [ev])[0]
+    relay.incoming.put_nowait((seq, ev))
+    asyncio.run(_run_media_loops(relay, lambda: bool(qq.sent) and not relay._outstanding))
+    assert qq.order == [("text", "[D] Alice reacted with :kusa:", "REF9")]
+    assert _pending(store)
+
+    qq.fail_media = False
+    relay2, _ = make_relay(tmp_path, qq)
+    relay2.store = store
+    relay2._claim_pending(0)
+    asyncio.run(_run_media_loops(relay2, lambda: not _pending(store)))
+    assert qq.order == [
+        ("text", "[D] Alice reacted with :kusa:", "REF9"),
+        ("media", "FILEINFO", None, None),
+    ]
+    store.close()
+
+
+def test_format_refusal_on_multi_emoji_preserves_order(tmp_path):
+    from qq_bridge.fit import QQ_IMAGE, Prepared
+
+    class OrderQQ(FakeQQ):
+        def __init__(self):
+            super().__init__()
+            self.refused_a = False
+
+        async def upload_group_media(self, group, data, filename, file_type):
+            return filename
+
+        async def send_group_media(self, group, file_info, *, content=None, reference=None, **kwargs):
+            if file_info == "a.png" and not self.refused_a:
+                self.refused_a = True
+                raise QQError(40034002, "format", status=400)
+            return await super().send_group_media(
+                group, file_info, content=content, reference=reference, **kwargs
+            )
+
+    qq = OrderQQ()
+    relay, store = make_relay(tmp_path, qq)
+
+    async def fake_prepare(job):
+        name = job["content"]["filename"]
+        if job.get("force"):
+            name = name.replace(".png", ".jpg")
+        return Prepared(b"img", name, QQ_IMAGE)
+
+    relay._prepare_media = fake_prepare
+    ev = text_event(
+        body="",
+        sender="@discord_1:example.org",
+        format="org.matrix.custom.html",
+        formatted_body=(
+            '<img data-mx-emoticon src="mxc://example.org/a" alt=":a:"/>'
+            '<img data-mx-emoticon src="mxc://example.org/b" alt=":b:"/>'
+        ),
+    ) | {"event_id": "$multi-refuse"}
+    seq = store.accept_transaction("t-multi-refuse", [ev])[0]
+    relay.incoming.put_nowait((seq, ev))
+    asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
+    assert qq.order == [
+        ("text", "[D] Alice:", None),
+        ("media", "a.jpg", None, None),
+        ("media", "b.png", None, None),
+    ]
+    store.close()
+
+
+def test_replay_does_not_resend_media_when_label_was_refused_or_sender_renamed(tmp_path):
+    from qq_bridge.fit import QQ_IMAGE, Prepared
+
+    class LabelRefusingQQ(FakeQQ):
+        async def send_group_text(self, group, content, *, reference=None, **kwargs):
+            raise QQError(304003, "URL not allowed", status=400)
+
+    qq = LabelRefusingQQ()
+    relay, store = make_relay(tmp_path, qq)
+    ev = {
+        "room_id": ROOM,
+        "sender": "@alice:example.org",
+        "type": "m.room.message",
+        "event_id": "$img",
+        "content": {"msgtype": "m.image", "url": "mxc://x/y"},
+    }
+    _run_media(relay, ev["content"], Prepared(b"img", "a.png", QQ_IMAGE))
+    assert len(qq.media) == 1
+    # Replay must recognize media_progress.done and not resend the image.
+    asyncio.run(relay.handle_matrix_event(ev))
+    assert relay._queue.empty()
+
+    # Renamed sender after caption chunks still resumes the pending attachment.
+    qq2 = FakeQQ()
+    relay2, store2 = make_relay(tmp_path, qq2)
+    store2.note_media_progress("$renamed", labels_sent=2, labels_done=True, media_sent=0, done=False)
+    store2.add_message("Q1", "G", ROOM, "$renamed", None, "matrix")
+    store2.add_message("Q2", "G", ROOM, "$renamed", None, "matrix")
+
+    async def down_member(*_args, **_kwargs):
+        raise asyncio.TimeoutError()
+
+    relay2.matrix.member = down_member
+    ev2 = {
+        "room_id": ROOM,
+        "sender": "@alice:example.org",
+        "type": "m.room.message",
+        "event_id": "$renamed",
+        "content": {"msgtype": "m.image", "url": "mxc://x/y"},
+    }
+    # Resume enqueues without hitting member lookup (so timeout cannot clear pending).
+    asyncio.run(relay2.handle_matrix_event(ev2))
+    job = relay2._queue.get_nowait()
+    assert job["skip_label"] is True
+    store.close()
+    store2.close()
+
+
+def test_single_inline_emoji_reply_resolves_inflight_quote_and_unquoted_fallback(tmp_path):
+    class RefuseRefOnceQQ(FakeQQ):
+        async def send_group_text(self, group, content, *, reference=None, **kwargs):
+            if reference == "REF-BAD":
+                raise QQError(400, "bad ref", status=400)
+            return await super().send_group_text(group, content, reference=reference, **kwargs)
+
+    qq = RefuseRefOnceQQ()
+    relay, store = make_relay(tmp_path, qq)
+    target = text_event(body="hello") | {"event_id": "$target"}
+    reply = text_event(
+        body="nice",
+        sender="@discord_1:example.org",
+        format="org.matrix.custom.html",
+        formatted_body='nice <img data-mx-emoticon src="mxc://example.org/e1" alt=":e1:"/>',
+        **{"m.relates_to": {"m.in_reply_to": {"event_id": "$target"}}},
+    ) | {"event_id": "$reply-inline"}
+    seqs = store.accept_transaction("t-inline-quote", [target, reply])
+    for seq, ev in zip(seqs, [target, reply]):
+        relay.incoming.put_nowait((seq, ev))
+    asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
+    assert qq.order == [
+        ("text", "[M] Alice: hello", None),
+        ("text", "[D] Alice: nice :e1:", "REF1"),
+        ("media", "FILEINFO", None, None),
+    ]
+
+    # When QQ refuses the reply reference, inline-emoji text falls back unquoted.
+    store.add_message("QB", "G", ROOM, "$bad", "REF-BAD", "matrix")
+    reply2 = text_event(
+        body="yo",
+        sender="@discord_1:example.org",
+        format="org.matrix.custom.html",
+        formatted_body='yo <img data-mx-emoticon src="mxc://example.org/e2" alt=":e2:"/>',
+        **{"m.relates_to": {"m.in_reply_to": {"event_id": "$bad"}}},
+    ) | {"event_id": "$reply-inline-2"}
+    seq2 = store.accept_transaction("t-inline-fallback", [reply2])[0]
+    relay.incoming.put_nowait((seq2, reply2))
+    asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
+    assert qq.order[-2:] == [
+        ("text", "[D] Alice: yo :e2:", None),
+        ("media", "FILEINFO", None, None),
+    ]
+    store.close()
+
+
+def test_slow_inline_emoji_reattaches_speaker_label_after_intervening_message(tmp_path, monkeypatch):
+    monkeypatch.setattr("qq_bridge.relay.MEDIA_WAIT", 0.01)
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay.matrix.names["@bob:example.org"] = "Bob"
+    release = asyncio.Event()
+
+    async def slow_download(url, limit):
+        await release.wait()
+        return b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+    relay.matrix.download = slow_download
+    alice = text_event(
+        body="hi",
+        sender="@alice:example.org",
+        format="org.matrix.custom.html",
+        formatted_body='hi <img data-mx-emoticon src="mxc://example.org/a" alt=":a:"/>',
+    ) | {"event_id": "$alice-inline"}
+    bob = text_event(body="bob msg", sender="@bob:example.org") | {"event_id": "$bob-msg"}
+    seqs = store.accept_transaction("t-interleave", [alice, bob])
+    for seq, ev in zip(seqs, [alice, bob]):
+        relay.incoming.put_nowait((seq, ev))
+
+    async def go():
+        tasks = [
+            asyncio.create_task(relay._consume_matrix()),
+            asyncio.create_task(relay._send_loop()),
+            asyncio.create_task(relay._prepare_loop(relay._images)),
+        ]
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if len(qq.sent) >= 2:
+                release.set()
+            if not _pending(store):
+                break
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(go())
+    assert qq.order == [
+        ("text", "[M] Alice: hi :a:", None),
+        ("text", "[M] Bob: bob msg", None),
+        ("text", "[M] Alice:", None),
+        ("media", "FILEINFO", None, None),
+    ]
+    store.close()
+
+
+def test_emoji_only_permanent_send_and_second_emoji_failures_send_shortcodes(tmp_path):
+    class RejectFirstSendQQ(FakeQQ):
+        async def send_group_media(self, group, file_info, *, content=None, reference=None, **kwargs):
+            raise QQError(400, "rejected", status=400)
+
+    qq = RejectFirstSendQQ()
+    relay, store = make_relay(tmp_path, qq)
+
+    async def download_fail_second(url, limit):
+        if url.endswith("/b"):
+            raise RuntimeError("broken")
+        return b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+    relay.matrix.download = download_fail_second
+    ev = text_event(
+        body="",
+        sender="@discord_1:example.org",
+        event_id="$two-fail",
+        format="org.matrix.custom.html",
+        formatted_body=(
+            '<img data-mx-emoticon src="mxc://example.org/a" alt=":a:"/>'
+            '<img data-mx-emoticon src="mxc://example.org/b" alt=":b:"/>'
+        ),
+    )
+    seq = store.accept_transaction("t-two-fail", [ev])[0]
+    relay.incoming.put_nowait((seq, ev))
+    asyncio.run(_run_media_loops(relay, lambda: not _pending(store)))
+    assert qq.order == [
+        ("text", "[D] Alice:", None),
+        ("text", ":a:", None),
+        ("text", ":b:", None),
+    ]
+    store.close()
+
+
+def test_failed_forced_reencode_sends_failure_notice_after_label(tmp_path):
+    from qq_bridge.fit import QQ_IMAGE, Prepared, Unfit
+
+    class FormatRefuseQQ(FakeQQ):
+        async def send_group_media(self, group, file_info, *, content=None, reference=None, **kwargs):
+            raise QQError(40034002, "format", status=400)
+
+    qq = FormatRefuseQQ()
+    relay, store = make_relay(tmp_path, qq)
+
+    async def fail_reencode(job):
+        raise Unfit("not accepted by QQ")
+
+    relay._prepare_media = fail_reencode
+    _run_media(
+        relay,
+        {"msgtype": "m.image", "url": "mxc://x/y"},
+        Prepared(b"img", "a.webp", QQ_IMAGE),
+    )
+    assert qq.order == [
+        ("text", "[M] Alice:", None),
+        ("text", "[image not accepted by QQ]", None),
+    ]
+    store.close()
+
+
+def test_exhausted_daily_quota_defers_before_uploading(tmp_path):
+    from qq_bridge.fit import QQ_IMAGE, Prepared
+    from qq_bridge.ratelimit import RateLimiter
+
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    limiter = RateLimiter(20, 0)
+    relay._group_limiters["G"] = limiter
+    _run_media(
+        relay,
+        {"msgtype": "m.image", "url": "mxc://x/y"},
+        Prepared(b"img", "a.png", QQ_IMAGE),
+    )
+    assert qq.uploads == []
+    assert qq.sent == []
+    assert qq.media == []
     store.close()

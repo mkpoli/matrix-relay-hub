@@ -3531,3 +3531,92 @@ def test_exhausted_daily_quota_defers_before_uploading(tmp_path):
     assert qq.sent == []
     assert qq.media == []
     store.close()
+
+
+def test_unknown_qq_gateway_event_is_logged_at_info_with_secrets_redacted(tmp_path, caplog):
+    import logging
+
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    with caplog.at_level(logging.INFO, logger="qq_bridge.relay"):
+        asyncio.run(
+            relay.on_qq_event(
+                "GROUP_MESSAGE_DELETE",
+                {
+                    "id": "M1",
+                    "group_openid": "G",
+                    "author": {"username": "Alice"},
+                    "auth_token": "secret-top",
+                    "attachments": [{"url": "https://example.invalid/file?token=url-secret"}],
+                    "message_scene": {
+                        "source": "recall",
+                        "ext": ["msg_idx=REF1", "auth_token=secret-ext", "edit_flag=1"],
+                    },
+                },
+            )
+        )
+    assert any(
+        "QQ event GROUP_MESSAGE_DELETE:" in rec.message
+        and '"id": "M1"' in rec.message
+        and '"username": "Alice"' in rec.message
+        and "secret-top" not in rec.message
+        and "secret-ext" not in rec.message
+        and "url-secret" not in rec.message
+        and '"ext_keys": ["edit_flag", "msg_idx"]' in rec.message
+        for rec in caplog.records
+    )
+    store.close()
+
+
+def test_group_message_logs_nonstandard_keys_and_scene_ext_without_secrets(tmp_path, caplog):
+    import logging
+
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    with caplog.at_level(logging.INFO, logger="qq_bridge.relay"):
+        asyncio.run(
+            relay.on_qq_event(
+                "GROUP_MESSAGE_CREATE",
+                {
+                    "id": "M2",
+                    "group_openid": "G",
+                    "author": {"member_openid": "U1", "username": "Alice"},
+                    "content": "hello",
+                    "message_type": {"token": "nested-secret"},
+                    "edited_timestamp": "2026-11-26T00:00:00Z",
+                    "message_scene": {
+                        "source": "edit\ninjected",
+                        "ext": [
+                            "msg_idx=REF2",
+                            "auth_token=secret-token",
+                            "edit_seq=2",
+                        ],
+                    },
+                },
+            )
+        )
+        # Malformed non-list ext must not crash message handling.
+        asyncio.run(
+            relay.on_qq_event(
+                "GROUP_MESSAGE_CREATE",
+                {
+                    "id": "M3",
+                    "group_openid": "G",
+                    "author": {"member_openid": "U1", "username": "Alice"},
+                    "content": "!qq status",
+                    "message_scene": {"ext": 1},
+                },
+            )
+        )
+    assert any(
+        "QQ GROUP_MESSAGE_CREATE" in rec.message
+        and "\n" not in rec.message
+        and "scene=edit injected" in rec.message
+        and "ext_keys=['edit_seq']" in rec.message
+        and "extra_keys=['edited_timestamp']" in rec.message
+        and "secret-token" not in rec.message
+        and "nested-secret" not in rec.message
+        for rec in caplog.records
+    )
+    assert not relay._queue.empty()
+    store.close()

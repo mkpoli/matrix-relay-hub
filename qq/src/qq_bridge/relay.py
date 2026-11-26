@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 
 import aiohttp
 import logging
@@ -164,6 +165,99 @@ def is_edit(content: dict) -> bool:
     if "m.new_content" in content:
         return True
     return (content.get("m.relates_to") or {}).get("rel_type") == "m.replace"
+
+
+_STANDARD_QQ_MESSAGE_KEYS = frozenset(
+    {
+        "id",
+        "group_id",
+        "group_openid",
+        "content",
+        "timestamp",
+        "author",
+        "attachments",
+        "mentions",
+        "message_scene",
+        "msg_elements",
+        "message_type",
+        "message_reference",
+    }
+)
+_SENSITIVE_QQ_KEY_PARTS = ("token", "secret", "sig", "cookie", "password", "authorization", "rkey")
+_UNKNOWN_EVENT_SCALAR_KEYS = (
+    "id",
+    "group_openid",
+    "group_id",
+    "channel_id",
+    "guild_id",
+    "message_id",
+    "msg_id",
+    "message_type",
+    "timestamp",
+    "op_member_openid",
+    "msg_seq",
+    "seq",
+)
+
+
+def _safe_log_str(value: str, limit: int = 80) -> str:
+    cleaned = "".join(" " if ord(ch) < 32 or ord(ch) == 127 else ch for ch in value)
+    return cleaned if len(cleaned) <= limit else cleaned[:limit] + "..."
+
+
+def _safe_log_scalar(value: object, limit: int = 80) -> object:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        if "://" in value:
+            head, _, _ = value.partition("?")
+            return _safe_log_str(head, limit)
+        return _safe_log_str(value, limit)
+    return f"<{type(value).__name__}>"
+
+
+def _summarize_qq_payload(data: object) -> str:
+    if not isinstance(data, dict):
+        return f"<{type(data).__name__}>"
+    summary: dict[str, object] = {
+        "keys": [_safe_log_str(str(k), 40) for k in sorted(data, key=str)[:16]]
+    }
+    for key in _UNKNOWN_EVENT_SCALAR_KEYS:
+        if key in data:
+            summary[key] = _safe_log_scalar(data[key])
+    author = data.get("author")
+    if isinstance(author, dict):
+        author_summary: dict[str, object] = {}
+        for key in ("id", "member_openid", "username", "bot"):
+            if key in author:
+                author_summary[key] = _safe_log_scalar(author[key])
+        if author_summary:
+            summary["author"] = author_summary
+    scene = data.get("message_scene")
+    if isinstance(scene, dict):
+        scene_summary: dict[str, object] = {}
+        if isinstance(scene.get("source"), str):
+            scene_summary["source"] = _safe_log_str(scene["source"], 40)
+        ext = scene.get("ext")
+        if isinstance(ext, list):
+            ext_keys = sorted(
+                {
+                    _safe_log_str(item.partition("=")[0], 40)
+                    for item in ext[:32]
+                    if isinstance(item, str)
+                    and "=" in item
+                    and not any(
+                        part in item.partition("=")[0].lower()
+                        for part in _SENSITIVE_QQ_KEY_PARTS
+                    )
+                }
+            )[:8]
+            if ext_keys:
+                scene_summary["ext_keys"] = ext_keys
+        if scene_summary:
+            summary["message_scene"] = scene_summary
+    text = json.dumps(summary, ensure_ascii=False, sort_keys=True)
+    return text if len(text) <= 400 else text[:400] + "..."
 
 
 class Relay:
@@ -1568,21 +1662,71 @@ class Relay:
     # -- QQ -> Matrix -----------------------------------------------------
 
     async def on_qq_event(self, event_type: str, data: dict) -> None:
+        if not isinstance(data, dict):
+            log.info("QQ event %s: %s", _safe_log_str(str(event_type), 64), _summarize_qq_payload(data))
+            return
         if event_type in ("GROUP_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE"):
-            author = data.get("author") or {}
+            author = data.get("author") if isinstance(data.get("author"), dict) else {}
+            extra_keys = sorted(
+                _safe_log_str(str(k), 40)
+                for k in data
+                if k not in _STANDARD_QQ_MESSAGE_KEYS
+            )[:8]
+            scene = data.get("message_scene")
+            scene_source = (
+                _safe_log_str(scene["source"], 40)
+                if isinstance(scene, dict) and isinstance(scene.get("source"), str)
+                else None
+            )
+            scene_ext = scene.get("ext") if isinstance(scene, dict) else None
+            scene_ext_keys = sorted(
+                {
+                    _safe_log_str(item.partition("=")[0], 40)
+                    for item in scene_ext[:32]
+                    if isinstance(item, str)
+                    and "=" in item
+                    and item.partition("=")[0] not in ("msg_idx", "ref_msg_idx")
+                    and not any(
+                        part in item.partition("=")[0].lower()
+                        for part in _SENSITIVE_QQ_KEY_PARTS
+                    )
+                }
+                if isinstance(scene_ext, list)
+                else ()
+            )[:8]
+            extra_parts: list[str] = []
+            if scene_source and scene_source != "default":
+                extra_parts.append(f"scene={scene_source}")
+            if scene_ext_keys:
+                extra_parts.append(f"ext_keys={scene_ext_keys}")
+            if extra_keys:
+                extra_parts.append(f"extra_keys={extra_keys}")
+            extra = _safe_log_str(" " + " ".join(extra_parts), 200) if extra_parts else ""
+            raw_type = data.get("message_type")
+            msg_type = (
+                raw_type
+                if isinstance(raw_type, (int, str)) and not isinstance(raw_type, bool)
+                else (None if raw_type is None else f"<{type(raw_type).__name__}>")
+            )
             log.info(
-                "QQ %s group=%s author=%s",
+                "QQ %s group=%s author=%s type=%s%s",
                 event_type,
-                data.get("group_openid"),
-                author.get("username"),
+                _safe_log_scalar(data.get("group_openid")),
+                _safe_log_scalar(author.get("username")),
+                _safe_log_scalar(msg_type, 20),
+                extra,
             )
             await self._on_group_message(data)
         elif event_type == "GROUP_ADD_ROBOT":
-            log.info("added to QQ group %s", data.get("group_openid"))
+            log.info("added to QQ group %s", _safe_log_scalar(data.get("group_openid")))
         elif event_type == "GROUP_DEL_ROBOT":
-            log.info("removed from QQ group %s", data.get("group_openid"))
+            log.info("removed from QQ group %s", _safe_log_scalar(data.get("group_openid")))
         else:
-            log.debug("QQ event %s", event_type)
+            log.info(
+                "QQ event %s: %s",
+                _safe_log_str(str(event_type), 64),
+                _summarize_qq_payload(data),
+            )
 
     async def _on_group_message(self, data: dict) -> None:
         group = data.get("group_openid")

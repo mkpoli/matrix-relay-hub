@@ -396,3 +396,50 @@ def test_qq_forwarded_chat_record_preserves_distinct_messages_and_ignores_plain_
     not_forward = "[群聊的聊天记录]\n这不是转发结构"
     plain, _ = render_qq_text(not_forward, [], "example.org")
     assert plain == not_forward
+
+
+def test_qq_forwarded_chat_record_edge_cases():
+    # Different timestamps prevent deduplicating genuine repeated messages.
+    with_times = (
+        "[群聊的聊天记录]\n"
+        "=== 消息 1 ===\n[消息内容] hi\n[发送者] Alice\n[时间] 09:00\n\n"
+        "=== 消息 2 ===\n[消息内容] hi\n[发送者] Alice\n[时间] 10:00\n"
+    )
+    body, _ = render_qq_text(with_times, [], "example.org")
+    assert body == "[群聊的聊天记录]\n> Alice:\n> hi\n> hi"
+
+    # Literal [发送者] inside multiline content is preserved.
+    literal_tag = (
+        "[群聊的聊天记录]\n"
+        "=== 消息 1 ===\n[消息内容] first\n[发送者] literal\n[发送者] Alice\n"
+    )
+    body, _ = render_qq_text(literal_tag, [], "example.org")
+    assert body == "[群聊的聊天记录]\n> Alice:\n> first\n> [发送者] literal"
+
+    # Nested forward / literal `=== 消息 N ===` bails out instead of misattributing.
+    nested = (
+        "[群聊的聊天记录]\n"
+        "=== 消息 1 ===\n[消息内容] [群聊的聊天记录]\n=== 消息 1 ===\n[消息内容] inner\n[发送者] Bob\n[发送者] Alice\n"
+    )
+    body, _ = render_qq_text(nested, [], "example.org")
+    assert "=== 消息 1 ===" in body
+
+    # Multiline leading bot mentions are stripped before detecting the forward.
+    bot_prefixed = (
+        "<@B1>\n<@B2>\n[群聊的聊天记录]\n"
+        "=== 消息 1 ===\n[消息内容] hi\n[发送者] Alice\n"
+    )
+    body, _ = render_qq_text(
+        bot_prefixed,
+        [{"id": "B1", "is_you": True}, {"id": "B2", "bot": True}],
+        "example.org",
+    )
+    assert body == "[群聊的聊天记录]\n> Alice: hi"
+
+    # Attached sticker uses [图片] placeholder instead of duplicating [表情].
+    sticker_fwd = (
+        "[群聊的聊天记录]\n"
+        '=== 消息 1 ===\n[消息内容] <faceType=6,faceId="0",ext="">\n[发送者] Alice\n'
+    )
+    body, _ = render_qq_text(sticker_fwd, [], "example.org", sticker_image=True)
+    assert body == "[群聊的聊天记录]\n> Alice: [图片]"

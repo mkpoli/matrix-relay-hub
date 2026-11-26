@@ -134,7 +134,7 @@ def _mention_names(mentions: list[dict] | None) -> tuple[dict[str, str], set[str
 
 
 _FORWARD_HEADER_RE = re.compile(r"^\[([^\[\]\n]{1,60}聊天记录)\]$")
-_FORWARD_ITEM_RE = re.compile(r"^===\s*消息\s*\d+\s*===$")
+_FORWARD_ITEM_RE = re.compile(r"^===\s*消息\s*(\d+)\s*===$")
 _FORWARD_FIELD_RE = re.compile(r"^\[(消息内容|发送者|时间)\]\s?(.*)$")
 
 
@@ -151,58 +151,96 @@ def _parse_forwarded_record(text: str) -> tuple[str, list[tuple[str, str]]] | No
         return None
     header = header_match.group(0)
 
-    blocks: list[list[str]] = []
+    blocks: list[tuple[int, list[str]]] = []
+    current_num: int | None = None
     current: list[str] | None = None
     for line in lines[1:]:
         stripped = line.strip()
-        if _FORWARD_ITEM_RE.match(stripped):
-            if current is not None:
-                blocks.append(current)
+        item_match = _FORWARD_ITEM_RE.match(stripped)
+        if item_match:
+            if current is not None and current_num is not None:
+                blocks.append((current_num, current))
+            current_num = int(item_match.group(1))
             current = []
         elif current is None:
             if stripped:
                 return None
         else:
             current.append(line)
-    if current is not None:
-        blocks.append(current)
+    if current is not None and current_num is not None:
+        blocks.append((current_num, current))
     if not blocks:
         return None
 
-    entries: list[tuple[str, str]] = []
-    for block in blocks:
+    # Require strict 1..N numbering so nested forwards or literal markers in content
+    # bail out safely instead of splitting or misattributing messages.
+    if [num for num, _ in blocks] != list(range(1, len(blocks) + 1)):
+        return None
+
+    entries: list[tuple[str, str, str]] = []
+    for _, raw_block in blocks:
+        block = list(raw_block)
+        while block and not block[-1].strip():
+            block.pop()
+        while block and not block[0].strip():
+            block.pop(0)
+        if not block:
+            return None
+
         sender = ""
-        content_lines: list[str] = []
-        active_field: str | None = None
-        saw_tag = False
-        for line in block:
-            field_match = _FORWARD_FIELD_RE.match(line)
-            if field_match:
-                saw_tag = True
-                tag, value = field_match.group(1), field_match.group(2)
-                active_field = tag
-                if tag == "发送者":
-                    sender = value.strip()
-                elif tag == "消息内容":
-                    content_lines.append(value)
-            elif active_field == "消息内容":
-                content_lines.append(line)
-            elif line.strip():
-                # Unexpected untagged text outside [消息内容]; bail out to avoid data loss.
+        timestamp = ""
+        # Peel trailing metadata lines ([发送者], [时间]) from the bottom first so
+        # literal `[发送者] ...` lines inside multiline `[消息内容]` stay intact.
+        while block:
+            tail_match = _FORWARD_FIELD_RE.match(block[-1])
+            if not tail_match:
+                break
+            tag, value = tail_match.group(1), tail_match.group(2).strip()
+            if tag == "发送者" and not sender:
+                sender = value
+                block.pop()
+            elif tag == "时间" and not timestamp:
+                timestamp = value
+                block.pop()
+            else:
+                break
+
+        # Also support leading [发送者]/[时间] before [消息内容].
+        while block:
+            head_match = _FORWARD_FIELD_RE.match(block[0])
+            if not head_match:
+                break
+            tag, value = head_match.group(1), head_match.group(2).strip()
+            if tag == "发送者" and not sender:
+                sender = value
+                block.pop(0)
+            elif tag == "时间" and not timestamp:
+                timestamp = value
+                block.pop(0)
+            else:
+                break
+
+        if not sender:
+            return None
+
+        if block:
+            content_match = _FORWARD_FIELD_RE.match(block[0])
+            if not content_match or content_match.group(1) != "消息内容":
                 return None
-        if not saw_tag:
-            return None
-        content = "\n".join(content_lines).strip()
-        if not sender and not content:
-            return None
-        entries.append((sender, content))
+            content_lines = [content_match.group(2), *block[1:]]
+            content = "\n".join(content_lines).strip()
+        else:
+            content = ""
+
+        entries.append((sender, content, timestamp))
 
     # QQ Bot API sometimes flattens a merged forward twice ([1..k, 1..k]).
+    # Compare timestamps too so genuine repeats at different times are preserved.
     if len(entries) >= 2 and len(entries) % 2 == 0:
         half = len(entries) // 2
         if entries[:half] == entries[half:]:
             entries = entries[:half]
-    return header, entries
+    return header, [(sender, content) for sender, content, _ in entries]
 
 
 def _render_qq_inline(
@@ -270,15 +308,16 @@ def _strip_leading_bot_mentions(text: str, bots: set[str]) -> str:
     if not bots:
         return text
     pos = 0
+    length = len(text)
     while True:
-        ws = SPACE_RE.match(text, pos)
-        cur = ws.end() if ws else pos
-        if not text.startswith("<@", cur):
+        while pos < length and text[pos].isspace():
+            pos += 1
+        if not text.startswith("<@", pos):
             break
-        end = text.find(">", cur + 2)
+        end = text.find(">", pos + 2)
         if end == -1:
             break
-        openid = text[cur + 2 : end]
+        openid = text[pos + 2 : end]
         if openid.lower() not in bots:
             break
         pos = end + 1
@@ -306,10 +345,10 @@ def render_qq_text(
         groups: list[tuple[str, list[tuple[str, str]]]] = []
         for sender, raw_item in entries:
             item_plain, item_html = _render_qq_inline(
-                raw_item, names, bots, domain, face_images, sticker_image=False
+                raw_item, names, bots, domain, face_images, sticker_image=sticker_image
             )
             if not item_plain and not item_html:
-                item_plain = item_html = "[消息]"
+                item_plain = item_html = "[图片]" if sticker_image else "[消息]"
             if groups and groups[-1][0] == sender:
                 groups[-1][1].append((item_plain, item_html))
             else:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 
 import aiohttp
 import logging
@@ -164,6 +165,60 @@ def is_edit(content: dict) -> bool:
     if "m.new_content" in content:
         return True
     return (content.get("m.relates_to") or {}).get("rel_type") == "m.replace"
+
+
+_STANDARD_QQ_MESSAGE_KEYS = frozenset(
+    {
+        "id",
+        "group_id",
+        "group_openid",
+        "content",
+        "timestamp",
+        "author",
+        "attachments",
+        "mentions",
+        "message_scene",
+        "msg_elements",
+        "message_type",
+        "message_reference",
+    }
+)
+_SENSITIVE_QQ_KEY_PARTS = ("token", "secret", "sig", "cookie", "password", "authorization")
+
+
+def _redact_qq_value(value: object, *, depth: int = 0) -> object:
+    if depth >= 4:
+        return "..."
+    if isinstance(value, dict):
+        out: dict[str, object] = {}
+        for k, v in value.items():
+            key = str(k)
+            if any(part in key.lower() for part in _SENSITIVE_QQ_KEY_PARTS):
+                out[key] = "<redacted>"
+            else:
+                out[key] = _redact_qq_value(v, depth=depth + 1)
+        return out
+    if isinstance(value, list):
+        items: list[object] = []
+        for item in value[:16]:
+            if isinstance(item, str) and "=" in item:
+                k, _, _ = item.partition("=")
+                if any(part in k.lower() for part in _SENSITIVE_QQ_KEY_PARTS):
+                    items.append(f"{k}=<redacted>")
+                    continue
+            items.append(_redact_qq_value(item, depth=depth + 1))
+        return items
+    if isinstance(value, str) and len(value) > 120:
+        return value[:120] + "..."
+    return value
+
+
+def _summarize_qq_payload(data: object) -> str:
+    try:
+        text = json.dumps(_redact_qq_value(data), ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        text = repr(data)
+    return text if len(text) <= 500 else text[:500] + "..."
 
 
 class Relay:
@@ -1467,11 +1522,40 @@ class Relay:
     async def on_qq_event(self, event_type: str, data: dict) -> None:
         if event_type in ("GROUP_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE"):
             author = data.get("author") or {}
+            extra_keys = sorted(
+                str(k) for k in data if k not in _STANDARD_QQ_MESSAGE_KEYS
+            )
+            scene = data.get("message_scene")
+            scene_source = scene.get("source") if isinstance(scene, dict) else None
+            scene_ext_keys = sorted(
+                {
+                    item.partition("=")[0]
+                    for item in (scene.get("ext") or [])
+                    if isinstance(item, str)
+                    and "=" in item
+                    and item.partition("=")[0] not in ("msg_idx", "ref_msg_idx")
+                    and not any(
+                        part in item.partition("=")[0].lower()
+                        for part in _SENSITIVE_QQ_KEY_PARTS
+                    )
+                }
+                if isinstance(scene, dict)
+                else ()
+            )
+            extra = ""
+            if scene_source and scene_source != "default":
+                extra += f" scene={scene_source}"
+            if scene_ext_keys:
+                extra += f" ext_keys={scene_ext_keys}"
+            if extra_keys:
+                extra += f" extra_keys={extra_keys}"
             log.info(
-                "QQ %s group=%s author=%s",
+                "QQ %s group=%s author=%s type=%s%s",
                 event_type,
                 data.get("group_openid"),
                 author.get("username"),
+                data.get("message_type"),
+                extra,
             )
             await self._on_group_message(data)
         elif event_type == "GROUP_ADD_ROBOT":
@@ -1479,7 +1563,7 @@ class Relay:
         elif event_type == "GROUP_DEL_ROBOT":
             log.info("removed from QQ group %s", data.get("group_openid"))
         else:
-            log.debug("QQ event %s", event_type)
+            log.info("QQ event %s: %s", event_type, _summarize_qq_payload(data))
 
     async def _on_group_message(self, data: dict) -> None:
         group = data.get("group_openid")

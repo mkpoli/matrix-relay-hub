@@ -36,6 +36,7 @@ HEARTBEAT_SECONDS = 30.0
 MAX_MISSED_PONGS = 2
 ACK_TIMEOUT_SECONDS = 15.0
 CONNECT_WAIT_SECONDS = 10.0
+MAX_AUTH_FAILURES = 5
 
 RATE_LIMIT_ERRCODES = frozenset({45009, 45033, 846616})
 TRANSIENT_ERRCODES = frozenset({-1, 45009, 45033, 846616})
@@ -70,6 +71,10 @@ class WeComError(Exception):
         )
 
 
+class WeComAuthError(WeComError):
+    """Raised when WeCom rejects bot_id/secret authentication."""
+
+
 def _req_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
@@ -84,11 +89,15 @@ class WeComAIBotClient:
         *,
         heartbeat_interval: float = HEARTBEAT_SECONDS,
         ack_timeout: float = ACK_TIMEOUT_SECONDS,
+        reconnect_base_delay: float = 1.0,
+        max_auth_failures: int = MAX_AUTH_FAILURES,
     ) -> None:
         self.cfg = cfg
         self.session = session
         self.heartbeat_interval = heartbeat_interval
         self.ack_timeout = ack_timeout
+        self.reconnect_base_delay = reconnect_base_delay
+        self.max_auth_failures = max_auth_failures
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._ready = asyncio.Event()
         self._stopped = False
@@ -97,6 +106,7 @@ class WeComAIBotClient:
         self._send_lock = asyncio.Lock()
         self._events: asyncio.Queue[dict] = asyncio.Queue()
         self._worker: asyncio.Task | None = None
+        self._close_task: asyncio.Task | None = None
 
     @property
     def connected(self) -> bool:
@@ -115,16 +125,30 @@ class WeComAIBotClient:
         self._stopped = False
         self._kicked = False
         self._worker = asyncio.create_task(self._dispatch_loop(handler))
-        delay = 1.0
+        delay = self.reconnect_base_delay
+        auth_failures = 0
         try:
             while not self._stopped and not self._kicked:
+                authenticated = False
                 try:
-                    await self._connect_once()
-                    delay = 1.0
+                    authenticated = await self._connect_once()
                 except asyncio.CancelledError:
                     raise
+                except WeComAuthError as exc:
+                    auth_failures += 1
+                    log.error(
+                        "WeCom AI Bot authentication failed (%d/%d): %s",
+                        auth_failures,
+                        self.max_auth_failures,
+                        exc,
+                    )
+                    if auth_failures >= self.max_auth_failures:
+                        raise
                 except Exception as exc:
                     log.warning("WeCom WebSocket error: %s", exc)
+                if authenticated:
+                    delay = self.reconnect_base_delay
+                    auth_failures = 0
                 if self._stopped or self._kicked:
                     break
                 log.info("reconnecting to WeCom WebSocket in %.1fs", delay)
@@ -141,22 +165,28 @@ class WeComAIBotClient:
             except Exception:
                 log.exception("failed to handle WeCom callback")
 
-    async def _connect_once(self) -> None:
+    async def _connect_once(self) -> bool:
         log.info("connecting to WeCom AI Bot gateway %s", self.cfg.ws_url)
+        authenticated = False
         async with self.session.ws_connect(self.cfg.ws_url, heartbeat=None) as ws:
             self._ws = ws
+
             async def _lifecycle() -> None:
+                nonlocal authenticated
                 try:
                     req_id = _req_id(CMD_SUBSCRIBE)
-                    ack = await self._rpc(
-                        CMD_SUBSCRIBE,
-                        {"bot_id": self.cfg.bot_id, "secret": self.cfg.secret},
-                        req_id=req_id,
-                        allow_unready=True,
-                    )
-                    errcode = ack.get("errcode", 0)
-                    if errcode != 0:
-                        raise WeComError(errcode, str(ack.get("errmsg", "auth failed")))
+                    try:
+                        await self._rpc(
+                            CMD_SUBSCRIBE,
+                            {"bot_id": self.cfg.bot_id, "secret": self.cfg.secret},
+                            req_id=req_id,
+                            allow_unready=True,
+                        )
+                    except WeComError as exc:
+                        if not exc.transient:
+                            raise WeComAuthError(exc.code, exc.message) from exc
+                        raise
+                    authenticated = True
                     self._ready.set()
                     log.info("WeCom AI Bot authenticated")
                     missed_pongs = 0
@@ -199,6 +229,9 @@ class WeComAIBotClient:
                         self._handle_frame(frame)
                     elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
                         break
+                if not lifecycle_task.done():
+                    with contextlib.suppress(TimeoutError, Exception):
+                        await asyncio.wait_for(asyncio.shield(lifecycle_task), timeout=1.0)
                 if lifecycle_task.done() and not lifecycle_task.cancelled():
                     exc = lifecycle_task.exception()
                     if exc is not None:
@@ -210,6 +243,7 @@ class WeComAIBotClient:
                     await lifecycle_task
                 self._fail_pending("WeCom WebSocket disconnected")
                 self._ws = None
+        return authenticated
 
     def _handle_frame(self, frame: dict) -> None:
         cmd = frame.get("cmd")
@@ -228,7 +262,7 @@ class WeComAIBotClient:
                 )
                 self._kicked = True
                 if self._ws and not self._ws.closed:
-                    asyncio.create_task(self._ws.close())
+                    self._close_task = asyncio.create_task(self._ws.close())
                 return
             self._events.put_nowait(frame)
             return
@@ -407,6 +441,10 @@ class WeComAIBotClient:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._worker
             self._worker = None
+        if self._close_task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._close_task
+            self._close_task = None
         if self._ws is not None and not self._ws.closed:
             await self._ws.close()
         self._fail_pending("WeCom client closed")
@@ -435,13 +473,20 @@ class WeComWebhookClient:
                     str(data.get("errmsg", text) if isinstance(data, dict) else text),
                     status=response.status,
                 )
-            if isinstance(data, dict) and data.get("errcode", 0) != 0:
+            if not isinstance(data, dict) or "errcode" not in data:
+                raise WeComError(
+                    "invalid_response",
+                    f"expected JSON object with errcode from webhook: {text[:200]}",
+                    status=response.status,
+                    transient=True,
+                )
+            if data["errcode"] != 0:
                 raise WeComError(
                     data["errcode"],
                     str(data.get("errmsg", "webhook error")),
                     status=response.status,
                 )
-            return data if isinstance(data, dict) else {}
+            return data
 
     async def send_markdown(self, content: str) -> dict:
         return await self._post_json({"msgtype": "markdown", "markdown": {"content": content}})
@@ -478,15 +523,22 @@ class WeComWebhookClient:
                     str(body.get("errmsg", text) if isinstance(body, dict) else text),
                     status=response.status,
                 )
-            if isinstance(body, dict) and body.get("errcode", 0) != 0:
+            if not isinstance(body, dict) or "errcode" not in body:
+                raise WeComError(
+                    "invalid_response",
+                    f"expected JSON object with errcode from upload_media: {text[:200]}",
+                    status=response.status,
+                    transient=True,
+                )
+            if body["errcode"] != 0:
                 raise WeComError(
                     body["errcode"],
                     str(body.get("errmsg", "upload_media error")),
                     status=response.status,
                 )
-            media_id = body.get("media_id") if isinstance(body, dict) else None
+            media_id = body.get("media_id")
             if not media_id:
-                raise WeComError("upload_media", "missing media_id in upload_media response")
+                raise WeComError("upload_media", "missing media_id in upload_media response", transient=True)
             return str(media_id)
 
     async def send_file(self, media_id: str) -> dict:

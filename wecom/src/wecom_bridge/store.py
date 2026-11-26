@@ -53,6 +53,13 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS inbound_pending (
+    msgid TEXT PRIMARY KEY,
+    frame TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -88,6 +95,45 @@ class Store:
     def release_inbound(self, msgid: str) -> None:
         """Remove a claimed inbound msgid if relaying to Matrix failed before delivery."""
         self.conn.execute("DELETE FROM inbound WHERE msgid = ? AND event_id IS NULL", (msgid,))
+
+    def enqueue_inbound(self, msgid: str, frame: dict) -> None:
+        """Persist a failed inbound WeCom callback for later local retry."""
+        self.conn.execute(
+            """
+            INSERT INTO inbound_pending(msgid, frame, ts, attempts) VALUES(?, ?, ?, 0)
+            ON CONFLICT(msgid) DO NOTHING
+            """,
+            (msgid, json.dumps(frame, ensure_ascii=False), int(time.time())),
+        )
+
+    def claim_inbound_pending(
+        self,
+        *,
+        max_age: int,
+        max_attempts: int,
+        busy: set[str] | frozenset[str] = frozenset(),
+    ) -> list[tuple[str, dict]]:
+        now = int(time.time())
+        self.conn.execute(
+            "DELETE FROM inbound_pending WHERE ts < ? OR attempts >= ?",
+            (now - max_age, max_attempts),
+        )
+        rows = [
+            row
+            for row in self.conn.execute(
+                "SELECT msgid, frame FROM inbound_pending ORDER BY ts, rowid"
+            )
+            if row["msgid"] not in busy
+        ]
+        for row in rows:
+            self.conn.execute(
+                "UPDATE inbound_pending SET attempts = attempts + 1 WHERE msgid = ?",
+                (row["msgid"],),
+            )
+        return [(row["msgid"], json.loads(row["frame"])) for row in rows]
+
+    def finish_inbound_pending(self, msgid: str) -> None:
+        self.conn.execute("DELETE FROM inbound_pending WHERE msgid = ?", (msgid,))
 
     # -- outbound Matrix -> WeCom -----------------------------------------
 

@@ -207,3 +207,11 @@ def sanitize_filename(name: str | None, fallback: str) -> str:
     if not cleaned or cleaned in (".", ".."):
         return fallback
     return cleaned
+
+
+_WECOM_MD_TAG_RE = re.compile(r"<(@|/?font\b)", re.IGNORECASE)
+
+
+def sanitize_wecom_markdown(text: str) -> str:
+    """Neutralize WeCom Markdown mention (<@userid>) and <font> tags in relayed text."""
+    return _WECOM_MD_TAG_RE.sub("<\u200b\\1", text)

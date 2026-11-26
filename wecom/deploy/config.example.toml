@@ -20,7 +20,7 @@ mode = "aibot"
 bot_id = "CHANGE"
 secret = "CHANGE"
 # Group chatid (or user userid for a DM). Leave empty only when running
-# `wecom-bridge discover --config /data/config.toml` to print incoming chatids.
+# `python -m wecom_bridge discover --config /data/config.toml` to print incoming chatids.
 chat_id = "CHAT_ID"
 # Optional bot display name used to strip the leading @BotName prefix in groups.
 bot_name = ""

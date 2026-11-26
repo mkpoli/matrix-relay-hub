@@ -7,8 +7,8 @@ import aiohttp
 from aiohttp import web
 import pytest
 
+from helpers import encrypt_file
 from wecom_bridge.config import WeComConfig
-from wecom_bridge.crypto import encrypt_file
 from wecom_bridge.wecom import (
     CHUNK_SIZE,
     CMD_EVENT_CALLBACK,
@@ -20,6 +20,7 @@ from wecom_bridge.wecom import (
     CMD_UPLOAD_FINISH,
     CMD_UPLOAD_INIT,
     WeComAIBotClient,
+    WeComAuthError,
     WeComError,
     WeComWebhookClient,
 )
@@ -200,6 +201,8 @@ def test_webhook_client_send_and_upload():
             body = await request.json()
             if body.get("msgtype") == "text" and body["text"]["content"] == "ratelimit":
                 return web.json_response({"errcode": 45009, "errmsg": "freq limit"})
+            if body.get("msgtype") == "text" and body["text"]["content"] == "html200":
+                return web.Response(text="<html>bad proxy</html>", content_type="text/html")
             seen_sends.append(body)
             return web.json_response({"errcode": 0, "errmsg": "ok"})
 
@@ -241,6 +244,10 @@ def test_webhook_client_send_and_upload():
             assert exc_info.value.rate_limited is True
             assert exc_info.value.transient is True
 
+            with pytest.raises(WeComError) as html_exc:
+                await client.send_text("html200")
+            assert html_exc.value.transient is True
+
         await runner.cleanup()
 
         assert seen_sends[0] == {"msgtype": "markdown", "markdown": {"content": "hi **team**"}}
@@ -254,5 +261,59 @@ def test_webhook_client_send_and_upload():
         }
         assert seen_sends[3] == {"msgtype": "file", "file": {"media_id": "wh-media-1"}}
         assert seen_uploads == [("doc.txt", b"hello document")]
+
+    asyncio.run(scenario())
+
+
+def test_aibot_auth_rejection_backs_off_and_raises():
+    async def scenario():
+        attempts = 0
+
+        async def ws_handler(request: web.Request) -> web.WebSocketResponse:
+            nonlocal attempts
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            async for msg in ws:
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    continue
+                frame = json.loads(msg.data)
+                if frame.get("cmd") == CMD_SUBSCRIBE:
+                    attempts += 1
+                    await ws.send_json(
+                        {
+                            "headers": {"req_id": frame["headers"]["req_id"]},
+                            "errcode": 40001,
+                            "errmsg": "invalid secret",
+                        }
+                    )
+            return ws
+
+        app = web.Application()
+        app.router.add_get("/ws", ws_handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+
+        cfg = WeComConfig(
+            mode="aibot",
+            bot_id="bot1",
+            secret="bad-secret",
+            chat_id="chat-1",
+            incoming="#main:example.org",
+            ws_url=f"ws://127.0.0.1:{port}/ws",
+        )
+        async with aiohttp.ClientSession() as session:
+            client = WeComAIBotClient(
+                cfg,
+                session,
+                reconnect_base_delay=0.02,
+                max_auth_failures=2,
+            )
+            with pytest.raises(WeComAuthError, match="40001"):
+                await client.run(lambda _f: asyncio.sleep(0))
+        await runner.cleanup()
+        assert attempts == 2
 
     asyncio.run(scenario())

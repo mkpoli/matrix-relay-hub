@@ -50,12 +50,3 @@ def decrypt_file(encrypted: bytes, aes_key: str) -> bytes:
         raise DecryptError("invalid PKCS#7 padding bytes")
     return decrypted[:-pad_len]
 
-
-def encrypt_file(plaintext: bytes, aes_key: str) -> bytes:
-    """Encrypt bytes using WeCom's AES-256-CBC + 32-byte PKCS#7 scheme (used in tests)."""
-    key = _decode_aes_key(aes_key)
-    iv = key[:16]
-    pad_len = PKCS7_BLOCK - (len(plaintext) % PKCS7_BLOCK)
-    padded = plaintext + bytes([pad_len]) * pad_len
-    encryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
-    return encryptor.update(padded) + encryptor.finalize()

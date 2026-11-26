@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,15 @@ class WeComConfig:
     webhook_key: str = ""
     api_base: str = DEFAULT_API_BASE
     msgtype: str = "markdown"
+    rate_limit_per_minute: int | None = None
+
+    @property
+    def effective_rate_limit(self) -> int:
+        if self.rate_limit_per_minute is not None:
+            return self.rate_limit_per_minute
+        # Group Robot Webhooks enforce 20 msg/min; keep headroom at 18/min.
+        # AI Bot WS does not publish a fixed per-minute cap; 50/min is a conservative default.
+        return 18 if self.mode == "webhook" else 50
 
     @property
     def aibot_enabled(self) -> bool:
@@ -159,6 +169,11 @@ def load(path: str | Path) -> Config:
     if msgtype not in VALID_WEBHOOK_MSGTYPES:
         raise ConfigError(f"wecom.msgtype must be one of {', '.join(VALID_WEBHOOK_MSGTYPES)}")
 
+    rate_limit_raw = wecom_raw.get("rate_limit_per_minute")
+    if rate_limit_raw is not None:
+        if isinstance(rate_limit_raw, bool) or not isinstance(rate_limit_raw, int) or rate_limit_raw < 1:
+            raise ConfigError("wecom.rate_limit_per_minute must be an integer >= 1")
+
     wecom = WeComConfig(
         mode=mode,
         bot_id=_optional_str(wecom_raw, "bot_id", "wecom"),
@@ -171,10 +186,16 @@ def load(path: str | Path) -> Config:
         webhook_key=_optional_str(wecom_raw, "webhook_key", "wecom"),
         api_base=(_optional_str(wecom_raw, "api_base", "wecom", DEFAULT_API_BASE) or DEFAULT_API_BASE).rstrip("/"),
         msgtype=msgtype,
+        rate_limit_per_minute=rate_limit_raw,
     )
     if mode == "webhook":
         if not wecom.resolved_webhook_url:
             raise ConfigError("wecom.webhook_url or wecom.webhook_key is required in webhook mode")
+        if wecom.webhook_url and wecom.webhook_key:
+            url_keys = parse_qs(urlparse(wecom.webhook_url).query).get("key")
+            url_key = url_keys[0] if url_keys else ""
+            if url_key and url_key != wecom.webhook_key:
+                raise ConfigError("wecom.webhook_url key does not match wecom.webhook_key")
     else:
         if not wecom.incoming:
             raise ConfigError("wecom.incoming is required in aibot mode")
@@ -214,11 +235,17 @@ def load(path: str | Path) -> Config:
     ignore_raw = raw.get("ignore_senders", [])
     if not isinstance(ignore_raw, list) or not all(isinstance(x, str) for x in ignore_raw):
         raise ConfigError("ignore_senders must be a list of strings")
+    for pattern in ignore_raw:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ConfigError(f"invalid regex in ignore_senders {pattern!r}: {exc}") from exc
 
     ignore_notices = raw.get("ignore_notices", True)
     if not isinstance(ignore_notices, bool):
         raise ConfigError("ignore_notices must be a boolean")
-    relay_reactions = raw.get("relay_reactions", True)
+    default_reactions = mode != "webhook"
+    relay_reactions = raw.get("relay_reactions", default_reactions)
     if not isinstance(relay_reactions, bool):
         raise ConfigError("relay_reactions must be a boolean")
 

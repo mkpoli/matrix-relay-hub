@@ -86,7 +86,7 @@ export WECOM_DATA_DIR="$HOME/matrix-bridge-data/wecom"
 export WECOM_UID="$(id -u)" WECOM_GID="$(id -g)"
 ```
 
-Copy `wecom/deploy/config.example.toml` to `$WECOM_DATA_DIR/config.toml` and choose `mode = "aibot"` (bidirectional AI Bot WebSocket over `wss://openws.work.weixin.qq.com`) or `mode = "webhook"` (outbound-only Group Robot Webhook). In `aibot` mode, you can run `python -m wecom_bridge discover --config /data/config.toml` and `@`-mention the bot once in the target internal group to print its `chat_id`. Copy `wecom/deploy/registration.example.yaml` to `$WECOM_DATA_DIR/registration.yaml`, replace the tokens and domain, and keep `url: http://matrix-relay-wecom:29336` unless you change `WECOM_NETWORK_ALIAS`. The bridge does not support encrypted Matrix rooms, external WeChat customer groups, or message recall.
+Copy `wecom/deploy/config.example.toml` to `$WECOM_DATA_DIR/config.toml` and choose `mode = "aibot"` (bidirectional AI Bot WebSocket over `wss://openws.work.weixin.qq.com`) or `mode = "webhook"` (outbound-only Group Robot Webhook). In `aibot` mode, stop any running bridge instance first (WeCom allows only one WebSocket connection per `bot_id`), then run `python -m wecom_bridge discover --config /data/config.toml` and `@`-mention the bot once in the target internal group to print its `chat_id`. Copy `wecom/deploy/registration.example.yaml` to `$WECOM_DATA_DIR/registration.yaml`, replace the tokens and domain, and keep `url: http://matrix-relay-wecom:29336` unless you change `WECOM_NETWORK_ALIAS`. The bridge does not support encrypted Matrix rooms, external WeChat customer groups, or message recall.
 
 ## Operate
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import signal
 import sys
@@ -83,17 +84,39 @@ async def run(cfg: config.Config) -> None:
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, stop.set)
-        await stop.wait()
+
+        exit_code = 0
+        stop_task = asyncio.create_task(stop.wait())
+        try:
+            if ws_task is not None:
+                done, _ = await asyncio.wait(
+                    {stop_task, ws_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if ws_task in done and not stop.is_set():
+                    exc = ws_task.exception() if not ws_task.cancelled() else None
+                    if exc is not None:
+                        log.error("WeCom gateway exited with error: %s", exc)
+                    else:
+                        log.error("WeCom gateway exited unexpectedly; stopping bridge")
+                    exit_code = 1
+            else:
+                await stop_task
+        finally:
+            stop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stop_task
         log.info("shutting down")
 
-        if ws_task is not None:
+        if ws_task is not None and not ws_task.done():
             ws_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await ws_task
         await wecom.close()
         await relay.stop()
         await app.stop()
         store.close()
+        if exit_code:
+            raise SystemExit(exit_code)
 
 
 async def discover(cfg: config.Config) -> None:
@@ -129,11 +152,15 @@ async def discover(cfg: config.Config) -> None:
 
 
 async def simulate(cfg: config.Config, args: argparse.Namespace) -> None:
+    if cfg.wecom.mode != "aibot":
+        raise SystemExit("simulate is only supported in mode = 'aibot'")
     chat_id = args.chat or cfg.wecom.chat_id
     if not chat_id:
         raise SystemExit("pass --chat or set wecom.chat_id in config")
     if cfg.wecom.chat_id and chat_id != cfg.wecom.chat_id:
         raise SystemExit(f"chat {chat_id} does not match configured wecom.chat_id {cfg.wecom.chat_id}")
+    if not cfg.wecom.chat_id:
+        cfg = dataclasses.replace(cfg, wecom=dataclasses.replace(cfg.wecom, chat_id=chat_id))
     async with aiohttp.ClientSession() as session:
         store = Store(cfg.state_path)
         matrix = MatrixClient(cfg.matrix, session)

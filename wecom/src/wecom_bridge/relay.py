@@ -27,6 +27,7 @@ from .formatting import (
     ghost_localpart,
     render_matrix_with_quote,
     sanitize_filename,
+    sanitize_wecom_markdown,
     strip_bot_mention,
     strip_reply_fallback,
 )
@@ -45,6 +46,9 @@ MEDIA_WAIT = 20.0
 PENDING_MAX_AGE = 24 * 3600
 PENDING_ATTEMPTS = 8
 PENDING_RETRY = 15 * 60
+INBOUND_RETRY = 60
+INBOUND_MAX_AGE = 3600
+INBOUND_ATTEMPTS = 5
 
 
 def is_edit(content: dict) -> bool:
@@ -113,8 +117,10 @@ class Relay:
         self._current: int | None = None
         self._outstanding: dict[int, int] = {}
         self._keep: set[int] = set()
+        self._failed_events: set[str] = set()
         self._claimed: set[int] = set()
         self._rooms: dict[str, str] = {}
+        self._joined_rooms: set[str] = set()
         self._labels: dict[str, str] = {}
         self._incoming_room: str | None = None
         self._tagged = len(cfg.rooms) > 1
@@ -124,8 +130,9 @@ class Relay:
         self._queue: asyncio.Queue[dict] = asyncio.Queue()
         self._images: asyncio.Queue[dict] = asyncio.Queue()
         self._videos: asyncio.Queue[dict] = asyncio.Queue()
-        # Webhook limit is 20/min; keep headroom at 18/min. AI Bot WS allows higher throughput.
-        self._limiter = RateLimiter(18 if cfg.wecom.mode == "webhook" else 50)
+        self._limiter = RateLimiter(cfg.wecom.effective_rate_limit)
+        self._inbound_busy: set[str] = set()
+        self._bg_tasks: set[asyncio.Task] = set()
         self._tasks: list[asyncio.Task] = []
 
     @property
@@ -148,6 +155,7 @@ class Relay:
             asyncio.create_task(self._prepare_loop(self._images)),
             asyncio.create_task(self._prepare_loop(self._videos)),
             asyncio.create_task(self._retry_rooms()),
+            asyncio.create_task(self._retry_inbound_loop()),
         ]
 
     def resume_pending(self) -> None:
@@ -184,11 +192,13 @@ class Relay:
                 log.exception("cannot read pending events")
 
     async def stop(self) -> None:
-        for task in self._tasks:
+        all_tasks = [*self._tasks, *self._bg_tasks]
+        for task in all_tasks:
             task.cancel()
-        for task in self._tasks:
+        for task in all_tasks:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        self._bg_tasks.clear()
 
     async def _ensure_bot(self) -> None:
         try:
@@ -197,15 +207,20 @@ class Relay:
             log.debug("bot user already present or not creatable: %s", exc)
 
     async def _resolve_room(self, room) -> None:
-        room_id = await self.matrix.resolve_alias(room.alias)
-        self._rooms[room.alias] = room_id
-        self._labels[room_id] = room.label
-        if room.alias == self.cfg.wecom.incoming:
-            self._incoming_room = room_id
-        try:
-            await self.matrix.join(room_id, self.bot_mxid)
-        except MatrixError as exc:
-            log.warning("cannot join %s as %s: %s", room.alias, self.bot_mxid, exc)
+        room_id = self._rooms.get(room.alias)
+        if not room_id:
+            room_id = await self.matrix.resolve_alias(room.alias)
+            self._rooms[room.alias] = room_id
+            self._labels[room_id] = room.label
+            if room.alias == self.cfg.wecom.incoming:
+                self._incoming_room = room_id
+        if room.alias not in self._joined_rooms:
+            try:
+                await self.matrix.join(room_id, self.bot_mxid)
+                self._joined_rooms.add(room.alias)
+            except (MatrixError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                log.warning("cannot join %s as %s yet: %s", room.alias, self.bot_mxid, exc)
+                return
         if await self.matrix.is_encrypted(room_id):
             log.warning("%s is encrypted; WeCom bridge cannot read encrypted events", room.alias)
         log.info("mirroring %s (%s) as [%s]", room.alias, room_id, room.label)
@@ -214,7 +229,7 @@ class Relay:
         while True:
             await asyncio.sleep(60)
             for room in self.cfg.rooms:
-                if room.alias in self._rooms:
+                if room.alias in self._joined_rooms:
                     continue
                 try:
                     await self._resolve_room(room)
@@ -235,13 +250,20 @@ class Relay:
                 self._outstanding[seq] = 0
             try:
                 await self.handle_matrix_event(event)
+            except asyncio.CancelledError:
+                self._retry_later()
+                raise
+            except (MatrixError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                log.warning("transient error handling Matrix event; keeping for retry: %s", exc)
+                self._retry_later()
             except Exception:
                 log.exception("failed to relay a Matrix event")
+                self._retry_later()
             finally:
                 self._current = None
-            if seq is not None and not self._outstanding.get(seq):
-                self._outstanding.pop(seq, None)
-                self._settle(seq)
+                if seq is not None and not self._outstanding.get(seq):
+                    self._outstanding.pop(seq, None)
+                    self._settle(seq)
 
     def _put(self, job: dict) -> None:
         if self._current is not None and "pending" not in job:
@@ -252,20 +274,29 @@ class Relay:
         self._queue.put_nowait(job)
 
     def _finish(self, job: dict) -> None:
+        event_id = job.get("event_id")
         seq = job.get("pending")
         if seq is None:
+            if event_id and job.get("final_part", True):
+                self._failed_events.discard(event_id)
             return
         left = self._outstanding.get(seq, 1) - 1
         if left > 0:
             self._outstanding[seq] = left
             return
         self._outstanding.pop(seq, None)
+        if event_id:
+            self._failed_events.discard(event_id)
         self._settle(seq)
 
     def _retry_later(self, job: dict | None = None) -> None:
         seq = job.get("pending") if job is not None else self._current
         if seq is not None:
             self._keep.add(seq)
+        if job is not None:
+            event_id = job.get("event_id")
+            if event_id:
+                self._failed_events.add(event_id)
 
     def _settle(self, seq: int) -> None:
         if seq in self._keep:
@@ -361,6 +392,7 @@ class Relay:
                         "room": room_id,
                         "event_id": event_id,
                         "text": part,
+                        "final_part": index == len(parts) - 1,
                     }
                 )
         elif msgtype in WECOM_MEDIA_MSGTYPES:
@@ -411,6 +443,18 @@ class Relay:
             return
         msgtype = new.get("msgtype")
         if msgtype not in ("m.text", "m.emote"):
+            return
+        try:
+            original = await self.matrix.event(room_id, target, self.bot_mxid)
+        except (MatrixError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            log.info("cannot verify edit target %s; keeping for retry: %s", target, exc)
+            self._retry_later()
+            return
+        if not isinstance(original, dict) or original.get("sender") != sender:
+            log.info("ignoring edit of %s by non-author %s", target, sender)
+            return
+        if original.get("room_id") and original.get("room_id") != room_id:
+            log.info("ignoring cross-room edit of %s", target)
             return
         body = strip_reply_fallback(str(new.get("body") or "")).strip()
         if not body:
@@ -522,35 +566,64 @@ class Relay:
     async def _send_loop(self) -> None:
         while True:
             job = await self._queue.get()
+            handed_off = False
             try:
-                await self._dispatch_outbound(job)
+                handed_off = bool(await self._dispatch_outbound(job))
+            except asyncio.CancelledError:
+                self._retry_later(job)
+                raise
             except Exception:
                 log.exception("unexpected error in WeCom send loop")
+                self._retry_later(job)
             finally:
-                self._finish(job)
+                if not handed_off:
+                    self._finish(job)
 
-    async def _send_text(self, text: str) -> None:
+    def _is_suppressed(self, job: dict) -> bool:
+        kind = job["kind"]
+        event_id = job.get("event_id", "")
+        if kind == "edit":
+            target = job.get("target", "")
+            return (
+                (bool(event_id) and self.store.superseded(event_id) == "redacted")
+                or (bool(target) and self.store.superseded(target) == "redacted")
+            )
+        return bool(event_id) and bool(self.store.superseded(event_id))
+
+    async def _send_text(self, text: str, *, job: dict | None = None) -> bool:
         await self._limiter.acquire()
+        if job is not None and self._is_suppressed(job):
+            return False
         if isinstance(self.wecom, WeComWebhookClient):
             if self.cfg.wecom.msgtype == "text":
                 await self.wecom.send_text(text)
             else:
-                await self.wecom.send_markdown(text)
+                await self.wecom.send_markdown(sanitize_wecom_markdown(text))
         else:
-            await self.wecom.send_markdown(self.cfg.wecom.chat_id, text)
+            await self.wecom.send_markdown(
+                self.cfg.wecom.chat_id, sanitize_wecom_markdown(text)
+            )
+        return True
 
-    async def _send_prepared_media(self, prepared: Prepared) -> None:
+    async def _upload_media_if_needed(self, prepared: Prepared) -> str | None:
+        if isinstance(self.wecom, WeComWebhookClient):
+            if prepared.media_type == "image":
+                return None
+            return await self.wecom.upload_file(prepared.filename, prepared.data)
+        return await self.wecom.upload_media(
+            prepared.media_type, prepared.filename, prepared.data
+        )
+
+    async def _deliver_media(self, prepared: Prepared, media_id: str | None) -> None:
         await self._limiter.acquire()
         if isinstance(self.wecom, WeComWebhookClient):
             if prepared.media_type == "image":
                 await self.wecom.send_image(prepared.data)
             else:
-                media_id = await self.wecom.upload_file(prepared.filename, prepared.data)
+                assert media_id is not None
                 await self.wecom.send_file(media_id)
         else:
-            media_id = await self.wecom.upload_media(
-                prepared.media_type, prepared.filename, prepared.data
-            )
+            assert media_id is not None
             await self.wecom.send_media(
                 self.cfg.wecom.chat_id,
                 prepared.media_type,
@@ -558,65 +631,98 @@ class Relay:
                 title=prepared.filename if prepared.media_type == "video" else None,
             )
 
-    async def _dispatch_outbound(self, job: dict) -> None:
-        kind = job["kind"]
+    async def _send_media_job(self, job: dict, prepared: Prepared) -> None:
         event_id = job.get("event_id", "")
         chat_id = self.cfg.wecom.chat_id or "webhook"
-        if kind in ("text", "edit"):
-            if kind == "text" and event_id and self.store.superseded(event_id):
+        if self._is_suppressed(job):
+            return
+        speaker = job["speaker"]
+        caption = job.get("caption") or ""
+        header = f"{speaker}: {caption}" if caption else f"{speaker} sent {prepared.filename}"
+        try:
+            # Upload media before sending the header so upload failures do not duplicate headers.
+            media_id = await self._upload_media_if_needed(prepared)
+            if self._is_suppressed(job):
                 return
+            for part in chunk_utf8(header, self._text_byte_limit):
+                if not await self._send_text(part, job=job):
+                    return
+            if self._is_suppressed(job):
+                return
+            await self._deliver_media(prepared, media_id)
+        except WeComError as exc:
+            log.warning("WeCom media send failed: %s", exc)
+            if exc.transient:
+                self._retry_later(job)
+            return
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            log.warning("network error sending media to WeCom: %s", exc)
+            self._retry_later(job)
+            return
+        if event_id:
+            self.store.record_outbound(event_id, chat_id, job["room"])
+
+    async def _finish_slow_media(self, job: dict) -> None:
+        try:
+            prepared = await job["ready"]
+            await self._send_media_job(job, prepared)
+        except asyncio.CancelledError:
+            self._retry_later(job)
+            raise
+        except Exception as exc:
+            await self._handle_media_failure(job, exc)
+        finally:
+            self._finish(job)
+
+    async def _dispatch_outbound(self, job: dict) -> bool:
+        kind = job["kind"]
+        event_id = job.get("event_id", "")
+        seq = job.get("pending")
+        if (seq is not None and seq in self._keep) or (
+            event_id and event_id in self._failed_events
+        ):
+            # An earlier part of this event failed; leave later parts for the retry pass.
+            return False
+        chat_id = self.cfg.wecom.chat_id or "webhook"
+        if kind in ("text", "edit"):
+            if self._is_suppressed(job):
+                return False
             try:
-                await self._send_text(job["text"])
+                sent_ok = await self._send_text(job["text"], job=job)
             except WeComError as exc:
                 log.warning("WeCom text send failed: %s", exc)
                 if exc.transient:
                     self._retry_later(job)
-                return
+                return False
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 log.warning("network error sending text to WeCom: %s", exc)
                 self._retry_later(job)
-                return
+                return False
+            if not sent_ok:
+                return False
             if event_id:
                 self.store.record_outbound(event_id, chat_id, job["room"])
             if kind == "edit" and job.get("final_part", True):
                 self.store.mark_edit_done(event_id, job["target"])
-            return
+            return False
 
         if kind == "media":
-            if event_id and self.store.superseded(event_id):
-                return
+            if self._is_suppressed(job):
+                return False
             ready: asyncio.Future[Prepared] = job["ready"]
             try:
                 prepared = await asyncio.wait_for(asyncio.shield(ready), timeout=MEDIA_WAIT)
             except TimeoutError:
-                log.info("media preparation exceeded %.0fs; waiting in background", MEDIA_WAIT)
-                try:
-                    prepared = await ready
-                except Exception as exc:
-                    await self._handle_media_failure(job, exc)
-                    return
+                log.info("media preparation exceeded %.0fs; finishing in background", MEDIA_WAIT)
+                task = asyncio.create_task(self._finish_slow_media(job))
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
+                return True
             except Exception as exc:
                 await self._handle_media_failure(job, exc)
-                return
-
-            speaker = job["speaker"]
-            caption = job.get("caption") or ""
-            header = f"{speaker}: {caption}" if caption else f"{speaker} sent {prepared.filename}"
-            try:
-                for part in chunk_utf8(header, self._text_byte_limit):
-                    await self._send_text(part)
-                await self._send_prepared_media(prepared)
-            except WeComError as exc:
-                log.warning("WeCom media send failed: %s", exc)
-                if exc.transient:
-                    self._retry_later(job)
-                return
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                log.warning("network error sending media to WeCom: %s", exc)
-                self._retry_later(job)
-                return
-            if event_id:
-                self.store.record_outbound(event_id, chat_id, job["room"])
+                return False
+            await self._send_media_job(job, prepared)
+        return False
 
     async def _handle_media_failure(self, job: dict, exc: Exception) -> None:
         if isinstance(exc, Unfit):
@@ -656,7 +762,7 @@ class Relay:
             self._joined.add((mxid, room_id))
         return mxid
 
-    async def on_wecom_frame(self, frame: dict) -> None:
+    async def on_wecom_frame(self, frame: dict, *, retrying: bool = False) -> None:
         if frame.get("cmd") != "aibot_msg_callback":
             return
         body = frame.get("body")
@@ -681,45 +787,104 @@ class Relay:
             return
         room_id = self._incoming_room
         if not room_id:
-            log.warning("incoming Matrix room %s not resolved yet", self.cfg.wecom.incoming)
+            log.warning("incoming Matrix room %s not resolved yet; queueing inbound callback", self.cfg.wecom.incoming)
+            if msgid:
+                self.store.enqueue_inbound(msgid, frame)
             return
         if msgid and not self.store.claim_inbound(msgid, chat_id, room_id):
             log.debug("ignoring duplicate WeCom msgid %s", msgid)
+            if retrying:
+                self.store.finish_inbound_pending(msgid)
             return
         try:
-            event_id = await self._relay_wecom_body(body, room_id, sender, chattype == "group")
-        except Exception:
+            event_id = await self._relay_wecom_body(
+                body, room_id, sender, chattype == "group", msgid=msgid
+            )
+        except Exception as exc:
             if msgid:
                 self.store.release_inbound(msgid)
+                self.store.enqueue_inbound(msgid, frame)
+            if not retrying:
+                log.warning("Matrix delivery failed for WeCom msgid %s; queued for retry: %s", msgid, exc)
+                return
             raise
-        if msgid and event_id:
-            self.store.set_inbound_event(msgid, event_id)
+        if msgid:
+            if event_id:
+                self.store.set_inbound_event(msgid, event_id)
+            self.store.finish_inbound_pending(msgid)
+
+    async def _retry_inbound_loop(self) -> None:
+        while True:
+            await asyncio.sleep(INBOUND_RETRY)
+            try:
+                await self.retry_inbound_once()
+            except Exception:
+                log.exception("cannot retry pending inbound WeCom callbacks")
+
+    async def retry_inbound_once(self) -> None:
+        items = self.store.claim_inbound_pending(
+            max_age=INBOUND_MAX_AGE,
+            max_attempts=INBOUND_ATTEMPTS,
+            busy=self._inbound_busy,
+        )
+        for msgid, frame in items:
+            self._inbound_busy.add(msgid)
+            try:
+                await self.on_wecom_frame(frame, retrying=True)
+            except Exception as exc:
+                log.warning("retry failed for WeCom msgid %s: %s", msgid, exc)
+            finally:
+                self._inbound_busy.discard(msgid)
 
     async def _relay_wecom_body(
-        self, body: dict, room_id: str, userid: str, is_group: bool
+        self,
+        body: dict,
+        room_id: str,
+        userid: str,
+        is_group: bool,
+        *,
+        msgid: str = "",
     ) -> str:
         mxid = await self._ensure_ghost(userid, room_id)
         msgtype = str(body.get("msgtype") or "")
         quote = body.get("quote") if isinstance(body.get("quote"), dict) else None
         last_event_id = ""
+        part_seq = 0
+
+        def next_txn() -> str | None:
+            nonlocal part_seq
+            if not msgid:
+                return None
+            txn = f"wecom_{msgid}_{part_seq}"
+            part_seq += 1
+            return txn
 
         if msgtype == "text":
             raw_text = str((body.get("text") or {}).get("content") or "")
             cleaned = strip_bot_mention(raw_text, self.cfg.wecom.bot_name, is_group=is_group)
             if not cleaned and not quote:
                 return ""
-            last_event_id = await self._send_matrix_text(room_id, mxid, cleaned, quote)
+            last_event_id = await self._send_matrix_text(
+                room_id, mxid, cleaned, quote, next_txn=next_txn
+            )
         elif msgtype == "voice":
             raw_text = str((body.get("voice") or {}).get("content") or "").strip()
             text = f"[voice] {raw_text}" if raw_text else "[voice]"
-            last_event_id = await self._send_matrix_text(room_id, mxid, text, quote)
+            last_event_id = await self._send_matrix_text(
+                room_id, mxid, text, quote, next_txn=next_txn
+            )
         elif msgtype in ("image", "file", "video"):
             if quote:
-                last_event_id = await self._send_matrix_text(room_id, mxid, "", quote)
+                last_event_id = await self._send_matrix_text(
+                    room_id, mxid, "", quote, next_txn=next_txn
+                )
             payload = body.get(msgtype) if isinstance(body.get(msgtype), dict) else {}
-            last_event_id = await self._relay_wecom_media(
-                room_id, mxid, msgtype, payload
-            ) or last_event_id
+            last_event_id = (
+                await self._relay_wecom_media(
+                    room_id, mxid, msgtype, payload, txn_id=next_txn()
+                )
+                or last_event_id
+            )
         elif msgtype == "mixed":
             items = (body.get("mixed") or {}).get("msg_item") or []
             pending_quote = quote
@@ -734,18 +899,20 @@ class Relay:
                     )
                     if cleaned or pending_quote:
                         last_event_id = await self._send_matrix_text(
-                            room_id, mxid, cleaned, pending_quote
+                            room_id, mxid, cleaned, pending_quote, next_txn=next_txn
                         )
                         pending_quote = None
                 elif kind == "image":
                     if pending_quote:
                         last_event_id = await self._send_matrix_text(
-                            room_id, mxid, "", pending_quote
+                            room_id, mxid, "", pending_quote, next_txn=next_txn
                         )
                         pending_quote = None
                     img = item.get("image") if isinstance(item.get("image"), dict) else {}
                     last_event_id = (
-                        await self._relay_wecom_media(room_id, mxid, "image", img)
+                        await self._relay_wecom_media(
+                            room_id, mxid, "image", img, txn_id=next_txn()
+                        )
                         or last_event_id
                     )
         else:
@@ -753,7 +920,13 @@ class Relay:
         return last_event_id
 
     async def _send_matrix_text(
-        self, room_id: str, mxid: str, text: str, quote: dict | None
+        self,
+        room_id: str,
+        mxid: str,
+        text: str,
+        quote: dict | None,
+        *,
+        next_txn=None,
     ) -> str:
         plain, formatted = render_matrix_with_quote(text, quote)
         if not plain:
@@ -765,11 +938,20 @@ class Relay:
             if index == 0 and formatted and len(parts) == 1:
                 content["format"] = "org.matrix.custom.html"
                 content["formatted_body"] = formatted
-            last_event_id = await self.matrix.send_message(room_id, mxid, content)
+            txn_id = next_txn() if next_txn else None
+            last_event_id = await self.matrix.send_message(
+                room_id, mxid, content, txn_id=txn_id
+            )
         return last_event_id
 
     async def _relay_wecom_media(
-        self, room_id: str, mxid: str, kind: str, media_payload: dict
+        self,
+        room_id: str,
+        mxid: str,
+        kind: str,
+        media_payload: dict,
+        *,
+        txn_id: str | None = None,
     ) -> str:
         url = media_payload.get("url")
         if not isinstance(url, str) or not url or not isinstance(self.wecom, WeComAIBotClient):
@@ -787,6 +969,7 @@ class Relay:
                 room_id,
                 mxid,
                 {"msgtype": "m.text", "body": f"[{kind} could not be fetched from WeCom]"},
+                txn_id=txn_id,
             )
 
         detected_mime, ext = sniff_mime(data, content_type or "application/octet-stream")
@@ -810,6 +993,7 @@ class Relay:
                 "url": mxc,
                 "info": {"mimetype": detected_mime, "size": len(data)},
             },
+            txn_id=txn_id,
         )
 
     async def inject_wecom_message(

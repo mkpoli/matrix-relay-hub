@@ -65,6 +65,8 @@ label = "main"
     cfg = load(path)
     assert cfg.wecom.mode == "webhook"
     assert cfg.wecom.can_send is True
+    assert cfg.relay_reactions is False
+    assert cfg.wecom.effective_rate_limit == 18
     assert cfg.wecom.resolved_webhook_key == "abc-123"
     assert cfg.wecom.resolved_upload_url == (
         "https://qyapi.weixin.qq.com/cgi-bin/webhook/upload_media?key=abc-123&type=file"
@@ -105,6 +107,15 @@ def test_invalid_configs_rejected(tmp_path: Path):
         ("incoming not in rooms", BASE_AIBOT.replace('incoming = "#main:example.org"', 'incoming = "#other:example.org"')),
         ("bad bot_mxid", BASE_AIBOT.replace("@wecombot:example.org", "wecombot")),
         ("duplicate label", BASE_AIBOT + '\n[[room]]\nalias = "#two:example.org"\nlabel = "main"\n'),
+        ("bad ignore regex", 'ignore_senders = ["[unclosed"]\n' + BASE_AIBOT),
+        (
+            "mismatched webhook keys",
+            BASE_AIBOT.replace(
+                'mode = "aibot"',
+                'mode = "webhook"\nwebhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=k1"\nwebhook_key = "k2"',
+            ),
+        ),
+        ("bad rate limit", BASE_AIBOT.replace('mode = "aibot"', 'mode = "aibot"\nrate_limit_per_minute = 0')),
     ]
     for name, body in cases:
         path = tmp_path / f"{name.replace(' ', '_')}.toml"

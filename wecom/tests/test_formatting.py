@@ -4,6 +4,7 @@ from wecom_bridge.formatting import (
     ghost_localpart,
     parse_content_disposition,
     render_matrix_with_quote,
+    sanitize_wecom_markdown,
     strip_bot_mention,
     strip_reply_fallback,
 )
@@ -69,3 +70,11 @@ def test_format_reaction_key_and_source_tags():
     assert source_tag("@wecombot:example.org") == "W"
     assert source_tag("@qq_123:example.org") == "Q"
     assert source_tag("@alice:example.org") == "M"
+
+
+def test_sanitize_wecom_markdown_neutralizes_mentions_and_font_tags():
+    sanitized = sanitize_wecom_markdown('hi <@all> <font color="warning">alert</font> a < b')
+    assert "<@all>" not in sanitized
+    assert "<font" not in sanitized
+    assert "</font>" not in sanitized
+    assert "a < b" in sanitized

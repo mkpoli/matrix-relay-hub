@@ -103,6 +103,7 @@ class MatrixClient:
                 "/_matrix/client/v3/register",
                 params={"kind": "user"},
                 json_body={
+                    "type": "m.login.application_service",
                     "username": localpart,
                     "displayname": displayname,
                     "inhibit_login": True,
@@ -122,11 +123,18 @@ class MatrixClient:
             json_body={"displayname": displayname},
         )
 
-    async def send_message(self, room_id: str, user_id: str, content: dict) -> str:
-        txn = uuid.uuid4().hex
+    async def send_message(
+        self,
+        room_id: str,
+        user_id: str,
+        content: dict,
+        *,
+        txn_id: str | None = None,
+    ) -> str:
+        txn = txn_id or uuid.uuid4().hex
         data = await self.request(
             "PUT",
-            f"/_matrix/client/v3/rooms/{_q(room_id)}/send/m.room.message/{txn}",
+            f"/_matrix/client/v3/rooms/{_q(room_id)}/send/m.room.message/{_q(txn)}",
             user_id=user_id,
             json_body=content,
         )
@@ -229,6 +237,7 @@ class AppService:
     async def start(self) -> None:
         app = web.Application()
         for prefix in ("/_matrix/app/v1", "/_matrix/app/r0"):
+            app.router.add_post(f"{prefix}/ping", self.ping)
             app.router.add_get(f"{prefix}/ping", self.ping)
             app.router.add_put(f"{prefix}/transactions/{{txn_id}}", self.transaction)
             app.router.add_get(f"{prefix}/users/{{user_id}}", self.user)

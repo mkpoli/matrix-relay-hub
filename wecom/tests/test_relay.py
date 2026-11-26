@@ -5,6 +5,7 @@ from pathlib import Path
 from PIL import Image
 
 from wecom_bridge.config import Config, MatrixConfig, RoomConfig, WeComConfig
+from wecom_bridge.matrix import MatrixError
 from wecom_bridge.relay import Relay
 from wecom_bridge.store import Store
 from wecom_bridge.wecom import WeComAIBotClient, WeComError, WeComWebhookClient
@@ -17,15 +18,22 @@ class FakeMatrix:
         self.events: dict[tuple[str, str], dict] = {}
         self.media_blobs: dict[str, bytes] = {}
         self.sent: list[tuple[str, str, dict]] = []
+        self.sent_txns: list[str | None] = []
         self.uploaded: list[tuple[bytes, str, str, str]] = []
         self.registered: list[tuple[str, str]] = []
         self.joined: list[tuple[str, str]] = []
         self.displaynames: list[tuple[str, str]] = []
+        self.fail_member = False
+        self.fail_join = False
+        self.fail_send = False
 
     async def resolve_alias(self, alias: str) -> str:
         return self.rooms[alias]
 
     async def join(self, room_id: str, user_id: str) -> None:
+        if self.fail_join:
+            self.fail_join = False
+            raise MatrixError(503, "unavailable")
         self.joined.append((room_id, user_id))
 
     async def is_encrypted(self, room_id: str) -> bool:
@@ -39,14 +47,23 @@ class FakeMatrix:
         self.displaynames.append((user_id, displayname))
 
     async def member(self, room_id: str, user_id: str) -> dict | None:
+        if self.fail_member:
+            self.fail_member = False
+            raise MatrixError(503, "busy")
         name = self.members.get((room_id, user_id))
         return {"displayname": name} if name else None
 
     async def event(self, room_id: str, event_id: str, user_id: str | None = None) -> dict | None:
         return self.events.get((room_id, event_id))
 
-    async def send_message(self, room_id: str, user_id: str, content: dict) -> str:
+    async def send_message(
+        self, room_id: str, user_id: str, content: dict, *, txn_id: str | None = None
+    ) -> str:
+        if self.fail_send:
+            self.fail_send = False
+            raise MatrixError(503, "homeserver down")
         self.sent.append((room_id, user_id, content))
+        self.sent_txns.append(txn_id)
         return f"$mx_{len(self.sent)}"
 
     async def upload(self, data: bytes, content_type: str, filename: str, user_id: str) -> str:
@@ -187,6 +204,10 @@ def test_bidirectional_aibot_relay(tmp_path: Path):
         matrix.members[("!dev:example.org", "@discord_42:example.org")] = "Alice"
         matrix.members[("!dev:example.org", "@bob:example.org")] = "Bob"
         matrix.events[("!dev:example.org", "$orig")] = {"sender": "@bob:example.org"}
+        matrix.events[("!dev:example.org", "$bob_msg")] = {
+            "sender": "@bob:example.org",
+            "room_id": "!dev:example.org",
+        }
         png = _png_bytes()
         matrix.media_blobs["mxc://example.org/pic"] = png
 
@@ -247,7 +268,19 @@ def test_bidirectional_aibot_relay(tmp_path: Path):
             assert wecom.uploaded == [("image", "pic.png", png)]
             assert wecom.sent_media == [("chat-1", "image", "mid-1", None)]
 
-            # 3. Matrix edit & reaction & loop prevention.
+            # 3. Matrix edit (valid author vs spoofed non-author) & reaction & loop prevention.
+            relay.incoming.put_nowait((None, {
+                "event_id": "$spoof_edit",
+                "room_id": "!dev:example.org",
+                "sender": "@discord_42:example.org",
+                "type": "m.room.message",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "* spoofed",
+                    "m.new_content": {"msgtype": "m.text", "body": "spoofed"},
+                    "m.relates_to": {"rel_type": "m.replace", "event_id": "$bob_msg"},
+                },
+            }))
             relay.incoming.put_nowait((None, {
                 "event_id": "$edit1",
                 "room_id": "!dev:example.org",
@@ -257,7 +290,7 @@ def test_bidirectional_aibot_relay(tmp_path: Path):
                     "msgtype": "m.text",
                     "body": "* fixed",
                     "m.new_content": {"msgtype": "m.text", "body": "fixed text"},
-                    "m.relates_to": {"rel_type": "m.replace", "event_id": "$e1"},
+                    "m.relates_to": {"rel_type": "m.replace", "event_id": "$bob_msg"},
                 },
             }))
             relay.incoming.put_nowait((None, {
@@ -436,6 +469,125 @@ def test_webhook_mode_outbound_relay(tmp_path: Path):
             ]
             assert wecom.images == [png]
             assert wecom.files == [("report.txt", b"report contents here", "wh-1")]
+        finally:
+            await relay.stop()
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_multipart_retry_and_inbound_retry_and_join_retry(tmp_path: Path):
+    async def scenario():
+        cfg = _make_config(tmp_path, mode="aibot")
+        store = Store(cfg.state_path)
+        matrix = FakeMatrix()
+        matrix.members[("!main:example.org", "@alice:example.org")] = "Alice"
+        matrix.fail_join = True
+        wecom = FakeAIBot(cfg.wecom)
+        relay = Relay(cfg, store, matrix, wecom)
+        await relay.start()
+        try:
+            # Failed join did not mark the room as joined, so retry succeeds.
+            assert "#main:example.org" not in relay._joined_rooms
+            await relay._resolve_room(cfg.rooms[0])
+            assert "#main:example.org" in relay._joined_rooms
+
+            # Multipart message where chunk 0 fails: chunk 1 must be skipped, and retry sends 0 then 1.
+            long_body = ("A" * 2500) + "\n" + ("B" * 2500)
+            ev = {
+                "event_id": "$long1",
+                "room_id": "!main:example.org",
+                "sender": "@alice:example.org",
+                "type": "m.room.message",
+                "content": {"msgtype": "m.text", "body": long_body},
+            }
+            wecom.fail_next_send = True
+            seqs = store.accept_transaction("t-long", [ev])
+            relay.incoming.put_nowait((seqs[0], ev))
+            await _drain(relay)
+            assert wecom.sent_markdowns == []
+            pending = store.claim_pending(max_age=3600, max_attempts=5)
+            assert len(pending) == 1
+            relay.incoming.put_nowait(pending[0])
+            await _drain(relay)
+            assert len(wecom.sent_markdowns) == 2
+            assert "A" * 100 in wecom.sent_markdowns[0][1]
+            assert "B" * 100 in wecom.sent_markdowns[1][1]
+
+            # Inbound Matrix 503 persists callback for retry with deterministic txn_id.
+            matrix.fail_send = True
+            frame = {
+                "cmd": "aibot_msg_callback",
+                "headers": {"req_id": "in-1"},
+                "body": {
+                    "msgid": "wc-retry-1",
+                    "chattype": "group",
+                    "chatid": "chat-1",
+                    "from": {"userid": "zhangsan"},
+                    "msgtype": "text",
+                    "text": {"content": "@RelayBot survives outage"},
+                },
+            }
+            await relay.on_wecom_frame(frame)
+            assert matrix.sent == []
+            await relay.retry_inbound_once()
+            assert len(matrix.sent) == 1
+            assert matrix.sent[0][2]["body"] == "survives outage"
+            assert matrix.sent_txns[0] == "wecom_wc-retry-1_0"
+        finally:
+            await relay.stop()
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_media_upload_failure_does_not_duplicate_header(tmp_path: Path):
+    async def scenario():
+        cfg = _make_config(tmp_path, mode="aibot")
+        store = Store(cfg.state_path)
+        matrix = FakeMatrix()
+        matrix.members[("!main:example.org", "@alice:example.org")] = "Alice"
+        matrix.media_blobs["mxc://example.org/pic"] = _png_bytes()
+
+        class FlakyUploadAIBot(FakeAIBot):
+            def __init__(self, c: WeComConfig) -> None:
+                super().__init__(c)
+                self.fail_upload = True
+
+            async def upload_media(self, media_type: str, filename: str, data: bytes) -> str:
+                if self.fail_upload:
+                    self.fail_upload = False
+                    raise WeComError(846616, "upload busy")
+                return await super().upload_media(media_type, filename, data)
+
+        wecom = FlakyUploadAIBot(cfg.wecom)
+        relay = Relay(cfg, store, matrix, wecom)
+        await relay.start()
+        try:
+            ev = {
+                "event_id": "$m1",
+                "room_id": "!main:example.org",
+                "sender": "@alice:example.org",
+                "type": "m.room.message",
+                "content": {
+                    "msgtype": "m.image",
+                    "body": "cat.png",
+                    "filename": "cat.png",
+                    "url": "mxc://example.org/pic",
+                    "info": {"mimetype": "image/png"},
+                },
+            }
+            seqs = store.accept_transaction("t-m1", [ev])
+            relay.incoming.put_nowait((seqs[0], ev))
+            await _drain(relay)
+            # Upload failed before header, so zero headers were sent.
+            assert wecom.sent_markdowns == []
+            pending = store.claim_pending(max_age=3600, max_attempts=5)
+            assert len(pending) == 1
+            relay.incoming.put_nowait(pending[0])
+            await _drain(relay)
+            assert wecom.sent_markdowns == [("chat-1", "[M] Alice sent cat.png")]
+            assert len(wecom.sent_media) == 1
         finally:
             await relay.stop()
             store.close()

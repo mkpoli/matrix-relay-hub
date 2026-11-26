@@ -2,7 +2,8 @@ import base64
 
 import pytest
 
-from wecom_bridge.crypto import DecryptError, decrypt_file, encrypt_file
+from helpers import encrypt_file
+from wecom_bridge.crypto import DecryptError, decrypt_file
 
 
 def _make_key(raw: bytes = bytes(range(32)), *, strip_pad: bool = True) -> str:

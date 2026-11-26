@@ -3777,3 +3777,184 @@ def test_qq_forwarded_record_handles_relative_redirect_html_rejection_and_failur
         for msg in relay.matrix.sent
     )
     store.close()
+
+
+def test_qq_ghost_syncs_and_caches_member_avatar_without_overwriting_with_default(tmp_path):
+    class FakeContent:
+        def __init__(self, body: bytes):
+            self._body = body
+
+        async def iter_chunked(self, size: int):
+            yield self._body
+
+    class FakeResp:
+        def __init__(self, status: int, body: bytes, content_type: str = "image/jpeg"):
+            self.status = status
+            self.content = FakeContent(body)
+            self.content_length = len(body)
+            self.headers = {"content-type": content_type}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class AvatarSession:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        def get(self, url, **kwargs):
+            self.calls.append(url)
+            if "fail" in url:
+                return FakeResp(500, b"err", "text/plain")
+            return FakeResp(200, b"\x89PNG\r\n\x1a\navatar", "image/png")
+
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay._incoming = ROOM
+    relay._avatar = "mxc://example.org/default-qq"
+    session = AvatarSession()
+    relay.matrix.session = session
+    uploaded: list[tuple[str, str, str]] = []
+    avatars_set: list[tuple[str, str]] = []
+
+    async def fake_upload(data, content_type, filename, user_id):
+        uploaded.append((content_type, filename, user_id))
+        return f"mxc://example.org/av-{len(uploaded)}"
+
+    async def fake_set_avatar(user_id, mxc):
+        avatars_set.append((user_id, mxc))
+
+    relay.matrix.upload = fake_upload
+    relay.matrix.set_avatar = fake_set_avatar
+
+    async def go():
+        await relay.on_qq_event(
+            "GROUP_MESSAGE_CREATE",
+            {
+                "id": "AV-1",
+                "group_openid": "G",
+                "author": {
+                    "member_openid": "U1",
+                    "username": "Alice",
+                    "avatar": "https://thirdqq.qlogo.cn/g?b=oidb&k=1&t=111",
+                },
+                "content": "first",
+            },
+        )
+        # Same avatar URL with a different volatile `t=` param hits cache (no second HTTP GET).
+        await relay.on_qq_event(
+            "GROUP_MESSAGE_CREATE",
+            {
+                "id": "AV-2",
+                "group_openid": "G",
+                "author": {
+                    "member_openid": "U1",
+                    "username": "Alice",
+                    "avatar": "https://thirdqq.qlogo.cn/g?b=oidb&k=1&t=222",
+                },
+                "content": "second",
+            },
+        )
+        # Later message without avatar field must keep the cached real avatar (never revert to qq.png).
+        await relay.on_qq_event(
+            "GROUP_MESSAGE_CREATE",
+            {
+                "id": "AV-3",
+                "group_openid": "G",
+                "author": {"member_openid": "U1", "username": "Alice"},
+                "content": "third",
+            },
+        )
+        # Untrusted avatar falls back to default qq.png.
+        await relay.on_qq_event(
+            "GROUP_MESSAGE_CREATE",
+            {
+                "id": "AV-4",
+                "group_openid": "G",
+                "author": {
+                    "member_openid": "U2",
+                    "username": "Bob",
+                    "avatar": "https://127.0.0.1/evil.png",
+                },
+                "content": "hi",
+            },
+        )
+
+    asyncio.run(go())
+    assert len(session.calls) == 1
+    assert uploaded == [("image/png", "avatar.png", "@qq_u1:example.org")]
+    assert avatars_set == [
+        ("@qq_u1:example.org", "mxc://example.org/av-1"),
+        ("@qq_u2:example.org", "mxc://example.org/default-qq"),
+    ]
+
+    # Replayed old message ID must not revert or re-fetch avatar.
+    await_replay = relay.on_qq_event(
+        "GROUP_MESSAGE_CREATE",
+        {
+            "id": "AV-1",
+            "group_openid": "G",
+            "author": {
+                "member_openid": "U1",
+                "username": "Alice",
+                "avatar": "https://thirdqq.qlogo.cn/g?b=oidb&k=old",
+            },
+            "content": "first",
+        },
+    )
+    asyncio.run(await_replay)
+    assert len(session.calls) == 1
+
+    # Expired TTL revalidates the same URL, while failing fetches back off instead of retrying every event.
+    store.conn.execute("UPDATE member_avatars SET updated = 0 WHERE member_openid = 'U1'")
+    asyncio.run(
+        relay.on_qq_event(
+            "GROUP_MESSAGE_CREATE",
+            {
+                "id": "AV-5",
+                "group_openid": "G",
+                "author": {
+                    "member_openid": "U1",
+                    "username": "Alice",
+                    "avatar": "https://thirdqq.qlogo.cn/g?b=oidb&k=1&t=333",
+                },
+                "content": "refresh",
+            },
+        )
+    )
+    assert len(session.calls) == 2
+
+    asyncio.run(
+        relay.on_qq_event(
+            "GROUP_MESSAGE_CREATE",
+            {
+                "id": "AV-6",
+                "group_openid": "G",
+                "author": {
+                    "member_openid": "U3",
+                    "username": "Carol",
+                    "avatar": "https://thirdqq.qlogo.cn/fail",
+                },
+                "content": "f1",
+            },
+        )
+    )
+    asyncio.run(
+        relay.on_qq_event(
+            "GROUP_MESSAGE_CREATE",
+            {
+                "id": "AV-7",
+                "group_openid": "G",
+                "author": {
+                    "member_openid": "U3",
+                    "username": "Carol",
+                    "avatar": "https://thirdqq.qlogo.cn/fail",
+                },
+                "content": "f2",
+            },
+        )
+    )
+    assert session.calls.count("https://thirdqq.qlogo.cn/fail") == 1
+    store.close()

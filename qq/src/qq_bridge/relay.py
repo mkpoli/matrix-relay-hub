@@ -24,6 +24,7 @@ from .formatting import (
     extract_face_ids,
     extract_forwarded_attachments,
     format_reaction_key,
+    is_trusted_qq_avatar_url,
     is_trusted_qq_media_url,
     normalize_media_url_key,
     render_qq_text,
@@ -40,6 +41,9 @@ from .store import Store
 log = logging.getLogger(__name__)
 
 MAX_MEDIA_DOWNLOAD = 40 * 1024 * 1024
+MAX_AVATAR_DOWNLOAD = 2 * 1024 * 1024
+AVATAR_TTL = 86_400
+AVATAR_RETRY_BACKOFF = 300.0
 # Matrix media held in memory for shrinking; the homeserver takes 50 MB uploads.
 MAX_MATRIX_MEDIA = 64 * 1024 * 1024
 # Discord, which every public room is bridged to, refuses a longer message and posts an error
@@ -295,7 +299,8 @@ class Relay:
         self._tagged = len(cfg.rooms) > 1
         self._ghosts: dict[str, str] = {}
         self._avatar: str | None = None
-        self._avatars: set[str] = set()
+        self._avatars: dict[str, str] = {}
+        self._avatar_backoff: dict[tuple[str, str], float] = {}
         self._last_sent_event: str | None = None
         self._joined: set[tuple[str, str]] = set()
         self._names: dict[tuple[str, str], tuple[str, float]] = {}
@@ -1758,11 +1763,12 @@ class Relay:
                 self.cfg.qq.incoming,
             )
             return
-        ghost = await self._ghost(group, room_id, member_id, name)
         qq_id = str(data.get("id") or "")
         if qq_id and self.store.event_for_qq(qq_id):
             log.debug("dropping redelivered QQ message %s", qq_id)
             return
+        avatar_url = author.get("avatar") if isinstance(author.get("avatar"), str) else None
+        ghost = await self._ghost(group, room_id, member_id, name, avatar_url=avatar_url)
         ref_idx = self._scene_index(data, "msg_idx")
         reply_to = next(
             (
@@ -2096,8 +2102,90 @@ class Relay:
             return mxc
         return None
 
+    async def _fetch_member_avatar(
+        self, mxid: str, member_id: str, avatar_url: str
+    ) -> tuple[str, str, bool] | None:
+        """Return `(avatar_key, mxc, fresh)` for a trusted QQ avatar URL, or None."""
+        if not is_trusted_qq_avatar_url(avatar_url):
+            return None
+        avatar_key = normalize_media_url_key(avatar_url)
+        cached = self.store.member_avatar(member_id)
+        now = time.time()
+        if cached and cached[0] == avatar_key and (now - cached[2]) < AVATAR_TTL:
+            return avatar_key, cached[1], False
+        backoff_key = (member_id, avatar_key)
+        if self._avatar_backoff.get(backoff_key, 0.0) > time.monotonic():
+            return None
+        current_url = avatar_url
+        data = b""
+        content_type = ""
+        for _hop in range(3):
+            if not is_trusted_qq_avatar_url(current_url):
+                self._avatar_backoff[backoff_key] = time.monotonic() + AVATAR_RETRY_BACKOFF
+                return None
+            try:
+                async with self.matrix.session.get(
+                    current_url,
+                    allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as response:
+                    if response.status in (301, 302, 303, 307, 308):
+                        location = response.headers.get("location") or ""
+                        resolved = urljoin(current_url, location) if location else ""
+                        if not resolved or not is_trusted_qq_avatar_url(resolved):
+                            self._avatar_backoff[backoff_key] = time.monotonic() + AVATAR_RETRY_BACKOFF
+                            return None
+                        current_url = resolved
+                        continue
+                    if response.status >= 400:
+                        self._avatar_backoff[backoff_key] = time.monotonic() + AVATAR_RETRY_BACKOFF
+                        return None
+                    content_type = (
+                        (response.headers.get("content-type") or "")
+                        .split(";", 1)[0]
+                        .strip()
+                        .lower()
+                    )
+                    if not content_type.startswith("image/"):
+                        self._avatar_backoff[backoff_key] = time.monotonic() + AVATAR_RETRY_BACKOFF
+                        return None
+                    if hasattr(response, "content"):
+                        data = await _read_capped(response, MAX_AVATAR_DOWNLOAD)
+                    else:
+                        data = await response.read()
+                    break
+            except Exception as exc:
+                log.debug("cannot download QQ avatar for %s: %s", member_id, exc)
+                self._avatar_backoff[backoff_key] = time.monotonic() + AVATAR_RETRY_BACKOFF
+                return None
+        else:
+            self._avatar_backoff[backoff_key] = time.monotonic() + AVATAR_RETRY_BACKOFF
+            return None
+        if not data or len(data) > MAX_AVATAR_DOWNLOAD:
+            self._avatar_backoff[backoff_key] = time.monotonic() + AVATAR_RETRY_BACKOFF
+            return None
+        ext = {
+            "image/png": ".png",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+        }.get(content_type, ".jpg")
+        try:
+            mxc = await self.matrix.upload(data, content_type, f"avatar{ext}", mxid)
+        except Exception as exc:
+            log.debug("cannot upload QQ avatar for %s: %s", mxid, exc)
+            self._avatar_backoff[backoff_key] = time.monotonic() + AVATAR_RETRY_BACKOFF
+            return None
+        self._avatar_backoff.pop(backoff_key, None)
+        return avatar_key, mxc, True
+
     async def _ghost(
-        self, group: str, room_id: str, member_id: str, name: str
+        self,
+        group: str,
+        room_id: str,
+        member_id: str,
+        name: str,
+        *,
+        avatar_url: str | None = None,
     ) -> str:
         localpart = f"qq_{str(member_id).lower()}"
         mxid = f"@{localpart}:{self.domain}"
@@ -2118,12 +2206,39 @@ class Relay:
             except Exception:
                 pass
             self._ghosts[mxid] = name
-        if self._avatar and mxid not in self._avatars:
-            try:
-                await self.matrix.set_avatar(mxid, self._avatar)
-                self._avatars.add(mxid)
-            except Exception as exc:
-                log.debug("cannot set avatar for %s: %s", mxid, exc)
+        fetched = (
+            await self._fetch_member_avatar(mxid, str(member_id), avatar_url)
+            if avatar_url
+            else None
+        )
+        applied = False
+        if fetched:
+            avatar_key, mxc, fresh = fetched
+            if self._avatars.get(mxid) == mxc:
+                if fresh:
+                    self.store.set_member_avatar(str(member_id), avatar_key, mxc)
+                applied = True
+            else:
+                try:
+                    await self.matrix.set_avatar(mxid, mxc)
+                    self._avatars[mxid] = mxc
+                    if fresh:
+                        self.store.set_member_avatar(str(member_id), avatar_key, mxc)
+                    applied = True
+                except Exception as exc:
+                    log.debug("cannot set avatar for %s: %s", mxid, exc)
+                    self._avatar_backoff[(str(member_id), avatar_key)] = (
+                        time.monotonic() + AVATAR_RETRY_BACKOFF
+                    )
+        if not applied:
+            cached = self.store.member_avatar(str(member_id))
+            fallback = cached[1] if cached else (self._avatar if mxid not in self._avatars else None)
+            if fallback and self._avatars.get(mxid) != fallback:
+                try:
+                    await self.matrix.set_avatar(mxid, fallback)
+                    self._avatars[mxid] = fallback
+                except Exception as exc:
+                    log.debug("cannot set avatar for %s: %s", mxid, exc)
         key = (mxid, room_id)
         if key not in self._joined:
             try:

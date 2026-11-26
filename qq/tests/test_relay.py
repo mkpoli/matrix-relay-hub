@@ -3777,3 +3777,76 @@ def test_qq_forwarded_record_handles_relative_redirect_html_rejection_and_failur
         for msg in relay.matrix.sent
     )
     store.close()
+
+
+def test_qq_voice_prefers_wav_url_and_attaches_asr_transcript_caption(tmp_path):
+    class FakeContent:
+        def __init__(self, body: bytes):
+            self._body = body
+
+        async def iter_chunked(self, size: int):
+            yield self._body
+
+    class FakeResp:
+        def __init__(self, body: bytes, content_type: str = "audio/wav"):
+            self.status = 200
+            self.content = FakeContent(body)
+            self.content_length = len(body)
+            self.headers = {"content-type": content_type}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class VoiceSession:
+        def __init__(self):
+            self.urls: list[str] = []
+
+        def get(self, url, **kwargs):
+            self.urls.append(url)
+            return FakeResp(b"RIFF\x00\x00\x00\x00WAVEfmt ")
+
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay._incoming = ROOM
+    session = VoiceSession()
+    relay.matrix.session = session
+    uploaded: list[tuple[str, str]] = []
+
+    async def fake_upload(data, content_type, filename, user_id):
+        uploaded.append((content_type, filename))
+        return f"mxc://example.org/v-{len(uploaded)}"
+
+    relay.matrix.upload = fake_upload
+    asyncio.run(
+        relay.on_qq_event(
+            "GROUP_MESSAGE_CREATE",
+            {
+                "id": "VOICE-1",
+                "group_openid": "G",
+                "author": {"member_openid": "U1", "username": "Alice"},
+                "content": "",
+                "attachments": [
+                    {
+                        "content_type": "voice",
+                        "filename": "note.silk",
+                        "url": "https://multimedia.nt.qq.com.cn/raw.silk",
+                        "voice_wav_url": "https://multimedia.nt.qq.com.cn/converted.wav",
+                        "asr_refer_text": "你好世界",
+                    }
+                ],
+            },
+        )
+    )
+    assert session.urls == ["https://multimedia.nt.qq.com.cn/converted.wav"]
+    assert uploaded == [("audio/wav", "note.wav")]
+    assert len(relay.matrix.sent) == 1
+    payload = relay.matrix.sent[0][2]
+    assert payload["msgtype"] == "m.audio"
+    assert payload["body"] == "你好世界"
+    assert payload["filename"] == "note.wav"
+    assert payload["info"]["mimetype"] == "audio/wav"
+    assert "org.matrix.msc3245.voice" in payload
+    store.close()

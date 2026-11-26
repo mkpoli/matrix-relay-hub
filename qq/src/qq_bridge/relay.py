@@ -2142,12 +2142,18 @@ class Relay:
         reply_to: str | None = None,
         timeout: float | None = None,
     ) -> str | None:
-        url = attachment.get("url") or attachment.get("voice_wav_url")
+        content_type = str(attachment.get("content_type") or "")
+        used_voice_wav = False
+        if content_type == "voice" and attachment.get("voice_wav_url"):
+            url = attachment["voice_wav_url"]
+            content_type = "audio/wav"
+            used_voice_wav = True
+        else:
+            url = attachment.get("url") or attachment.get("voice_wav_url")
+            if content_type == "voice":
+                content_type = "audio/wav" if attachment.get("voice_wav_url") else "audio/silk"
         if not url:
             return None
-        content_type = str(attachment.get("content_type") or "")
-        if content_type == "voice":
-            content_type = "audio/wav" if attachment.get("voice_wav_url") else "audio/silk"
         if not content_type:
             content_type = "application/octet-stream"
         trusted_only = bool(attachment.get("trusted_qq_media"))
@@ -2202,6 +2208,8 @@ class Relay:
         ):
             content_type = resp_content_type
         filename = str(attachment.get("filename") or "file")
+        if used_voice_wav and filename.lower().endswith((".silk", ".amr")):
+            filename = filename.rsplit(".", 1)[0] + ".wav"
         mxc = await self.matrix.upload(data, content_type, filename, ghost)
         if content_type.startswith("image/"):
             msgtype = "m.image"
@@ -2216,15 +2224,22 @@ class Relay:
             info["w"] = int(attachment["width"])
         if attachment.get("height"):
             info["h"] = int(attachment["height"])
+        asr_text = (
+            str(attachment.get("asr_refer_text") or "").strip()
+            if msgtype == "m.audio"
+            else ""
+        )
         payload: dict = {
             "msgtype": msgtype,
-            "body": filename,
+            "body": asr_text or filename,
             "url": mxc,
             "info": info,
         }
+        if asr_text and asr_text != filename:
+            payload["filename"] = filename
         if reply_to:
             payload["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_to}}
-        if msgtype == "m.audio" and attachment.get("voice_wav_url"):
+        if msgtype == "m.audio" and (used_voice_wav or attachment.get("voice_wav_url")):
             payload["org.matrix.msc3245.voice"] = {}
         return await self.matrix.send_message(room_id, ghost, payload)
 

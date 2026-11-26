@@ -520,3 +520,14 @@ def test_qq_forwarded_chat_record_deduplicates_volatile_rkey_attachments_and_str
     )
     assert len(extract_forwarded_attachments(many)) == 16
     assert "[图片: 17.jpg]" in render_qq_text(many, [], "example.org")[0]
+
+
+def test_trusted_qq_avatar_url_allowlist():
+    from qq_bridge.formatting import is_trusted_qq_avatar_url
+
+    assert is_trusted_qq_avatar_url("https://thirdqq.qlogo.cn/g?b=oidb&k=abc&s=100")
+    assert is_trusted_qq_avatar_url("https://q.qlogo.cn/qqapp/123/ABC/100")
+    assert is_trusted_qq_avatar_url("https://multimedia.nt.qq.com.cn/download?fileid=1")
+    assert not is_trusted_qq_avatar_url("http://thirdqq.qlogo.cn/g?b=oidb")
+    assert not is_trusted_qq_avatar_url("https://127.0.0.1/avatar.jpg")
+    assert not is_trusted_qq_avatar_url("https://evil.example.com/qlogo.cn/a.jpg")

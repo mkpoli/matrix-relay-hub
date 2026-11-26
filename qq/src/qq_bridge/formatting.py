@@ -148,6 +148,13 @@ _TRUSTED_QQ_MEDIA_DOMAINS = (
     "nt.qq.com",
     "qpic.cn",
 )
+_TRUSTED_QQ_AVATAR_DOMAINS = (
+    "qlogo.cn",
+    "gtimg.cn",
+    "qpic.cn",
+    "nt.qq.com.cn",
+    "nt.qq.com",
+)
 _VOLATILE_URL_PARAMS = frozenset({"rkey", "sig", "token", "auth_token", "t", "ts"})
 MAX_FORWARDED_ATTACHMENTS = 16
 
@@ -162,8 +169,7 @@ class ForwardedAttachment:
     height: int | None = None
 
 
-def is_trusted_qq_media_url(url: str) -> bool:
-    """Return True only for HTTPS URLs hosted on Tencent QQ's media domains."""
+def _is_trusted_https_domain(url: str, domains: tuple[str, ...]) -> bool:
     try:
         parsed = urlparse(url)
         port = parsed.port
@@ -176,10 +182,17 @@ def is_trusted_qq_media_url(url: str) -> bool:
     host = (parsed.hostname or "").lower().rstrip(".")
     if not host:
         return False
-    return any(
-        host == domain or host.endswith("." + domain)
-        for domain in _TRUSTED_QQ_MEDIA_DOMAINS
-    )
+    return any(host == domain or host.endswith("." + domain) for domain in domains)
+
+
+def is_trusted_qq_media_url(url: str) -> bool:
+    """Return True only for HTTPS URLs hosted on Tencent QQ's media domains."""
+    return _is_trusted_https_domain(url, _TRUSTED_QQ_MEDIA_DOMAINS)
+
+
+def is_trusted_qq_avatar_url(url: str) -> bool:
+    """Return True only for HTTPS URLs hosted on Tencent QQ's avatar/media domains."""
+    return _is_trusted_https_domain(url, _TRUSTED_QQ_AVATAR_DOMAINS)
 
 
 def normalize_media_url_key(url: str) -> str:

@@ -29,6 +29,12 @@ kind = "qq"
 namespace = "qq.example.invalid"
 config_ref = "secret://example/qq"
 
+[[plugins]]
+id = "example-wecom"
+kind = "wecom"
+namespace = "wecom.example.invalid"
+config_ref = "secret://example/wecom"
+
 [[communities]]
 id = "example-garden"
 room_id = "!example-garden:example.invalid" # Explicit and unique Matrix room ID.
@@ -52,3 +58,7 @@ remote_id = "example-irc-channel"
 [[communities.endpoints]]
 plugin = "example-qq"
 remote_id = "example-qq-group"
+
+[[communities.endpoints]]
+plugin = "example-wecom"
+remote_id = "example-wecom-chat"

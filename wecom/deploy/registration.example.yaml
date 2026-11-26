@@ -1,0 +1,16 @@
+id: wecom
+# The homeserver reaches the bridge at this address. Change it when the
+# network alias differs.
+url: http://matrix-relay-wecom:29336
+as_token: CHANGE
+hs_token: CHANGE
+sender_localpart: wecombot
+rate_limited: false
+namespaces:
+  users:
+    - regex: "^@wecombot:example\\.org$"
+      exclusive: true
+    - regex: "^@wecom_.*:example\\.org$"
+      exclusive: true
+  aliases: []
+  rooms: []

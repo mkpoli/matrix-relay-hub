@@ -2,7 +2,7 @@
 
 Each profile runs one bridge on an existing Docker network shared with an external Matrix homeserver. The homeserver must support application services, and its administrator must register each bridge. The scaffold publishes no ports and does not manage the homeserver or network. The IRC image is amd64-only.
 
-Discord, Telegram and IRC use pinned images. QQ uses a small image built from an existing QQ bridge checkout through an optional overlay.
+Discord, Telegram and IRC use pinned images. QQ and WeCom use small images built from the repository through optional overlays.
 
 ## Prepare
 
@@ -27,6 +27,7 @@ Use the version-specific configuration references and setup guides:
 - Telegram v26.10: [sample configuration](https://docs.mau.fi/configs/mautrix-telegram/v26.10.html), [authentication](https://docs.mau.fi/bridges/go/telegram/authentication.html).
 - IRC 4.0.1: [sample configuration](https://github.com/matrix-org/matrix-appservice-irc/blob/4.0.1/config.sample.yaml), [bridge setup](https://github.com/matrix-org/matrix-appservice-irc/blob/4.0.1/docs/bridge_setup.md), [image startup script](https://github.com/matrix-org/matrix-appservice-irc/blob/4.0.1/docker/start.sh). The image expects `/data/config.yaml` and `/data/appservice-registration-irc.yaml`.
 - QQ: an existing bridge checkout containing `src/qq_bridge/`, configured below.
+- WeCom: the in-repo bridge under `wecom/`, configured below.
 
 For Discord and Telegram, follow the [mautrix Docker setup](https://docs.mau.fi/bridges/general/docker-setup.html) for initialization and registration generation. Initial startup may create config files and generate tokens. Replace the generated `example.com` domain and set the homeserver address before the next run; the images exit 0 even when registration generation fails for missing settings, so check that `registration.yaml` exists before registering the bridge. The profiles do not automatically restart; configure a restart policy only after initialization and registration are complete. Review the version's config before connecting to real rooms; do not print or commit configuration, tokens or registration files. IRC requires a configured registration file as described in its setup guide. Follow the relevant guide for credentials, storage, permissions and relay settings. Put file-based databases, keys and other persistent files under `/data`, or use a separately managed persistent database dedicated to that bridge.
 
@@ -45,7 +46,7 @@ docker run --rm --network none --user "$(id -u):$(id -g)" -v "$IRC_DATA_DIR:/dat
 
 `-u` is the address the homeserver uses to reach the bridge. The bot localpart defaults to `appservice-irc`; `-l <localpart>` changes it.
 
-Configure the homeserver URL as reachable from the bridge, and the appservice URL as reachable from the homeserver over the shared network. `localhost` inside a container refers to that container. Use the configured internal port and a unique network alias for each appservice URL. Defaults are `matrix-relay-discord`, `matrix-relay-telegram`, `matrix-relay-irc` and `matrix-relay-qq`; set `DISCORD_NETWORK_ALIAS`, `TELEGRAM_NETWORK_ALIAS`, `IRC_NETWORK_ALIAS` or `QQ_NETWORK_ALIAS` to change them. Docker does not enforce alias uniqueness, so check the shared network for collisions. Ensure appservice IDs and namespaces do not collide. Give the registration file to the homeserver administrator through a secure channel and follow [appservice registration](https://docs.mau.fi/bridges/general/registering-appservices.html). Synapse needs access to the file inside its container and a restart after registration changes. Follow your homeserver's own restart or reload procedure; update both sides when registration-related settings change.
+Configure the homeserver URL as reachable from the bridge, and the appservice URL as reachable from the homeserver over the shared network. `localhost` inside a container refers to that container. Use the configured internal port and a unique network alias for each appservice URL. Defaults are `matrix-relay-discord`, `matrix-relay-telegram`, `matrix-relay-irc`, `matrix-relay-qq` and `matrix-relay-wecom`; set `DISCORD_NETWORK_ALIAS`, `TELEGRAM_NETWORK_ALIAS`, `IRC_NETWORK_ALIAS`, `QQ_NETWORK_ALIAS` or `WECOM_NETWORK_ALIAS` to change them. Docker does not enforce alias uniqueness, so check the shared network for collisions. Ensure appservice IDs and namespaces do not collide. Give the registration file to the homeserver administrator through a secure channel and follow [appservice registration](https://docs.mau.fi/bridges/general/registering-appservices.html). Synapse needs access to the file inside its container and a restart after registration changes. Follow your homeserver's own restart or reload procedure; update both sides when registration-related settings change.
 
 ### QQ (official bot)
 
@@ -69,6 +70,24 @@ The bot must be added to the QQ group with message receiving and active posting 
 
 X/Twitter status links are rewritten to FixupX and expanded into the post's text and media through the FixTweet API, so the group can read them where the QQ client cannot open x.com. GIFs arrive as X's MP4 versions. Set `enabled = false` in the `[twitter]` table to relay the links unchanged.
 
+### WeCom (AI Bot WebSocket or Group Robot Webhook)
+
+The bridge source is in `wecom/`. Build its image from the repository root:
+
+```sh
+docker build -f deploy/wecom/Dockerfile -t matrix-relay-hub/wecom-bridge:local .
+```
+
+Create its data directory and set the host user that owns it:
+
+```sh
+install -d -m 700 "$HOME/matrix-bridge-data/wecom"
+export WECOM_DATA_DIR="$HOME/matrix-bridge-data/wecom"
+export WECOM_UID="$(id -u)" WECOM_GID="$(id -g)"
+```
+
+Copy `wecom/deploy/config.example.toml` to `$WECOM_DATA_DIR/config.toml` and choose `mode = "aibot"` (bidirectional AI Bot WebSocket over `wss://openws.work.weixin.qq.com`) or `mode = "webhook"` (outbound-only Group Robot Webhook). In `aibot` mode, you can run `python -m wecom_bridge discover --config /data/config.toml` and `@`-mention the bot once in the target internal group to print its `chat_id`. Copy `wecom/deploy/registration.example.yaml` to `$WECOM_DATA_DIR/registration.yaml`, replace the tokens and domain, and keep `url: http://matrix-relay-wecom:29336` unless you change `WECOM_NETWORK_ALIAS`. The bridge does not support encrypted Matrix rooms, external WeChat customer groups, or message recall.
+
 ## Operate
 
 From the repository root, after configuration and registration, select any combination of profiles:
@@ -77,6 +96,7 @@ From the repository root, after configuration and registration, select any combi
 docker compose -f deploy/compose.yaml --profile discord up -d
 docker compose -f deploy/compose.yaml --profile telegram --profile irc up -d
 docker compose -f deploy/compose.yaml -f deploy/compose.qq.yaml --profile qq up -d
+docker compose -f deploy/compose.yaml -f deploy/compose.wecom.yaml --profile wecom up -d
 ```
 
 Each command affects the selected services; include all desired profiles when reconciling the full set. After starting a bridge, check its state, then verify registration, authentication and message delivery using the [integration checks](../docs/verification.md). Compose process status alone does not establish bridge readiness. For example:
@@ -106,11 +126,15 @@ These commands only render and validate Compose configuration; they do not requi
   export QQ_DATA_DIR=/tmp/matrix-bridge-test/qq
   export QQ_UID=1000
   export QQ_GID=1000
+  export WECOM_DATA_DIR=/tmp/matrix-bridge-test/wecom
+  export WECOM_UID=1000
+  export WECOM_GID=1000
   for profile in discord telegram irc; do
     docker compose -f deploy/compose.yaml --profile "$profile" config --quiet || exit
   done
   docker compose -f deploy/compose.yaml --profile discord --profile telegram --profile irc config --quiet && \
-    docker compose -f deploy/compose.yaml -f deploy/compose.qq.yaml --profile qq config --quiet
+    docker compose -f deploy/compose.yaml -f deploy/compose.qq.yaml --profile qq config --quiet && \
+    docker compose -f deploy/compose.yaml -f deploy/compose.wecom.yaml --profile wecom config --quiet
 )
 ```
 

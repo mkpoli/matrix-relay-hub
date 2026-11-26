@@ -68,12 +68,19 @@ def sweep_temp() -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
 def _is_animated(data: bytes) -> bool:
     try:
         with Image.open(io.BytesIO(data)) as image:
             return bool(getattr(image, "is_animated", False))
-    except (UnidentifiedImageError, OSError, Image.DecompressionBombError):
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError, ValueError):
         return False
+
+
+def _is_apng(data: bytes) -> bool:
+    return data.startswith(PNG_SIGNATURE) and _is_animated(data)
 
 
 def fit_image(data: bytes, limit: int = TARGET) -> bytes:
@@ -246,6 +253,7 @@ def fit_gif(data: bytes, limit: int = TARGET) -> bytes:
             if image.width * image.height > MAX_PIXELS:
                 raise Unfit(TOO_LARGE)
             loop = image.info.get("loop")
+            src_format = image.format
             skip_poster = bool(image.info.get("default_image"))
             raw_frames: list[Image.Image] = []
             durations: list[int] = []
@@ -272,7 +280,17 @@ def fit_gif(data: bytes, limit: int = TARGET) -> bytes:
         "optimize": False,
     }
     if loop is not None:
-        save_kwargs["loop"] = int(loop)
+        loop_count = int(loop)
+        if src_format == "PNG":
+            # APNG counts total plays (0 = infinite, 1 = once, N = N plays),
+            # whereas GIF counts repeats after the first play (0 = infinite,
+            # omitted = once, N-1 = N plays).
+            if loop_count == 0:
+                save_kwargs["loop"] = 0
+            elif loop_count > 1:
+                save_kwargs["loop"] = loop_count - 1
+        else:
+            save_kwargs["loop"] = loop_count
     try:
         for side in GIF_SIDES:
             palette_frames: list[Image.Image] = []
@@ -286,6 +304,7 @@ def fit_gif(data: bytes, limit: int = TARGET) -> bytes:
                 quantized.paste(
                     255, mask=alpha.point(lambda value: 255 if value < 128 else 0)
                 )
+                quantized.info.pop("loop", None)
                 palette_frames.append(quantized)
             out = io.BytesIO()
             palette_frames[0].save(
@@ -302,20 +321,35 @@ def fit_gif(data: bytes, limit: int = TARGET) -> bytes:
     raise Unfit(TOO_LARGE)
 
 
-async def _fit_animation(data: bytes, filename: str, limit: int) -> Prepared:
+async def _fit_animation(
+    data: bytes,
+    filename: str,
+    limit: int,
+    *,
+    prefer_gif: bool = False,
+    allow_gif: bool = True,
+) -> Prepared:
+    if prefer_gif and allow_gif:
+        try:
+            gif = await asyncio.to_thread(fit_gif, data, limit)
+            return Prepared(gif, _renamed(filename, ".gif"), QQ_IMAGE)
+        except Unfit:
+            pass
     try:
         video = await fit_video(data, limit)
         return Prepared(video, _renamed(filename, ".mp4"), QQ_VIDEO)
     except Unfit:
         pass
-    try:
-        # ffmpeg < 8.0 cannot decode animated WebP; convert to GIF to keep animation.
-        gif = await asyncio.to_thread(fit_gif, data, limit)
-        return Prepared(gif, _renamed(filename, ".gif"), QQ_IMAGE)
-    except Unfit:
-        log.info("sending the first frame of %s instead", filename)
-        image = await asyncio.to_thread(fit_image, data, limit)
-        return Prepared(image, _renamed(filename, ".jpg"), QQ_IMAGE)
+    if not prefer_gif and allow_gif:
+        try:
+            # ffmpeg < 8.0 cannot decode animated WebP; convert to GIF to keep animation.
+            gif = await asyncio.to_thread(fit_gif, data, limit)
+            return Prepared(gif, _renamed(filename, ".gif"), QQ_IMAGE)
+        except Unfit:
+            pass
+    log.info("sending the first frame of %s instead", filename)
+    image = await asyncio.to_thread(fit_image, data, limit)
+    return Prepared(image, _renamed(filename, ".jpg"), QQ_IMAGE)
 
 
 async def prepare(
@@ -333,6 +367,13 @@ async def prepare(
     """
     file_type = QQ_FILE_TYPES.get(msgtype, QQ_FILE)
     if file_type == QQ_IMAGE:
+        # QQ displays APNG as a static image or rejects it; convert to animated GIF so
+        # stickers keep transparency and loop inline. When `force` is set after QQ
+        # refused the GIF, skip GIF and fall back to MP4 or a still JPEG.
+        if await asyncio.to_thread(_is_apng, data):
+            return await _fit_animation(
+                data, filename, limit, prefer_gif=not force, allow_gif=not force
+            )
         if len(data) <= limit and not force:
             return Prepared(data, filename, QQ_IMAGE)
         if await asyncio.to_thread(_is_animated, data):

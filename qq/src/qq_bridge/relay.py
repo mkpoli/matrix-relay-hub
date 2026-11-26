@@ -2257,53 +2257,84 @@ class Relay:
         reply_to: str | None = None,
         timeout: float | None = None,
     ) -> str | None:
-        url = attachment.get("url") or attachment.get("voice_wav_url")
-        if not url:
+        raw_content_type = str(attachment.get("content_type") or "")
+        is_voice = raw_content_type == "voice" or raw_content_type.startswith("audio/")
+        raw_url = str(attachment.get("url") or "").strip()
+        wav_url = str(attachment.get("voice_wav_url") or "").strip()
+        if raw_url.startswith("//"):
+            raw_url = "https:" + raw_url
+        if wav_url.startswith("//"):
+            wav_url = "https:" + wav_url
+
+        candidates: list[tuple[str, str, bool]] = []
+        if is_voice and wav_url:
+            candidates.append((wav_url, "audio/wav", True))
+        if raw_url and raw_url != wav_url:
+            fallback_ct = (
+                "audio/silk" if raw_content_type == "voice" else (raw_content_type or "application/octet-stream")
+            )
+            candidates.append((raw_url, fallback_ct, False))
+        elif wav_url and not candidates:
+            candidates.append((wav_url, "audio/wav" if raw_content_type in ("", "voice") else raw_content_type, True))
+        if not candidates:
             return None
-        content_type = str(attachment.get("content_type") or "")
-        if content_type == "voice":
-            content_type = "audio/wav" if attachment.get("voice_wav_url") else "audio/silk"
-        if not content_type:
-            content_type = "application/octet-stream"
+
         trusted_only = bool(attachment.get("trusted_qq_media"))
-        current_url = str(url)
         data = b""
         resp_content_type = ""
-        for _hop in range(3):
-            if trusted_only and not is_trusted_qq_media_url(current_url):
-                raise RuntimeError("refusing untrusted forwarded attachment URL")
-            get_kwargs: dict = {}
-            if trusted_only:
-                get_kwargs["allow_redirects"] = False
-            if timeout is not None:
-                get_kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
-            async with self.matrix.session.get(current_url, **get_kwargs) as response:
-                if trusted_only and response.status in (301, 302, 303, 307, 308):
-                    location = response.headers.get("location") or ""
-                    resolved = urljoin(current_url, location) if location else ""
-                    if not resolved or not is_trusted_qq_media_url(resolved):
-                        raise RuntimeError("refusing redirect to untrusted attachment URL")
-                    current_url = resolved
-                    continue
-                if response.status >= 400:
-                    raise RuntimeError(f"attachment download failed: HTTP {response.status}")
-                resp_content_type = (
-                    (response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
-                )
-                try:
-                    if hasattr(response, "content"):
-                        data = await _read_capped(response, MAX_MEDIA_DOWNLOAD)
-                    else:
-                        data = await response.read()
-                except MediaTooLarge as exc:
-                    raise RuntimeError("attachment is too large") from exc
+        content_type = ""
+        used_voice_wav = False
+        last_exc: Exception | None = None
+        for cand_url, cand_ct, cand_is_wav in candidates:
+            current_url = cand_url
+            try:
+                for _hop in range(3):
+                    if trusted_only and not is_trusted_qq_media_url(current_url):
+                        raise RuntimeError("refusing untrusted forwarded attachment URL")
+                    get_kwargs: dict = {}
+                    if trusted_only:
+                        get_kwargs["allow_redirects"] = False
+                    if timeout is not None:
+                        get_kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
+                    async with self.matrix.session.get(current_url, **get_kwargs) as response:
+                        if trusted_only and response.status in (301, 302, 303, 307, 308):
+                            location = response.headers.get("location") or ""
+                            resolved = urljoin(current_url, location) if location else ""
+                            if not resolved or not is_trusted_qq_media_url(resolved):
+                                raise RuntimeError("refusing redirect to untrusted attachment URL")
+                            current_url = resolved
+                            continue
+                        if response.status >= 400:
+                            raise RuntimeError(f"attachment download failed: HTTP {response.status}")
+                        resp_content_type = (
+                            (response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+                        )
+                        try:
+                            if hasattr(response, "content"):
+                                data = await _read_capped(response, MAX_MEDIA_DOWNLOAD)
+                            else:
+                                data = await response.read()
+                        except MediaTooLarge as exc:
+                            raise RuntimeError("attachment is too large") from exc
+                        break
+                else:
+                    raise RuntimeError("too many redirects while downloading attachment")
+                if not data:
+                    raise RuntimeError("attachment download returned empty body")
+                if len(data) > MAX_MEDIA_DOWNLOAD:
+                    raise RuntimeError("attachment is too large")
+                content_type = cand_ct
+                used_voice_wav = cand_is_wav
+                last_exc = None
                 break
-        else:
-            raise RuntimeError("too many redirects while downloading attachment")
-        if not data:
-            raise RuntimeError("attachment download returned empty body")
-        if len(data) > MAX_MEDIA_DOWNLOAD:
-            raise RuntimeError("attachment is too large")
+            except Exception as exc:
+                last_exc = exc
+                if len(candidates) > 1 and cand_is_wav:
+                    log.info("voice_wav_url download failed (%s); falling back to raw audio URL", exc)
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
         if (
             trusted_only
             and content_type.startswith(("image/", "video/", "audio/"))
@@ -2316,7 +2347,13 @@ class Relay:
             or content_type == "application/octet-stream"
         ):
             content_type = resp_content_type
-        filename = str(attachment.get("filename") or "file")
+        filename = str(attachment.get("filename") or ("voice.wav" if used_voice_wav else "file"))
+        if used_voice_wav:
+            lower = filename.lower()
+            if lower.endswith((".silk", ".slk", ".amr")):
+                filename = filename.rsplit(".", 1)[0] + ".wav"
+            elif not lower.endswith(".wav"):
+                filename = f"{filename}.wav"
         mxc = await self.matrix.upload(data, content_type, filename, ghost)
         if content_type.startswith("image/"):
             msgtype = "m.image"
@@ -2331,15 +2368,22 @@ class Relay:
             info["w"] = int(attachment["width"])
         if attachment.get("height"):
             info["h"] = int(attachment["height"])
+        asr_text = (
+            str(attachment.get("asr_refer_text") or "").strip()
+            if msgtype == "m.audio"
+            else ""
+        )
         payload: dict = {
             "msgtype": msgtype,
-            "body": filename,
+            "body": asr_text or filename,
             "url": mxc,
             "info": info,
         }
+        if asr_text and asr_text != filename:
+            payload["filename"] = filename
         if reply_to:
             payload["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_to}}
-        if msgtype == "m.audio" and attachment.get("voice_wav_url"):
+        if msgtype == "m.audio" and (used_voice_wav or attachment.get("voice_wav_url")):
             payload["org.matrix.msc3245.voice"] = {}
         return await self.matrix.send_message(room_id, ghost, payload)
 

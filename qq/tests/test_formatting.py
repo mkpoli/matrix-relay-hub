@@ -323,3 +323,123 @@ def test_chunk_measures_utf16_code_units():
 def test_chunk_leaves_a_character_that_would_pass_the_limit():
     text = "a" * 1999 + "😀"
     assert chunk(text, limit=2000) == ["a" * 1999, "😀"]
+
+
+def test_qq_forwarded_chat_record_deduplicates_doubled_messages_and_groups_sender():
+    raw = (
+        "[群聊的聊天记录]\n"
+        "=== 消息 1 ===\n"
+        "[消息内容] 这个的主要问题是今昔文字镜作为一个glyph集\n"
+        "[发送者] baysoftware\n\n"
+        "=== 消息 2 ===\n"
+        "[消息内容] 它的一些字真的只是glyph\n"
+        "[发送者] baysoftware\n\n"
+        "=== 消息 3 ===\n"
+        "[消息内容] 这个的主要问题是今昔文字镜作为一个glyph集\n"
+        "[发送者] baysoftware\n\n"
+        "=== 消息 4 ===\n"
+        "[消息内容] 它的一些字真的只是glyph\n"
+        "[发送者] baysoftware\n"
+    )
+    body, html = render_qq_text(raw, [], "example.org")
+    assert body == (
+        "[群聊的聊天记录]\n"
+        "> baysoftware:\n"
+        "> 这个的主要问题是今昔文字镜作为一个glyph集\n"
+        "> 它的一些字真的只是glyph"
+    )
+    assert html == (
+        "<p>[群聊的聊天记录]</p>"
+        "<blockquote><p><strong>baysoftware</strong>:<br/>"
+        "这个的主要问题是今昔文字镜作为一个glyph集<br/>"
+        "它的一些字真的只是glyph</p></blockquote>"
+    )
+
+
+def test_qq_forwarded_chat_record_formats_multiple_senders_and_inline_faces():
+    raw = (
+        "[群聊的聊天记录]\n"
+        "=== 消息 1 ===\n"
+        "[消息内容] 第一句\n第二行\n"
+        "[发送者] Alice\n\n"
+        "=== 消息 2 ===\n"
+        '[消息内容] <faceType=1,faceId="0",ext="eyJ0ZXh0IjoiIn0="> 同意\n'
+        "[发送者] Bob\n"
+    )
+    body, html = render_qq_text(raw, [], "example.org")
+    assert body == (
+        "[群聊的聊天记录]\n"
+        "> Alice:\n"
+        "> 第一句\n"
+        "> 第二行\n"
+        ">\n"
+        "> Bob: 😲 同意"
+    )
+    assert "<strong>Alice</strong>:<br/>第一句<br/>第二行" in html
+    assert "<strong>Bob</strong>: 😲 同意" in html
+    assert "=== 消息" not in body
+
+
+def test_qq_forwarded_chat_record_preserves_distinct_messages_and_ignores_plain_text():
+    distinct = (
+        "[群聊的聊天记录]\n"
+        "=== 消息 1 ===\n"
+        "[消息内容] 早上好\n"
+        "[发送者] Alice\n\n"
+        "=== 消息 2 ===\n"
+        "[消息内容] 晚安\n"
+        "[发送者] Alice\n"
+    )
+    body, _ = render_qq_text(distinct, [], "example.org")
+    assert body == "[群聊的聊天记录]\n> Alice:\n> 早上好\n> 晚安"
+
+    not_forward = "[群聊的聊天记录]\n这不是转发结构"
+    plain, _ = render_qq_text(not_forward, [], "example.org")
+    assert plain == not_forward
+
+
+def test_qq_forwarded_chat_record_edge_cases():
+    # Different timestamps prevent deduplicating genuine repeated messages.
+    with_times = (
+        "[群聊的聊天记录]\n"
+        "=== 消息 1 ===\n[消息内容] hi\n[发送者] Alice\n[时间] 09:00\n\n"
+        "=== 消息 2 ===\n[消息内容] hi\n[发送者] Alice\n[时间] 10:00\n"
+    )
+    body, _ = render_qq_text(with_times, [], "example.org")
+    assert body == "[群聊的聊天记录]\n> Alice:\n> hi\n> hi"
+
+    # Literal [发送者] inside multiline content is preserved.
+    literal_tag = (
+        "[群聊的聊天记录]\n"
+        "=== 消息 1 ===\n[消息内容] first\n[发送者] literal\n[发送者] Alice\n"
+    )
+    body, _ = render_qq_text(literal_tag, [], "example.org")
+    assert body == "[群聊的聊天记录]\n> Alice:\n> first\n> [发送者] literal"
+
+    # Nested forward / literal `=== 消息 N ===` bails out instead of misattributing.
+    nested = (
+        "[群聊的聊天记录]\n"
+        "=== 消息 1 ===\n[消息内容] [群聊的聊天记录]\n=== 消息 1 ===\n[消息内容] inner\n[发送者] Bob\n[发送者] Alice\n"
+    )
+    body, _ = render_qq_text(nested, [], "example.org")
+    assert "=== 消息 1 ===" in body
+
+    # Multiline leading bot mentions are stripped before detecting the forward.
+    bot_prefixed = (
+        "<@B1>\n<@B2>\n[群聊的聊天记录]\n"
+        "=== 消息 1 ===\n[消息内容] hi\n[发送者] Alice\n"
+    )
+    body, _ = render_qq_text(
+        bot_prefixed,
+        [{"id": "B1", "is_you": True}, {"id": "B2", "bot": True}],
+        "example.org",
+    )
+    assert body == "[群聊的聊天记录]\n> Alice: hi"
+
+    # Attached sticker uses [图片] placeholder instead of duplicating [表情].
+    sticker_fwd = (
+        "[群聊的聊天记录]\n"
+        '=== 消息 1 ===\n[消息内容] <faceType=6,faceId="0",ext="">\n[发送者] Alice\n'
+    )
+    body, _ = render_qq_text(sticker_fwd, [], "example.org", sticker_image=True)
+    assert body == "[群聊的聊天记录]\n> Alice: [图片]"

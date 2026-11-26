@@ -133,21 +133,124 @@ def _mention_names(mentions: list[dict] | None) -> tuple[dict[str, str], set[str
     return names, bots
 
 
-def render_qq_text(
-    content: str,
-    mentions: list[dict] | None,
+_FORWARD_HEADER_RE = re.compile(r"^\[([^\[\]\n]{1,60}聊天记录)\]$")
+_FORWARD_ITEM_RE = re.compile(r"^===\s*消息\s*(\d+)\s*===$")
+_FORWARD_FIELD_RE = re.compile(r"^\[(消息内容|发送者|时间)\]\s?(.*)$")
+
+
+def _parse_forwarded_record(text: str) -> tuple[str, list[tuple[str, str]]] | None:
+    """Parse QQ Bot API's flattened merged-forward text into `(header, [(sender, content), ...])`.
+
+    Returns None if `text` does not match QQ's `[...聊天记录]` / `=== 消息 N ===` layout.
+    """
+    lines = text.replace("\r\n", "\n").strip().split("\n")
+    if len(lines) < 3:
+        return None
+    header_match = _FORWARD_HEADER_RE.match(lines[0].strip())
+    if not header_match:
+        return None
+    header = header_match.group(0)
+
+    blocks: list[tuple[int, list[str]]] = []
+    current_num: int | None = None
+    current: list[str] | None = None
+    for line in lines[1:]:
+        stripped = line.strip()
+        item_match = _FORWARD_ITEM_RE.match(stripped)
+        if item_match:
+            if current is not None and current_num is not None:
+                blocks.append((current_num, current))
+            current_num = int(item_match.group(1))
+            current = []
+        elif current is None:
+            if stripped:
+                return None
+        else:
+            current.append(line)
+    if current is not None and current_num is not None:
+        blocks.append((current_num, current))
+    if not blocks:
+        return None
+
+    # Require strict 1..N numbering so nested forwards or literal markers in content
+    # bail out safely instead of splitting or misattributing messages.
+    if [num for num, _ in blocks] != list(range(1, len(blocks) + 1)):
+        return None
+
+    entries: list[tuple[str, str, str]] = []
+    for _, raw_block in blocks:
+        block = list(raw_block)
+        while block and not block[-1].strip():
+            block.pop()
+        while block and not block[0].strip():
+            block.pop(0)
+        if not block:
+            return None
+
+        sender = ""
+        timestamp = ""
+        # Peel trailing metadata lines ([发送者], [时间]) from the bottom first so
+        # literal `[发送者] ...` lines inside multiline `[消息内容]` stay intact.
+        while block:
+            tail_match = _FORWARD_FIELD_RE.match(block[-1])
+            if not tail_match:
+                break
+            tag, value = tail_match.group(1), tail_match.group(2).strip()
+            if tag == "发送者" and not sender:
+                sender = value
+                block.pop()
+            elif tag == "时间" and not timestamp:
+                timestamp = value
+                block.pop()
+            else:
+                break
+
+        # Also support leading [发送者]/[时间] before [消息内容].
+        while block:
+            head_match = _FORWARD_FIELD_RE.match(block[0])
+            if not head_match:
+                break
+            tag, value = head_match.group(1), head_match.group(2).strip()
+            if tag == "发送者" and not sender:
+                sender = value
+                block.pop(0)
+            elif tag == "时间" and not timestamp:
+                timestamp = value
+                block.pop(0)
+            else:
+                break
+
+        if not sender:
+            return None
+
+        if block:
+            content_match = _FORWARD_FIELD_RE.match(block[0])
+            if not content_match or content_match.group(1) != "消息内容":
+                return None
+            content_lines = [content_match.group(2), *block[1:]]
+            content = "\n".join(content_lines).strip()
+        else:
+            content = ""
+
+        entries.append((sender, content, timestamp))
+
+    # QQ Bot API sometimes flattens a merged forward twice ([1..k, 1..k]).
+    # Compare timestamps too so genuine repeats at different times are preserved.
+    if len(entries) >= 2 and len(entries) % 2 == 0:
+        half = len(entries) // 2
+        if entries[:half] == entries[half:]:
+            entries = entries[:half]
+    return header, [(sender, content) for sender, content, _ in entries]
+
+
+def _render_qq_inline(
+    text: str,
+    names: dict[str, str],
+    bots: set[str],
     domain: str,
     face_images: dict[int, str] | None = None,
     sticker_image: bool = False,
 ) -> tuple[str, str]:
-    """Return the plain body and the HTML body for a QQ message.
-
-    `sticker_image` says the message carries an image attachment, which is
-    how a faceType 6 sticker arrives; its markup is then dropped from the
-    text because the attachment is the sticker.
-    """
-    text = content or ""
-    names, bots = _mention_names(mentions)
     body: list[str] = []
     markup: list[str] = []
     position = 0
@@ -199,6 +302,90 @@ def render_qq_text(
     body.append(text[position:])
     markup.append(_escape(text[position:]))
     return "".join(body).strip(), "".join(markup).strip()
+
+
+def _strip_leading_bot_mentions(text: str, bots: set[str]) -> str:
+    if not bots:
+        return text
+    pos = 0
+    length = len(text)
+    while True:
+        while pos < length and text[pos].isspace():
+            pos += 1
+        if not text.startswith("<@", pos):
+            break
+        end = text.find(">", pos + 2)
+        if end == -1:
+            break
+        openid = text[pos + 2 : end]
+        if openid.lower() not in bots:
+            break
+        pos = end + 1
+    return text[pos:].lstrip()
+
+
+def render_qq_text(
+    content: str,
+    mentions: list[dict] | None,
+    domain: str,
+    face_images: dict[int, str] | None = None,
+    sticker_image: bool = False,
+) -> tuple[str, str]:
+    """Return the plain body and the HTML body for a QQ message.
+
+    `sticker_image` says the message carries an image attachment, which is
+    how a faceType 6 sticker arrives; its markup is then dropped from the
+    text because the attachment is the sticker.
+    """
+    text = content or ""
+    names, bots = _mention_names(mentions)
+    forwarded = _parse_forwarded_record(_strip_leading_bot_mentions(text, bots))
+    if forwarded is not None:
+        header, entries = forwarded
+        groups: list[tuple[str, list[tuple[str, str]]]] = []
+        for sender, raw_item in entries:
+            item_plain, item_html = _render_qq_inline(
+                raw_item, names, bots, domain, face_images, sticker_image=sticker_image
+            )
+            if not item_plain and not item_html:
+                item_plain = item_html = "[图片]" if sticker_image else "[消息]"
+            if groups and groups[-1][0] == sender:
+                groups[-1][1].append((item_plain, item_html))
+            else:
+                groups.append((sender, [(item_plain, item_html)]))
+
+        plain_blocks: list[str] = []
+        html_blocks: list[str] = []
+        for sender, items in groups:
+            if len(items) == 1 and "\n" not in items[0][0]:
+                item_plain, item_html = items[0]
+                if sender:
+                    plain_blocks.append(f"> {sender}: {item_plain}")
+                    html_blocks.append(f"<p><strong>{_escape(sender)}</strong>: {item_html}</p>")
+                else:
+                    plain_blocks.append(f"> {item_plain}")
+                    html_blocks.append(f"<p>{item_html}</p>")
+            else:
+                plain_lines: list[str] = []
+                html_lines: list[str] = []
+                if sender:
+                    plain_lines.append(f"> {sender}:")
+                    html_lines.append(f"<strong>{_escape(sender)}</strong>:")
+                for item_plain, item_html in items:
+                    for subline in item_plain.split("\n"):
+                        plain_lines.append(f"> {subline}" if subline else ">")
+                    html_lines.append(item_html)
+                plain_blocks.append("\n".join(plain_lines))
+                html_blocks.append(f"<p>{'<br/>'.join(html_lines)}</p>")
+
+        plain_body = header + "\n" + "\n>\n".join(plain_blocks)
+        html_body = (
+            f"<p>{_escape(header)}</p>"
+            f"<blockquote>{''.join(html_blocks)}</blockquote>"
+        )
+        return plain_body, html_body
+
+    return _render_qq_inline(text, names, bots, domain, face_images, sticker_image)
 
 
 REPLY_FALLBACK = re.compile(r"> (?:\* )?<[@!#][^\s>]+>")

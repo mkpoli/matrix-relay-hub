@@ -139,12 +139,12 @@ class Store:
         ).fetchone()
         return row["username"] if row else None
 
-    def member_avatar(self, member_openid: str) -> tuple[str, str] | None:
+    def member_avatar(self, member_openid: str) -> tuple[str, str, int] | None:
         row = self.conn.execute(
-            "SELECT avatar_key, mxc FROM member_avatars WHERE member_openid = ?",
+            "SELECT avatar_key, mxc, updated FROM member_avatars WHERE member_openid = ?",
             (member_openid,),
         ).fetchone()
-        return (row["avatar_key"], row["mxc"]) if row else None
+        return (row["avatar_key"], row["mxc"], int(row["updated"])) if row else None
 
     def set_member_avatar(self, member_openid: str, avatar_key: str, mxc: str) -> None:
         self.conn.execute(

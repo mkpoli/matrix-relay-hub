@@ -232,3 +232,83 @@ def test_large_animated_gif_becomes_a_video():
     prepared = asyncio.run(prepare(data, "m.image", "image/gif", "cat.gif", limit=len(data) // 2))
     assert prepared.file_type == QQ_VIDEO
     assert prepared.filename == "cat.mp4"
+
+
+def test_small_apng_converts_to_animated_gif_for_qq():
+    poster = Image.new("RGBA", (64, 64), (255, 0, 0, 255))
+    anim = [
+        Image.new("RGBA", (64, 64), (0, 0, 255, 255)),
+        Image.new("RGBA", (64, 64), (0, 255, 0, 0)),
+    ]
+    out = io.BytesIO()
+    poster.save(out, "PNG", save_all=True, append_images=anim, default_image=True, duration=80, loop=0)
+    apng = out.getvalue()
+
+    prepared = asyncio.run(prepare(apng, "m.image", "image/apng", "wave.png"))
+    assert prepared.file_type == QQ_IMAGE
+    assert prepared.filename == "wave.gif"
+    with Image.open(io.BytesIO(prepared.data)) as gif:
+        assert gif.format == "GIF"
+        assert gif.n_frames == 2
+        assert gif.info["loop"] == 0
+
+    # Finite APNG play counts map to GIF repeat counts (1 play -> omit loop; 3 plays -> loop=2).
+    once_out = io.BytesIO()
+    anim[0].save(once_out, "PNG", save_all=True, append_images=anim[1:], duration=80, loop=1)
+    once_gif = asyncio.run(prepare(once_out.getvalue(), "m.image", "image/apng", "once.png"))
+    with Image.open(io.BytesIO(once_gif.data)) as gif:
+        assert "loop" not in gif.info
+
+    thrice_out = io.BytesIO()
+    anim[0].save(thrice_out, "PNG", save_all=True, append_images=anim[1:], duration=80, loop=3)
+    thrice_gif = asyncio.run(prepare(thrice_out.getvalue(), "m.image", "image/apng", "three.png"))
+    with Image.open(io.BytesIO(thrice_gif.data)) as gif:
+        assert gif.info["loop"] == 2
+
+    # Static PNG mislabeled image/apng stays untouched.
+    static_out = io.BytesIO()
+    Image.new("RGBA", (32, 32), (10, 20, 30, 255)).save(static_out, "PNG")
+    static_png = static_out.getvalue()
+    prepared_static = asyncio.run(prepare(static_png, "m.image", "image/apng", "still.png"))
+    assert prepared_static.data == static_png
+    assert prepared_static.filename == "still.png"
+
+
+def test_unfit_or_forced_apng_falls_back_to_video_or_still(monkeypatch):
+    def refuse_gif(data, limit):
+        raise Unfit("too large for QQ")
+
+    async def fake_video(data, limit):
+        return b"\x00\x00\x00\x18ftypmp42"
+
+    monkeypatch.setattr("qq_bridge.fit.fit_video", fake_video)
+
+    frames = [Image.new("RGBA", (64, 64), color) for color in ("red", "blue")]
+    out = io.BytesIO()
+    frames[0].save(out, "PNG", save_all=True, append_images=frames[1:], duration=80)
+    apng = out.getvalue()
+
+    # force=True after QQ refuses the GIF skips GIF and falls back to MP4.
+    forced = asyncio.run(prepare(apng, "m.image", "image/apng", "big.apng", force=True))
+    assert forced.file_type == QQ_VIDEO
+    assert forced.filename == "big.mp4"
+
+    # Unfit GIF also falls back to MP4 without force=True.
+    monkeypatch.setattr("qq_bridge.fit.fit_gif", refuse_gif)
+    prepared = asyncio.run(prepare(apng, "m.image", "image/apng", "big.apng"))
+    assert prepared.file_type == QQ_VIDEO
+    assert prepared.filename == "big.mp4"
+
+
+def test_png_probe_value_error_preserves_passthrough(monkeypatch):
+    static_out = io.BytesIO()
+    Image.new("RGBA", (16, 16), (1, 2, 3, 255)).save(static_out, "PNG")
+    png = static_out.getvalue()
+
+    def raise_metadata_limit(*args, **kwargs):
+        raise ValueError("Decompressed Data Too Large")
+
+    monkeypatch.setattr("qq_bridge.fit.Image.open", raise_metadata_limit)
+    prepared = asyncio.run(prepare(png, "m.image", "image/png", "icc.png"))
+    assert prepared.data == png
+    assert prepared.filename == "icc.png"

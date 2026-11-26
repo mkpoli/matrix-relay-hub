@@ -21,3 +21,7 @@ Keep passwords, access tokens, webhook URLs, registration files, encryption keys
 ## QQ
 
 Do not enable a QQ route solely because a bridge has been configured. Confirm account eligibility, current platform policy and actual incoming and outgoing delivery in a sandbox. The [architecture notes](architecture.md#bridge-candidates) identify the known uncertainty in the official bot API.
+
+## WeCom
+
+Verify WeCom administrator permissions, enterprise verification status, and internal-group scope before connecting a community room. AI Bot WebSocket mode requires a single active connection per bot (`bot_id`), receives `@bot` mentions in internal groups, and cannot bridge external WeChat customer groups. Group Robot Webhook mode is outbound-only (Matrix to WeCom) and rate-limited to 20 messages per minute.

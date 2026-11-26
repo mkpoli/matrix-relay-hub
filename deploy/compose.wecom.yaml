@@ -1,0 +1,17 @@
+services:
+  wecom:
+    profiles: [wecom]
+    image: ${WECOM_BRIDGE_IMAGE:-matrix-relay-hub/wecom-bridge:local}
+    build:
+      context: ..
+      dockerfile: deploy/wecom/Dockerfile
+    user: "${WECOM_UID:?Set WECOM_UID to the data directory owner}:${WECOM_GID:?Set WECOM_GID to the data directory group}"
+    networks:
+      matrix:
+        aliases: ["${WECOM_NETWORK_ALIAS:-matrix-relay-wecom}"]
+    volumes:
+      - type: bind
+        source: ${WECOM_DATA_DIR:-/var/empty/matrix-relay-hub/wecom}
+        target: /data
+        bind:
+          create_host_path: false

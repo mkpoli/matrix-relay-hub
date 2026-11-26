@@ -6,10 +6,12 @@ def test_puppets_and_bots_carry_their_network():
     assert source_tag("@telegram_8954644733:glyphatlas.org") == "T"
     assert source_tag("@irc_alice:glyphatlas.org") == "I"
     assert source_tag("@qq_ABC123:glyphatlas.org") == "Q"
+    assert source_tag("@wecom_zhangsan:glyphatlas.org") == "W"
     assert source_tag("@discordbot:glyphatlas.org") == "D"
     assert source_tag("@telegrambot:glyphatlas.org") == "T"
     assert source_tag("@heisenbridge:glyphatlas.org") == "I"
     assert source_tag("@qqbot:glyphatlas.org") == "Q"
+    assert source_tag("@wecombot:glyphatlas.org") == "W"
 
 
 def test_a_person_on_matrix_is_matrix():

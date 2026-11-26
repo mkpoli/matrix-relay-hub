@@ -23,9 +23,10 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 python3 -m unittest discover -s deploy -p 'test_compose*.py' -v
 python3 -m unittest discover -s irc-lab -p 'test_*.py' -v
 (cd qq && uv run pytest)
+(cd wecom && uv run pytest)
 ```
 
-The two labs run real containers and are not part of the unit suite. The QQ bridge tests need `uv` for their `aiohttp` dependency.
+The two labs run real containers and are not part of the unit suite. The QQ and WeCom bridge tests need `uv` for their dependencies.
 
 - [Architecture and bridge candidates](docs/architecture.md)
 - [Deployment](docs/deployment.md)

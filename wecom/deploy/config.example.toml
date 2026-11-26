@@ -1,0 +1,47 @@
+# Copy to the WeCom data directory as config.toml and edit.
+# The file holds bridge and WeCom credentials; keep it mode 600.
+
+[matrix]
+homeserver = "http://your-homeserver:8008"
+domain = "example.org"
+as_token = "CHANGE"
+hs_token = "CHANGE"
+bot_mxid = "@wecombot:example.org"
+listen_host = "0.0.0.0"
+listen_port = 29336
+
+[wecom]
+# "aibot" uses the official AI Bot WebSocket gateway (bidirectional: @bot
+# mentions in internal groups + proactive push via aibot_send_msg).
+# "webhook" uses an internal Group Robot Webhook URL (Matrix -> WeCom only).
+mode = "aibot"
+
+# AI Bot WebSocket credentials (required for mode = "aibot"):
+bot_id = "CHANGE"
+secret = "CHANGE"
+# Group chatid (or user userid for a DM). Leave empty only when running
+# `python -m wecom_bridge discover --config /data/config.toml` to print incoming chatids.
+chat_id = "CHAT_ID"
+# Optional bot display name used to strip the leading @BotName prefix in groups.
+bot_name = ""
+# Matrix room that receives incoming WeCom messages (mode = "aibot").
+incoming = "#wecom-test:example.org"
+
+# Group Robot Webhook credentials (used instead when mode = "webhook"):
+# webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=CHANGE"
+# msgtype = "markdown" # "markdown" (default, 4096 bytes) or "text" (2048 bytes)
+
+# Optional display-name overrides for WeCom userids (the AI Bot WebSocket
+# callback supplies userid only).
+[members]
+# zhangsan = "Zhang San"
+
+# Each room is mirrored into the WeCom group. The incoming room receives WeCom
+# messages in aibot mode; labels prefix messages when more than one room is listed.
+[[room]]
+alias = "#wecom-test:example.org"
+label = "test"
+
+[[room]]
+alias = "#welcome:example.org"
+label = "welcome"

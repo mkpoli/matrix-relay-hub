@@ -3,6 +3,7 @@
 **/*.pyc
 .venv
 qq/.venv
+wecom/.venv
 .pytest_cache
 lab/.run-*
 irc-lab/.run-*

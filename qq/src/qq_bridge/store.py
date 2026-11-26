@@ -80,6 +80,15 @@ CREATE TABLE IF NOT EXISTS tweets (
     ts INTEGER NOT NULL,
     PRIMARY KEY (group_openid, status_id)
 );
+
+CREATE TABLE IF NOT EXISTS media_progress (
+    event_id TEXT PRIMARY KEY,
+    labels_sent INTEGER NOT NULL DEFAULT 0,
+    labels_done INTEGER NOT NULL DEFAULT 0,
+    media_sent INTEGER NOT NULL DEFAULT 0,
+    done INTEGER NOT NULL DEFAULT 0,
+    ts INTEGER NOT NULL
+);
 """
 
 
@@ -174,6 +183,50 @@ class Store:
 
     def forget_messages(self, qq_ids: list[str]) -> None:
         self.conn.executemany("DELETE FROM messages WHERE qq_id = ?", [(qq_id,) for qq_id in qq_ids])
+
+    def media_progress(self, event_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT labels_sent, labels_done, media_sent, done FROM media_progress WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+
+    def note_media_progress(
+        self,
+        event_id: str,
+        *,
+        labels_sent: int | None = None,
+        labels_done: bool | None = None,
+        media_sent: int | None = None,
+        done: bool | None = None,
+    ) -> None:
+        if not event_id:
+            return
+        row = self.media_progress(event_id)
+        cur_labels = int(row["labels_sent"]) if row else 0
+        cur_labels_done = int(row["labels_done"]) if row else 0
+        cur_media = int(row["media_sent"]) if row else 0
+        cur_done = int(row["done"]) if row else 0
+        if labels_sent is not None:
+            cur_labels = max(cur_labels, labels_sent)
+        if labels_done is not None:
+            cur_labels_done = 1 if labels_done else cur_labels_done
+        if media_sent is not None:
+            cur_media = max(cur_media, media_sent)
+        if done is not None:
+            cur_done = 1 if done else cur_done
+        self.conn.execute(
+            """
+            INSERT INTO media_progress(event_id, labels_sent, labels_done, media_sent, done, ts)
+            VALUES(?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                labels_sent = excluded.labels_sent,
+                labels_done = excluded.labels_done,
+                media_sent = excluded.media_sent,
+                done = excluded.done,
+                ts = excluded.ts
+            """,
+            (event_id, cur_labels, cur_labels_done, cur_media, cur_done, int(time.time())),
+        )
 
     # -- edits and redactions -------------------------------------------------
 

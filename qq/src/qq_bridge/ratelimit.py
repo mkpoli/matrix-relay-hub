@@ -15,6 +15,15 @@ class RateLimiter:
         self._day: deque[float] = deque()
         self._lock = asyncio.Lock()
 
+    def exhausted(self) -> bool:
+        """Return True when the daily quota is currently used up without consuming a slot."""
+        if self.per_day is None:
+            return False
+        now = time.monotonic()
+        while self._day and now - self._day[0] >= 86400:
+            self._day.popleft()
+        return len(self._day) >= self.per_day
+
     async def acquire(self) -> bool:
         """Wait for a slot. False means the daily quota is used up."""
         while True:

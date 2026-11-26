@@ -292,6 +292,7 @@ class Relay:
         self._ghosts: dict[str, str] = {}
         self._avatar: str | None = None
         self._avatars: set[str] = set()
+        self._last_sent_event: str | None = None
         self._joined: set[tuple[str, str]] = set()
         self._names: dict[tuple[str, str], tuple[str, float]] = {}
         self._queue: asyncio.Queue[dict] = asyncio.Queue()
@@ -547,72 +548,110 @@ class Relay:
         if event_id and self.store.superseded(event_id):
             log.debug("ignoring %s, edited or redacted since", event_id)
             return
-        # A long text or captioned media event posts several QQ messages; after a
-        # restart only the parts not yet posted are sent.
+        # A long text or media event (label + attachment) posts several QQ messages;
+        # after a restart only the parts not yet posted are sent.
         sent = self.store.sent_count(event_id) if event_id else 0
+        progress = self.store.media_progress(event_id) if event_id else None
         if event_id and self.store.relayed_qq(event_id):
             log.debug("ignoring an event already carried to QQ: %s", event_id)
             return
-        if event_id and sent and msgtype not in ("m.text", "m.emote"):
-            media_caption = "" if sticker else _media_caption(content)
-            if media_caption:
-                if self.cfg.twitter and twitter.find(media_caption):
-                    media_caption = twitter.rewrite(media_caption)
-                prefix = await self._sender_prefix(room_id, sender)
-                reply_name = await self._reply_target_name(room_id, sender, content)
-                speaker = f"{prefix} → {reply_name}" if reply_name else prefix
-                caption_parts = chunk(f"{speaker}: {media_caption}")
-                if msgtype == "m.audio" or len(caption_parts) > 1:
-                    reference = self._reply_reference(event)
-                    for idx, part in enumerate(caption_parts, start=1):
-                        if idx < sent:
-                            continue
-                        self._put(
-                            {
-                                "kind": "text",
-                                "group": self.cfg.qq.group,
-                                "room": room_id,
-                                "event_id": event_id,
-                                "text": part,
-                                "reference": reference if idx == 1 and msgtype == "m.audio" else None,
-                                "fallback_unquoted": True,
-                            }
-                        )
+        if event_id and msgtype not in ("m.text", "m.emote"):
+            if progress is not None:
+                if progress["done"]:
+                    log.debug("ignoring an event already carried to QQ: %s", event_id)
                     return
-            log.debug("ignoring an event already carried to QQ: %s", event_id)
-            return
+                if msgtype not in QQ_FILE_TYPES:
+                    return
+                self._enqueue_media(
+                    {
+                        "kind": "media",
+                        "group": self.cfg.qq.group,
+                        "room": room_id,
+                        "event_id": event_id,
+                        "sender": sender,
+                        "content": content,
+                        "sticker": sticker,
+                        "reply_to": self._reply_event_id(content),
+                        "skip_label": bool(progress["labels_done"]),
+                        "skip_labels": int(progress["labels_sent"]),
+                        "media_index": 0,
+                        "media_total": 1,
+                    }
+                )
+                return
+            if sent:
+                log.debug("ignoring an event already carried to QQ: %s", event_id)
+                return
 
         if msgtype in ("m.text", "m.emote"):
             html_body, custom_emojis, emoji_only = _extract_message_emojis(content)
             if emoji_only:
+                if progress is not None and progress["done"]:
+                    log.debug("ignoring an event already carried to QQ: %s", event_id)
+                    return
+                if progress is not None:
+                    media_sent = int(progress["media_sent"])
+                    labels_done = bool(progress["labels_done"])
+                    labels_sent = int(progress["labels_sent"])
+                elif sent:
+                    media_sent = max(0, sent - 1)
+                    labels_done = True
+                    labels_sent = 1
+                else:
+                    media_sent = 0
+                    labels_done = False
+                    labels_sent = 0
                 reply_to = self._reply_event_id(content)
                 mentions = (
                     content.get("m.mentions")
                     if isinstance(content.get("m.mentions"), dict)
                     else None
                 )
+                total = len(custom_emojis)
                 for index, emoji in enumerate(custom_emojis):
-                    if index < sent:
+                    if index < media_sent:
                         continue
-                    self._enqueue_media(
-                        {
-                            "kind": "media",
-                            "group": self.cfg.qq.group,
-                            "room": room_id,
-                            "event_id": event_id,
-                            "sender": sender,
-                            "content": _emoji_media_content(
-                                emoji,
-                                reply_to=reply_to if index == 0 else None,
-                                mentions=mentions if index == 0 else None,
-                            ),
-                            "sticker": True,
-                            "custom_emoji": True,
-                            "emoji_only": True,
-                            "sniff_image": True,
-                            "reply_to": reply_to if index == 0 else None,
-                        }
-                    )
+                    if index == 0:
+                        self._enqueue_media(
+                            {
+                                "kind": "media",
+                                "group": self.cfg.qq.group,
+                                "room": room_id,
+                                "event_id": event_id,
+                                "sender": sender,
+                                "content": _emoji_media_content(
+                                    emoji, reply_to=reply_to, mentions=mentions
+                                ),
+                                "sticker": True,
+                                "custom_emoji": True,
+                                "emoji_only": True,
+                                "sniff_image": True,
+                                "reply_to": reply_to,
+                                "skip_label": labels_done,
+                                "skip_labels": labels_sent,
+                                "media_index": index,
+                                "media_total": total,
+                            }
+                        )
+                    else:
+                        self._enqueue_media(
+                            {
+                                "kind": "media",
+                                "group": self.cfg.qq.group,
+                                "room": room_id,
+                                "event_id": event_id,
+                                "sender": sender,
+                                "content": _emoji_media_content(emoji),
+                                "sticker": True,
+                                "custom_emoji": True,
+                                "emoji_only": True,
+                                "skip_label": True,
+                                "sniff_image": True,
+                                "reply_to": None,
+                                "media_index": index,
+                                "media_total": total,
+                            }
+                        )
                 return
             body = (
                 html_body
@@ -638,61 +677,47 @@ class Relay:
                 if msgtype == "m.emote"
                 else f"{source}{tag}{name}: {body}"
             )
+            reply_to = self._reply_event_id(content)
             reference = self._reply_reference(event)
             parts = chunk(text)
-            if len(custom_emojis) == 1 and len(parts) == 1:
-                reply_to = self._reply_event_id(content)
-                if sent == 0:
-                    self._enqueue_media(
-                        {
-                            "kind": "media",
-                            "group": self.cfg.qq.group,
-                            "room": room_id,
-                            "event_id": event_id,
-                            "sender": sender,
-                            "content": _emoji_media_content(
-                                custom_emojis[0], reply_to=reply_to
-                            ),
-                            "custom_emoji": True,
-                            "sniff_image": True,
-                            "caption": parts[0],
-                            "fallback_text": parts[0],
-                            "text_required": True,
-                            "reply_to": reply_to,
-                        }
-                    )
-            else:
-                for index, part in enumerate(parts):
-                    if index < sent:
-                        continue
-                    self._put(
-                        {
-                            "kind": "text",
-                            "group": self.cfg.qq.group,
-                            "room": room_id,
-                            "event_id": event_id,
-                            "text": part,
-                            "reference": reference if index == 0 else None,
-                            "fallback_unquoted": sticker,
-                        }
-                    )
-                for index, emoji in enumerate(custom_emojis, start=len(parts)):
-                    if index < sent:
-                        continue
-                    self._enqueue_media(
-                        {
-                            "kind": "media",
-                            "group": self.cfg.qq.group,
-                            "room": room_id,
-                            "event_id": event_id,
-                            "sender": sender,
-                            "content": _emoji_media_content(emoji),
-                            "sticker": True,
-                            "custom_emoji": True,
-                            "sniff_image": True,
-                            "reply_to": None,
-                        }
-                    )
+            media_sent = int(progress["media_sent"]) if progress is not None else 0
+            text_sent = max(0, sent - media_sent)
+            for index, part in enumerate(parts):
+                if index < text_sent:
+                    continue
+                self._put(
+                    {
+                        "kind": "text",
+                        "group": self.cfg.qq.group,
+                        "room": room_id,
+                        "event_id": event_id,
+                        "text": part,
+                        "reference": reference if index == 0 else None,
+                        "reply_to": reply_to if index == 0 else None,
+                        "fallback_unquoted": bool(sticker or custom_emojis),
+                    }
+                )
+            total = len(custom_emojis)
+            for index, emoji in enumerate(custom_emojis):
+                if index < media_sent:
+                    continue
+                self._enqueue_media(
+                    {
+                        "kind": "media",
+                        "group": self.cfg.qq.group,
+                        "room": room_id,
+                        "event_id": event_id,
+                        "sender": sender,
+                        "content": _emoji_media_content(emoji),
+                        "sticker": True,
+                        "custom_emoji": True,
+                        "skip_label": True,
+                        "sniff_image": True,
+                        "reply_to": None,
+                        "media_index": index,
+                        "media_total": total,
+                    }
+                )
             if links:
                 self._queue_twitter(
                     {
@@ -712,6 +737,8 @@ class Relay:
                     "content": content,
                     "sticker": sticker,
                     "reply_to": self._reply_event_id(content),
+                    "media_index": 0,
+                    "media_total": 1,
                 }
             )
 
@@ -721,9 +748,12 @@ class Relay:
         if not self.cfg.relay_reactions:
             return
         event_id = event.get("event_id", "")
-        if event_id and (
-            self.store.relayed_qq(event_id) or self.store.sent_count(event_id)
-        ):
+        if event_id and self.store.relayed_qq(event_id):
+            log.debug("ignoring a reaction already carried to QQ: %s", event_id)
+            return
+        progress = self.store.media_progress(event_id) if event_id else None
+        sent = self.store.sent_count(event_id) if event_id else 0
+        if progress is not None and progress["done"]:
             log.debug("ignoring a reaction already carried to QQ: %s", event_id)
             return
         content = event.get("content") or {}
@@ -734,6 +764,14 @@ class Relay:
         if not isinstance(target, str) or not target:
             return
         raw_key = relates.get("key")
+        mxc = raw_key.strip() if isinstance(raw_key, str) else ""
+        is_custom_mxc = mxc.startswith("mxc://")
+        if not is_custom_mxc and sent:
+            log.debug("ignoring a reaction already carried to QQ: %s", event_id)
+            return
+        if is_custom_mxc and progress is None and sent:
+            log.debug("ignoring a reaction already carried to QQ: %s", event_id)
+            return
         emoji = format_reaction_key(raw_key, content=content, relates=relates)
         if not emoji:
             return
@@ -748,8 +786,7 @@ class Relay:
         source = f"[{source_tag(sender)}] "
         tag = f"[{label}] " if self._tagged else ""
         text = chunk(f"{source}{tag}{name} reacted with {emoji}")[0]
-        mxc = raw_key.strip() if isinstance(raw_key, str) else ""
-        if mxc.startswith("mxc://"):
+        if is_custom_mxc:
             discord_meta = content.get("fi.mau.discord.reaction")
             animated = bool(
                 isinstance(discord_meta, dict) and discord_meta.get("animated")
@@ -773,6 +810,10 @@ class Relay:
                     "reference": reference,
                     "reference_event": reference_event,
                     "reply_to": None,
+                    "skip_label": bool(progress["labels_done"]) if progress is not None else False,
+                    "skip_labels": int(progress["labels_sent"]) if progress is not None else 0,
+                    "media_index": 0,
+                    "media_total": 1,
                 }
             )
             return
@@ -1069,6 +1110,10 @@ class Relay:
             if not deferred:
                 self._finish(job)
 
+    def _quota_exhausted(self, group: str) -> bool:
+        limiter = self._group_limiters.get(group)
+        return bool((limiter and limiter.exhausted()) or self._global.exhausted())
+
     async def _wait_limits(self, group: str) -> bool:
         limiter = self._group_limiters.setdefault(group, RateLimiter(20, 1000))
         if not await limiter.acquire():
@@ -1092,6 +1137,10 @@ class Relay:
                     job["reference_event"],
                 )
                 return False
+        elif reference is None and job.get("reply_to"):
+            reply_to = job["reply_to"]
+            if self.store.superseded(reply_to) != "redacted":
+                reference = self._reference_for_event(reply_to)
         if not await self._wait_limits(job["group"]):
             self._retry_later(job)
             return False
@@ -1125,6 +1174,8 @@ class Relay:
                         self._retry_later(job)
                     return False
                 self._remember_sent(job["group"], job["room"], job["event_id"], response)
+                if event_id:
+                    self._last_sent_event = event_id
                 log.info("sent to QQ group %s: %s", job["group"], response.get("id"))
                 return True
 
@@ -1233,7 +1284,28 @@ class Relay:
             return True
         return False
 
+    async def _prepare_forced_media(self, job: dict) -> Prepared | str:
+        try:
+            return await self._prepare_media({**job, "force": True})
+        except Unfit as exc:
+            return str(exc)
+        except Exception:
+            log.exception("failed to re-encode media for QQ")
+            return UNREADABLE
+
     async def _deliver_media(self, job: dict, result: Prepared | str) -> None:
+        event_id = job.get("event_id") or ""
+        media_index = int(job.get("media_index") or 0)
+        media_total = int(job.get("media_total") or 1)
+
+        def mark_media_done() -> None:
+            if event_id:
+                self.store.note_media_progress(
+                    event_id,
+                    media_sent=media_index + 1,
+                    done=(media_index + 1 >= media_total),
+                )
+
         reference = job.get("reference")
         if reference is None and job.get("reference_event"):
             reference = self._reference_for_event(job["reference_event"])
@@ -1251,47 +1323,90 @@ class Relay:
                 else None
             )
 
+        skip_label = bool(job.get("skip_label"))
+        skip_labels = int(job.get("skip_labels") or 0)
+        # If a slow custom emoji crossed MEDIA_WAIT and another event sent in
+        # between, restore speaker attribution so it never lands under another
+        # speaker's message.
+        if (
+            skip_label
+            and job.get("custom_emoji")
+            and not job.get("reaction")
+            and self._last_sent_event
+            and event_id
+            and self._last_sent_event != event_id
+        ):
+            skip_label = False
+            skip_labels = 0
         custom_caption = job.get("caption")
         fallback_text = job.get("fallback_text")
-        text_required = bool(job.get("text_required") and fallback_text)
         media_caption = ""
         if (
-            custom_caption is None
+            not skip_label
+            and custom_caption is None
             and not job.get("sticker")
             and not job.get("custom_emoji")
-            and not job.get("skip_media_caption")
         ):
             media_caption = _media_caption(job["content"])
             if media_caption and self.cfg.twitter and twitter.find(media_caption):
                 media_caption = twitter.rewrite(media_caption)
 
         speaker = ""
-        if custom_caption is None:
+        if not skip_label and custom_caption is None:
             prefix = await self._sender_prefix(job["room"], job["sender"])
-            needs_caption = (
-                isinstance(result, str)
-                or result.file_type != QQ_AUDIO
-                or bool(media_caption)
-            )
-            reply_name = (
-                await self._reply_target_name(
-                    job["room"],
-                    job["sender"],
-                    job["content"],
-                    sticker=bool(job.get("sticker")),
-                )
-                if needs_caption
-                else None
+            reply_name = await self._reply_target_name(
+                job["room"],
+                job["sender"],
+                job["content"],
+                sticker=bool(job.get("sticker")),
             )
             speaker = f"{prefix} → {reply_name}" if reply_name else prefix
 
-        caption_parts: list[str] = []
-        if media_caption:
-            caption_parts = chunk(f"{speaker}: {media_caption}")
+        if skip_label:
+            label_parts: list[str] = []
+        elif custom_caption is not None:
+            label_parts = [custom_caption]
+        elif media_caption:
+            label_parts = chunk(f"{speaker}: {media_caption}")
+        else:
+            label_parts = [chunk(f"{speaker}:")[0]]
+
+        shortcode = str(job["content"].get("body") or "[custom emoji]")
+
+        async def send_post_label_notice(reason: str | None) -> None:
+            if job.get("emoji_only"):
+                notice_text = chunk(shortcode)[0]
+            elif job.get("reaction"):
+                return
+            elif job.get("sticker"):
+                notice_text = chunk(_sticker_label(job["content"].get("body"), reason=reason))[0]
+            else:
+                kind = str(job["content"].get("msgtype", "m.file"))[2:]
+                notice_text = chunk(f"[{kind} {reason}]" if reason else f"[{kind}]")[0]
+            await self._send_text(
+                {
+                    "group": job["group"],
+                    "room": job["room"],
+                    "event_id": job["event_id"],
+                    "text": notice_text,
+                    "reference": None,
+                    "fallback_unquoted": True,
+                    "pending": job.get("pending"),
+                }
+            )
 
         if isinstance(result, str):
+            if skip_label:
+                if job.get("emoji_only"):
+                    await send_post_label_notice(result)
+                    if job.get("pending") in self._keep:
+                        return
+                mark_media_done()
+                return
             if fallback_text:
                 failure_parts = [fallback_text]
+            elif job.get("emoji_only"):
+                failure_parts = [chunk(f"{speaker}: {shortcode}")[0]]
             elif job.get("sticker"):
                 notice = _sticker_label(job["content"].get("body"), reason=result)
                 failure_parts = [chunk(f"{speaker}: {notice}")[0]]
@@ -1304,7 +1419,9 @@ class Relay:
                     else [chunk(f"{speaker}: {notice}")[0]]
                 )
             for idx, part in enumerate(failure_parts):
-                await self._send_text(
+                if idx < skip_labels:
+                    continue
+                sent_ok = await self._send_text(
                     {
                         "group": job["group"],
                         "room": job["room"],
@@ -1317,233 +1434,219 @@ class Relay:
                 )
                 if job.get("pending") in self._keep:
                     return
+                if sent_ok and event_id:
+                    self.store.note_media_progress(event_id, labels_sent=idx + 1)
+            if event_id:
+                self.store.note_media_progress(event_id, labels_done=True)
+            mark_media_done()
             return
-        if not await self._wait_limits(job["group"]):
+
+        if self._superseded_media(job):
+            return
+        if self._quota_exhausted(job["group"]):
+            log.warning("daily QQ message quota for %s is used up", job["group"])
             self._retry_later(job)
             return
-        emoji_only_fallback = (
-            chunk(f"{speaker}: {job['content'].get('body') or '[custom emoji]'}")[0]
-            if job.get("emoji_only") and speaker
-            else None
-        )
-        # QQ's official SDK passes `content` alongside `media` for image/video/file
-        # (msg_type 7) to embed text and media in one message, and omits it for voice.
-        separate_caption_parts: list[str] = []
-        if custom_caption is not None:
-            caption: str | None = custom_caption
-        elif caption_parts and result.file_type != QQ_AUDIO and len(caption_parts) == 1:
-            caption = caption_parts[0]
-            fallback_text = caption_parts[0]
-            text_required = True
-        else:
-            caption = chunk(f"{speaker}:")[0] if result.file_type != QQ_AUDIO else None
-            if caption_parts:
-                separate_caption_parts = caption_parts
-        try:
-            file_info = await self.qq.upload_group_media(
-                job["group"], result.data, result.filename, result.file_type
-            )
-        except QQError as exc:
-            if not self._handle_media_error(job, exc, "upload"):
-                permanent_fallback = fallback_text if text_required else emoji_only_fallback
-                if permanent_fallback:
-                    await self._send_text(
-                        {
-                            "group": job["group"],
-                            "room": job["room"],
-                            "event_id": job["event_id"],
-                            "text": permanent_fallback,
-                            "reference": reference,
-                            "fallback_unquoted": not job.get("reaction"),
-                            "pending": job.get("pending"),
-                        }
-                    )
-                elif separate_caption_parts:
-                    for idx, part in enumerate(separate_caption_parts):
-                        await self._send_text(
+
+        # Upload before posting the label so a format-refusal re-encode or
+        # transient upload error never sends a duplicate label.
+        forced = bool(job.get("force"))
+        prepared = result
+        file_info: str | None = None
+        while True:
+            try:
+                file_info = await self.qq.upload_group_media(
+                    job["group"], prepared.data, prepared.filename, prepared.file_type
+                )
+                break
+            except QQError as exc:
+                if (
+                    exc.code == QQ_FORMAT_REFUSED
+                    and not forced
+                    and (job.get("emoji_only") or media_total > 1)
+                ):
+                    log.info("QQ refused the format of %s; re-encoding inline", event_id)
+                    forced = True
+                    reprepared = await self._prepare_forced_media(job)
+                    if isinstance(reprepared, str):
+                        if job.get("emoji_only"):
+                            if skip_label:
+                                await send_post_label_notice(reprepared)
+                            else:
+                                await self._send_text(
+                                    {
+                                        "group": job["group"],
+                                        "room": job["room"],
+                                        "event_id": job["event_id"],
+                                        "text": chunk(f"{speaker}: {shortcode}")[0],
+                                        "reference": reference,
+                                        "fallback_unquoted": True,
+                                        "pending": job.get("pending"),
+                                    }
+                                )
+                            if job.get("pending") in self._keep:
+                                return
+                        if event_id:
+                            self.store.note_media_progress(event_id, labels_done=True)
+                        mark_media_done()
+                        return
+                    if self._superseded_media(job):
+                        return
+                    prepared = reprepared
+                    continue
+                if not self._handle_media_error(job, exc, "upload"):
+                    if skip_label:
+                        if job.get("emoji_only"):
+                            await send_post_label_notice(None)
+                            if job.get("pending") in self._keep:
+                                return
+                        mark_media_done()
+                        return
+                    if fallback_text:
+                        perm_parts = [fallback_text]
+                    elif job.get("emoji_only") and speaker:
+                        perm_parts = [chunk(f"{speaker}: {shortcode}")[0]]
+                    elif media_caption:
+                        perm_parts = label_parts
+                    else:
+                        perm_parts = []
+                    for idx, part in enumerate(perm_parts):
+                        if idx < skip_labels:
+                            continue
+                        sent_ok = await self._send_text(
                             {
                                 "group": job["group"],
                                 "room": job["room"],
                                 "event_id": job["event_id"],
                                 "text": part,
                                 "reference": reference if idx == 0 else None,
-                                "fallback_unquoted": True,
+                                "fallback_unquoted": not job.get("reaction"),
                                 "pending": job.get("pending"),
                             }
                         )
                         if job.get("pending") in self._keep:
                             return
-            return
+                        if sent_ok and event_id:
+                            self.store.note_media_progress(event_id, labels_sent=idx + 1)
+                    if event_id:
+                        self.store.note_media_progress(event_id, labels_done=True)
+                    mark_media_done()
+                return
+        assert file_info is not None
 
-        if text_required:
-            attempts: list[tuple[str | None, str | None]] = [(caption, reference)]
-            if reference is not None and not job.get("reaction"):
-                attempts.append((caption, None))
-            response: dict | None = None
-            for index, (send_content, send_ref) in enumerate(attempts):
-                try:
-                    response = await self.qq.send_group_media(
-                        job["group"], file_info, content=send_content, reference=send_ref
-                    )
-                    break
-                except QQError as exc:
-                    if _transient(exc) or exc.code == QQ_FORMAT_REFUSED:
-                        if not self._handle_media_error(job, exc, "send"):
-                            await self._send_text(
-                                {
-                                    "group": job["group"],
-                                    "room": job["room"],
-                                    "event_id": job["event_id"],
-                                    "text": fallback_text,
-                                    "reference": reference,
-                                    "fallback_unquoted": not job.get("reaction"),
-                                    "pending": job.get("pending"),
-                                }
-                            )
-                        return
-                    if index < len(attempts) - 1:
-                        log.info(
-                            "QQ refused media send for %s (caption=%s, reference=%s): %s; retrying",
-                            job["event_id"],
-                            bool(send_content),
-                            bool(send_ref),
-                            exc,
-                        )
-                        continue
-                    log.info(
-                        "QQ refused captioned media for %s (%s); sending text and image separately",
-                        job["event_id"],
-                        exc,
-                    )
-                    sent_ok = await self._send_text(
-                        {
-                            "group": job["group"],
-                            "room": job["room"],
-                            "event_id": job["event_id"],
-                            "text": fallback_text,
-                            "reference": reference,
-                            "fallback_unquoted": not job.get("reaction"),
-                            "pending": job.get("pending"),
-                        }
-                    )
-                    if not sent_ok or job.get("pending") in self._keep:
-                        return
-                    for bare_attempt in range(3):
-                        try:
-                            response = await self.qq.send_group_media(
-                                job["group"], file_info, content=None, reference=None
-                            )
-                            break
-                        except QQError as media_exc:
-                            if media_exc.code == QQ_FORMAT_REFUSED and not job.get("force"):
-                                retry = {
-                                    key: value
-                                    for key, value in job.items()
-                                    if key
-                                    not in (
-                                        "ready",
-                                        "sent",
-                                        "caption",
-                                        "fallback_text",
-                                        "text_required",
-                                    )
-                                }
-                                self._enqueue_media(
-                                    {**retry, "force": True, "skip_media_caption": True}
-                                )
-                                return
-                            if _transient(media_exc) and bare_attempt < 2:
-                                await asyncio.sleep(
-                                    3 * (bare_attempt + 1)
-                                    if media_exc.rate_limited
-                                    else 0.5
-                                )
-                                continue
-                            log.warning(
-                                "cannot send uncaptioned media for %s: %s",
-                                job["event_id"],
-                                media_exc,
-                            )
-                            return
-                    break
-            assert response is not None
-            self._remember_sent(job["group"], job["room"], job["event_id"], response)
-            log.info("sent media to QQ group %s: %s", job["group"], response.get("id"))
-            return
-
-        attempts = [(caption, reference)]
-        if caption is not None and reference is not None:
-            attempts.append((caption, None))
-            attempts.append((None, reference))
-            attempts.append((None, None))
-        elif reference is not None or caption is not None:
-            attempts.append((None, None))
-        response = None
-        for index, (send_content, send_ref) in enumerate(attempts):
-            try:
-                response = await self.qq.send_group_media(
-                    job["group"], file_info, content=send_content, reference=send_ref
-                )
-                break
-            except QQError as exc:
-                if (
-                    index == len(attempts) - 1
-                    or _transient(exc)
-                    or exc.code == QQ_FORMAT_REFUSED
-                ):
-                    if not self._handle_media_error(job, exc, "send"):
-                        if emoji_only_fallback:
-                            await self._send_text(
-                                {
-                                    "group": job["group"],
-                                    "room": job["room"],
-                                    "event_id": job["event_id"],
-                                    "text": emoji_only_fallback,
-                                    "reference": reference,
-                                    "fallback_unquoted": True,
-                                    "pending": job.get("pending"),
-                                }
-                            )
-                        elif separate_caption_parts:
-                            for idx, part in enumerate(separate_caption_parts):
-                                await self._send_text(
-                                    {
-                                        "group": job["group"],
-                                        "room": job["room"],
-                                        "event_id": job["event_id"],
-                                        "text": part,
-                                        "reference": reference if idx == 0 else None,
-                                        "fallback_unquoted": True,
-                                        "pending": job.get("pending"),
-                                    }
-                                )
-                                if job.get("pending") in self._keep:
-                                    return
-                    return
-                log.info(
-                    "QQ refused media send for %s (caption=%s, reference=%s): %s; retrying",
-                    job["event_id"],
-                    bool(send_content),
-                    bool(send_ref),
-                    exc,
-                )
-        assert response is not None
-        self._remember_sent(job["group"], job["room"], job["event_id"], response)
-        log.info("sent media to QQ group %s: %s", job["group"], response.get("id"))
-        for idx, part in enumerate(separate_caption_parts):
-            await self._send_text(
+        # QQ renders `content` on msg_type=7 below the image; send the label or
+        # caption first as text so attribution and quotes always appear above media.
+        for idx, part in enumerate(label_parts):
+            if idx < skip_labels:
+                continue
+            sent_ok = await self._send_text(
                 {
                     "group": job["group"],
                     "room": job["room"],
                     "event_id": job["event_id"],
                     "text": part,
-                    "reference": reference if idx == 0 and result.file_type == QQ_AUDIO else None,
-                    "fallback_unquoted": True,
+                    "reference": reference if idx == 0 else None,
+                    "fallback_unquoted": not job.get("reaction"),
                     "pending": job.get("pending"),
                 }
             )
             if job.get("pending") in self._keep:
                 return
+            if sent_ok and event_id:
+                self.store.note_media_progress(event_id, labels_sent=idx + 1)
+            if not sent_ok and job.get("reaction"):
+                if event_id:
+                    self.store.note_media_progress(event_id, labels_done=True)
+                mark_media_done()
+                return
+        if label_parts and event_id:
+            self.store.note_media_progress(
+                event_id, labels_sent=len(label_parts), labels_done=True
+            )
+
+        if self._superseded_media(job):
+            log.debug("dropping media %s, redacted before send", event_id)
+            return
+        if not await self._wait_limits(job["group"]):
+            self._retry_later(job)
+            return
+        if self._superseded_media(job):
+            log.debug("dropping media %s, redacted during rate limit wait", event_id)
+            return
+
+        response: dict | None = None
+        while True:
+            reencode = False
+            for attempt in range(3):
+                if self._superseded_media(job):
+                    log.debug("dropping media %s, redacted before send attempt", event_id)
+                    return
+                try:
+                    response = await self.qq.send_group_media(
+                        job["group"], file_info, content=None, reference=None
+                    )
+                    break
+                except QQError as exc:
+                    if exc.code == QQ_FORMAT_REFUSED and not forced:
+                        log.info(
+                            "QQ refused the format of %s on send; re-encoding inline",
+                            event_id,
+                        )
+                        forced = True
+                        reencode = True
+                        break
+                    if _transient(exc) and attempt < 2:
+                        await asyncio.sleep(
+                            3 * (attempt + 1) if exc.rate_limited else 0.5
+                        )
+                        continue
+                    if not self._handle_media_error(job, exc, "send"):
+                        if job.get("emoji_only"):
+                            await send_post_label_notice(None)
+                            if job.get("pending") in self._keep:
+                                return
+                        mark_media_done()
+                    return
+            if response is not None:
+                break
+            if not reencode:
+                return
+            reprepared = await self._prepare_forced_media(job)
+            if isinstance(reprepared, str):
+                if not self._superseded_media(job):
+                    await send_post_label_notice(reprepared)
+                    if job.get("pending") in self._keep:
+                        return
+                mark_media_done()
+                return
+            if self._superseded_media(job):
+                return
+            if self._quota_exhausted(job["group"]):
+                log.warning("daily QQ message quota for %s is used up", job["group"])
+                self._retry_later(job)
+                return
+            try:
+                file_info = await self.qq.upload_group_media(
+                    job["group"], reprepared.data, reprepared.filename, reprepared.file_type
+                )
+            except QQError as exc:
+                if not self._handle_media_error({**job, "force": True}, exc, "upload"):
+                    if job.get("emoji_only"):
+                        await send_post_label_notice(None)
+                        if job.get("pending") in self._keep:
+                            return
+                    mark_media_done()
+                return
+            if not await self._wait_limits(job["group"]):
+                self._retry_later(job)
+                return
+
+        assert response is not None
+        self._remember_sent(job["group"], job["room"], job["event_id"], response)
+        if event_id:
+            self._last_sent_event = event_id
+        mark_media_done()
+        log.info("sent media to QQ group %s: %s", job["group"], response.get("id"))
 
     def _remember_sent(
         self, group: str, room: str, event_id: str, response: dict

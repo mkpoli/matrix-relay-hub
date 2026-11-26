@@ -443,3 +443,57 @@ def test_qq_forwarded_chat_record_edge_cases():
     )
     body, _ = render_qq_text(sticker_fwd, [], "example.org", sticker_image=True)
     assert body == "[群聊的聊天记录]\n> Alice: [图片]"
+
+
+def test_qq_forwarded_chat_record_deduplicates_volatile_rkey_attachments_and_strips_urls():
+    from qq_bridge.formatting import extract_forwarded_attachments, is_trusted_qq_media_url
+
+    raw = (
+        "[群聊的聊天记录]\n"
+        "=== 消息 1 ===\n"
+        "[消息内容] 又是没法避免，汉大第一版检字表字形和正文字头字形不符的情况，𠋾\n"
+        "[发送者] 玄晖allen\n"
+        "[附件1] 类型:图片 文件名:424C880940CE2A22930A4C581C9E268C.jpg 尺寸:1084x2087 大小:555.6KB "
+        "URL:https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=FILE1&rkey=KEY_A&spec=0\n"
+        "[附件2] 类型:图片 文件名:E855CB976A8DD1EBA9F12C1D8ED78EFE.jpg 尺寸:1205x670 大小:125.2KB "
+        "URL:https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=FILE2&rkey=KEY_B&spec=0\n\n"
+        "=== 消息 2 ===\n"
+        "[消息内容] 又是没法避免，汉大第一版检字表字形和正文字头字形不符的情况，𠋾\n"
+        "[发送者] 玄晖allen\n"
+        "[附件1] 类型:图片 文件名:424C880940CE2A22930A4C581C9E268C.jpg 尺寸:1084x2087 大小:555.6KB "
+        "URL:https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=FILE1&rkey=KEY_C&spec=0\n"
+        "[附件2] 类型:图片 文件名:E855CB976A8DD1EBA9F12C1D8ED78EFE.jpg 尺寸:1205x670 大小:125.2KB "
+        "URL:https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=FILE2&rkey=KEY_D&spec=0\n"
+    )
+    body, html = render_qq_text(raw, [], "example.org")
+    assert body == (
+        "[群聊的聊天记录]\n"
+        "> 玄晖allen: 又是没法避免，汉大第一版检字表字形和正文字头字形不符的情况，𠋾"
+    )
+    assert "multimedia.nt.qq.com.cn" not in body
+    assert "multimedia.nt.qq.com.cn" not in html
+
+    atts = extract_forwarded_attachments(raw)
+    assert len(atts) == 2
+    assert atts[0]["filename"] == "424C880940CE2A22930A4C581C9E268C.jpg"
+    assert atts[0]["width"] == 1084 and atts[0]["height"] == 2087
+    assert atts[0]["content_type"] == "image/jpeg"
+    assert atts[0]["trusted_qq_media"] is True
+    assert atts[1]["filename"] == "E855CB976A8DD1EBA9F12C1D8ED78EFE.jpg"
+
+    # Untrusted URLs are never extracted for download (SSRF guard) and render as safe labels.
+    assert is_trusted_qq_media_url("https://multimedia.nt.qq.com.cn/download?fileid=1")
+    assert not is_trusted_qq_media_url("http://multimedia.nt.qq.com.cn/download?fileid=1")
+    assert not is_trusted_qq_media_url("https://127.0.0.1/secret.jpg")
+    assert not is_trusted_qq_media_url("https://evil.example.com/nt.qq.com.cn/a.jpg")
+    untrusted_raw = (
+        "[群聊的聊天记录]\n"
+        "=== 消息 1 ===\n"
+        "[消息内容] look\n"
+        "[发送者] Eve\n"
+        "[附件1] 类型:图片 文件名:x.jpg URL:https://127.0.0.1/secret.jpg\n"
+    )
+    assert extract_forwarded_attachments(untrusted_raw) == []
+    ubody, _ = render_qq_text(untrusted_raw, [], "example.org")
+    assert "127.0.0.1" not in ubody
+    assert "[图片: x.jpg]" in ubody

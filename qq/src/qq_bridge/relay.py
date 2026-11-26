@@ -21,7 +21,10 @@ from .formatting import (
     chunk,
     extract_custom_emojis,
     extract_face_ids,
+    extract_forwarded_attachments,
     format_reaction_key,
+    is_trusted_qq_media_url,
+    normalize_media_url_key,
     render_qq_text,
     sticker_labels,
     strip_leading_mentions,
@@ -1675,6 +1678,20 @@ class Relay:
             if str(item.get("content_type") or "").startswith("image/")
         )
         sticker_image = image_attachments > 0
+        forwarded_attachments = extract_forwarded_attachments(
+            content, data.get("mentions")
+        )
+        if forwarded_attachments:
+            existing_urls = {
+                normalize_media_url_key(str(item.get("url") or ""))
+                for item in attachments
+                if item.get("url")
+            }
+            for item in forwarded_attachments:
+                key = normalize_media_url_key(str(item.get("url") or ""))
+                if key not in existing_urls:
+                    existing_urls.add(key)
+                    attachments.append(item)
 
         face_images = await self._resolve_faces(content)
         body, html_body = render_qq_text(
@@ -1712,9 +1729,10 @@ class Relay:
 
         image_delivered = 0
         for attachment in attachments:
+            att_reply = None if (attachment.get("trusted_qq_media") and text_sent) else reply_to
             try:
                 event_id = await self._send_attachment(
-                    room_id, ghost, attachment, reply_to=reply_to
+                    room_id, ghost, attachment, reply_to=att_reply
                 )
                 if event_id:
                     if str(attachment.get("content_type") or "").startswith("image/"):
@@ -2002,12 +2020,39 @@ class Relay:
             content_type = "audio/wav" if attachment.get("voice_wav_url") else "audio/silk"
         if not content_type:
             content_type = "application/octet-stream"
-        async with self.matrix.session.get(url) as response:
-            if response.status >= 400:
-                raise RuntimeError(f"attachment download failed: HTTP {response.status}")
-            data = await response.read()
+        trusted_only = bool(attachment.get("trusted_qq_media"))
+        current_url = str(url)
+        data = b""
+        resp_content_type = ""
+        for _hop in range(3):
+            if trusted_only and not is_trusted_qq_media_url(current_url):
+                raise RuntimeError("refusing untrusted forwarded attachment URL")
+            get_kwargs = {"allow_redirects": False} if trusted_only else {}
+            async with self.matrix.session.get(current_url, **get_kwargs) as response:
+                if trusted_only and response.status in (301, 302, 303, 307, 308):
+                    location = response.headers.get("location") or ""
+                    if not location or not is_trusted_qq_media_url(location):
+                        raise RuntimeError("refusing redirect to untrusted attachment URL")
+                    current_url = location
+                    continue
+                if response.status >= 400:
+                    raise RuntimeError(f"attachment download failed: HTTP {response.status}")
+                resp_content_type = (
+                    (response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+                )
+                data = await response.read()
+                break
+        else:
+            raise RuntimeError("too many redirects while downloading attachment")
+        if not data:
+            raise RuntimeError("attachment download returned empty body")
         if len(data) > MAX_MEDIA_DOWNLOAD:
             raise RuntimeError("attachment is too large")
+        if resp_content_type and (
+            resp_content_type.startswith(("image/", "video/", "audio/"))
+            or content_type == "application/octet-stream"
+        ):
+            content_type = resp_content_type
         filename = str(attachment.get("filename") or "file")
         mxc = await self.matrix.upload(data, content_type, filename, ghost)
         if content_type.startswith("image/"):

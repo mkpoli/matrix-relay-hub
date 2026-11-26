@@ -5,10 +5,11 @@ from __future__ import annotations
 import base64
 import html
 import json
+import mimetypes
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from urllib.parse import unquote
+from urllib.parse import parse_qsl, unquote, urlparse
 
 SPACE_RE = re.compile(r"[ \t]*")
 FACE_RE = re.compile(r'<faceType=(\d+),faceId="([^"]*)"?,ext="([^"]*)"\s*/?>')
@@ -136,12 +137,115 @@ def _mention_names(mentions: list[dict] | None) -> tuple[dict[str, str], set[str
 _FORWARD_HEADER_RE = re.compile(r"^\[([^\[\]\n]{1,60}聊天记录)\]$")
 _FORWARD_ITEM_RE = re.compile(r"^===\s*消息\s*(\d+)\s*===$")
 _FORWARD_FIELD_RE = re.compile(r"^\[(消息内容|发送者|时间)\]\s?(.*)$")
+_FORWARD_ATTACHMENT_RE = re.compile(r"^\[附件\d+\]\s*(.+)$")
+_FORWARD_ATT_URL_RE = re.compile(r"(?:^|\s)URL:(https://\S+)", re.IGNORECASE)
+_FORWARD_ATT_KIND_RE = re.compile(r"(?:^|\s)类型:(\S+)")
+_FORWARD_ATT_NAME_RE = re.compile(r"(?:^|\s)文件名:(.+?)(?=\s+(?:尺寸|大小|URL):|$)", re.IGNORECASE)
+_FORWARD_ATT_DIM_RE = re.compile(r"(?:^|\s)尺寸:(\d+)x(\d+)", re.IGNORECASE)
+
+_TRUSTED_QQ_MEDIA_DOMAINS = (
+    "nt.qq.com.cn",
+    "nt.qq.com",
+    "qpic.cn",
+)
+_VOLATILE_URL_PARAMS = frozenset({"rkey", "sig", "token", "auth_token", "t", "ts"})
+MAX_FORWARDED_ATTACHMENTS = 16
 
 
-def _parse_forwarded_record(text: str) -> tuple[str, list[tuple[str, str]]] | None:
-    """Parse QQ Bot API's flattened merged-forward text into `(header, [(sender, content), ...])`.
+@dataclass(frozen=True)
+class ForwardedAttachment:
+    kind: str
+    filename: str
+    url: str
+    content_type: str
+    width: int | None = None
+    height: int | None = None
 
-    Returns None if `text` does not match QQ's `[...聊天记录]` / `=== 消息 N ===` layout.
+
+def is_trusted_qq_media_url(url: str) -> bool:
+    """Return True only for HTTPS URLs hosted on Tencent QQ's media domains."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        return False
+    if parsed.port not in (None, 443):
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        return False
+    return any(
+        host == domain or host.endswith("." + domain)
+        for domain in _TRUSTED_QQ_MEDIA_DOMAINS
+    )
+
+
+def normalize_media_url_key(url: str) -> str:
+    """Return a stable comparison key for a QQ media URL, ignoring volatile tokens like `rkey`."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return url
+    stable_params = sorted(
+        (k, v)
+        for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+        if k.lower() not in _VOLATILE_URL_PARAMS
+    )
+    query = "&".join(f"{k}={v}" for k, v in stable_params)
+    return f"{parsed.scheme.lower()}://{(parsed.hostname or '').lower()}{parsed.path}?{query}"
+
+
+def _guess_forwarded_mime(kind: str, filename: str) -> str:
+    guessed, _ = mimetypes.guess_type(filename)
+    if kind == "图片":
+        return guessed if guessed and guessed.startswith("image/") else "image/jpeg"
+    if kind == "视频":
+        return guessed if guessed and guessed.startswith("video/") else "video/mp4"
+    if kind == "语音":
+        return guessed if guessed and guessed.startswith("audio/") else "audio/mpeg"
+    return guessed or "application/octet-stream"
+
+
+def _parse_forwarded_attachment(body: str) -> ForwardedAttachment | None:
+    url_match = _FORWARD_ATT_URL_RE.search(body)
+    if not url_match:
+        return None
+    url = url_match.group(1).strip()
+    kind_match = _FORWARD_ATT_KIND_RE.search(body)
+    kind = kind_match.group(1).strip() if kind_match else "文件"
+    name_match = _FORWARD_ATT_NAME_RE.search(body)
+    filename = name_match.group(1).strip() if name_match else "file"
+    dim_match = _FORWARD_ATT_DIM_RE.search(body)
+    width = int(dim_match.group(1)) if dim_match else None
+    height = int(dim_match.group(2)) if dim_match else None
+    return ForwardedAttachment(
+        kind=kind,
+        filename=filename,
+        url=url,
+        content_type=_guess_forwarded_mime(kind, filename),
+        width=width,
+        height=height,
+    )
+
+
+def _attachment_dedupe_key(att: ForwardedAttachment) -> tuple:
+    return (
+        att.kind,
+        att.filename,
+        att.width,
+        att.height,
+        normalize_media_url_key(att.url),
+    )
+
+
+def _parse_forwarded_record(
+    text: str,
+) -> tuple[str, list[tuple[str, str, tuple[ForwardedAttachment, ...]]]] | None:
+    """Parse QQ Bot API's flattened merged-forward text into `(header, entries)`.
+
+    Each entry is `(sender, content, attachments)`. Returns None if `text` does
+    not match QQ's `[...聊天记录]` / `=== 消息 N ===` layout.
     """
     lines = text.replace("\r\n", "\n").strip().split("\n")
     if len(lines) < 3:
@@ -177,7 +281,7 @@ def _parse_forwarded_record(text: str) -> tuple[str, list[tuple[str, str]]] | No
     if [num for num, _ in blocks] != list(range(1, len(blocks) + 1)):
         return None
 
-    entries: list[tuple[str, str, str]] = []
+    entries: list[tuple[str, str, str, tuple[ForwardedAttachment, ...]]] = []
     for _, raw_block in blocks:
         block = list(raw_block)
         while block and not block[-1].strip():
@@ -189,9 +293,18 @@ def _parse_forwarded_record(text: str) -> tuple[str, list[tuple[str, str]]] | No
 
         sender = ""
         timestamp = ""
-        # Peel trailing metadata lines ([发送者], [时间]) from the bottom first so
-        # literal `[发送者] ...` lines inside multiline `[消息内容]` stay intact.
+        tail_attachments: list[ForwardedAttachment] = []
+        # Peel trailing metadata lines ([附件N], [发送者], [时间]) from the bottom
+        # first so literal `[发送者] ...` lines inside multiline `[消息内容]` stay intact.
         while block:
+            att_match = _FORWARD_ATTACHMENT_RE.match(block[-1])
+            if att_match:
+                parsed_att = _parse_forwarded_attachment(att_match.group(1))
+                if parsed_att is None:
+                    break
+                tail_attachments.append(parsed_att)
+                block.pop()
+                continue
             tail_match = _FORWARD_FIELD_RE.match(block[-1])
             if not tail_match:
                 break
@@ -204,6 +317,7 @@ def _parse_forwarded_record(text: str) -> tuple[str, list[tuple[str, str]]] | No
                 block.pop()
             else:
                 break
+        tail_attachments.reverse()
 
         # Also support leading [发送者]/[时间] before [消息内容].
         while block:
@@ -232,15 +346,54 @@ def _parse_forwarded_record(text: str) -> tuple[str, list[tuple[str, str]]] | No
         else:
             content = ""
 
-        entries.append((sender, content, timestamp))
+        entries.append((sender, content, timestamp, tuple(tail_attachments)))
 
-    # QQ Bot API sometimes flattens a merged forward twice ([1..k, 1..k]).
-    # Compare timestamps too so genuine repeats at different times are preserved.
+    # QQ Bot API sometimes flattens a merged forward twice ([1..k, 1..k]),
+    # issuing fresh volatile `rkey` tokens on the second copy's attachment URLs.
     if len(entries) >= 2 and len(entries) % 2 == 0:
         half = len(entries) // 2
-        if entries[:half] == entries[half:]:
+        keys = [
+            (sender, content, timestamp, tuple(_attachment_dedupe_key(a) for a in atts))
+            for sender, content, timestamp, atts in entries
+        ]
+        if keys[:half] == keys[half:]:
             entries = entries[:half]
-    return header, [(sender, content) for sender, content, _ in entries]
+    return header, [(sender, content, atts) for sender, content, _, atts in entries]
+
+
+def extract_forwarded_attachments(
+    content: str, mentions: list[dict] | None = None
+) -> list[dict]:
+    """Extract deduplicated, trusted QQ media attachments from a forwarded chat record."""
+    _, bots = _mention_names(mentions)
+    forwarded = _parse_forwarded_record(_strip_leading_bot_mentions(content or "", bots))
+    if forwarded is None:
+        return []
+    _, entries = forwarded
+    result: list[dict] = []
+    seen: set[str] = set()
+    for _, _, atts in entries:
+        for att in atts:
+            if not is_trusted_qq_media_url(att.url):
+                continue
+            key = normalize_media_url_key(att.url)
+            if key in seen:
+                continue
+            seen.add(key)
+            item: dict = {
+                "url": att.url,
+                "filename": att.filename,
+                "content_type": att.content_type,
+                "trusted_qq_media": True,
+            }
+            if att.width:
+                item["width"] = att.width
+            if att.height:
+                item["height"] = att.height
+            result.append(item)
+            if len(result) >= MAX_FORWARDED_ATTACHMENTS:
+                return result
+    return result
 
 
 def _render_qq_inline(
@@ -343,12 +496,31 @@ def render_qq_text(
     if forwarded is not None:
         header, entries = forwarded
         groups: list[tuple[str, list[tuple[str, str]]]] = []
-        for sender, raw_item in entries:
+        for sender, raw_item, atts in entries:
             item_plain, item_html = _render_qq_inline(
                 raw_item, names, bots, domain, face_images, sticker_image=sticker_image
             )
+            untrusted_labels = [
+                f"[{att.kind}: {att.filename}]"
+                for att in atts
+                if not is_trusted_qq_media_url(att.url)
+            ]
+            if untrusted_labels:
+                suffix = " ".join(untrusted_labels)
+                item_plain = f"{item_plain}\n{suffix}" if item_plain else suffix
+                item_html = (
+                    f"{item_html}<br/>{_escape(suffix)}"
+                    if item_html
+                    else _escape(suffix)
+                )
             if not item_plain and not item_html:
-                item_plain = item_html = "[图片]" if sticker_image else "[消息]"
+                if atts:
+                    kinds = [f"[{att.kind}]" for att in atts]
+                    placeholder = " ".join(kinds)
+                else:
+                    placeholder = "[图片]" if sticker_image else "[消息]"
+                item_plain = placeholder
+                item_html = _escape(placeholder)
             if groups and groups[-1][0] == sender:
                 groups[-1][1].append((item_plain, item_html))
             else:

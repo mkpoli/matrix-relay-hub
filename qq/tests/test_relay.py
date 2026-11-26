@@ -3223,3 +3223,83 @@ def test_group_message_logs_nonstandard_keys_and_scene_ext_without_secrets(tmp_p
     )
     assert not relay._queue.empty()
     store.close()
+
+
+def test_qq_forwarded_record_downloads_and_uploads_trusted_images(tmp_path):
+    class FakeResp:
+        def __init__(self, status: int, body: bytes, content_type: str = "image/jpeg", location: str = ""):
+            self.status = status
+            self._body = body
+            self.headers = {"content-type": content_type}
+            if location:
+                self.headers["location"] = location
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def read(self):
+            return self._body
+
+    class FakeSession:
+        def __init__(self):
+            self.requested: list[tuple[str, dict]] = []
+
+        def get(self, url, **kwargs):
+            self.requested.append((url, kwargs))
+            return FakeResp(200, b"\xff\xd8\xff\xe0img", "image/jpeg")
+
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay._incoming = ROOM
+    session = FakeSession()
+    relay.matrix.session = session
+    uploaded: list[tuple[bytes, str, str, str]] = []
+
+    async def fake_upload(data, content_type, filename, user_id):
+        uploaded.append((data, content_type, filename, user_id))
+        return f"mxc://example.org/{len(uploaded)}"
+
+    relay.matrix.upload = fake_upload
+    raw = (
+        "[群聊的聊天记录]\n"
+        "=== 消息 1 ===\n"
+        "[消息内容] 字形不符\n"
+        "[发送者] 玄晖allen\n"
+        "[附件1] 类型:图片 文件名:a.jpg 尺寸:100x200 大小:10KB "
+        "URL:https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=F1&rkey=R1&spec=0\n"
+        "[附件2] 类型:图片 文件名:b.jpg 尺寸:300x400 大小:20KB "
+        "URL:https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=F2&rkey=R2&spec=0\n\n"
+        "=== 消息 2 ===\n"
+        "[消息内容] 字形不符\n"
+        "[发送者] 玄晖allen\n"
+        "[附件1] 类型:图片 文件名:a.jpg 尺寸:100x200 大小:10KB "
+        "URL:https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=F1&rkey=R3&spec=0\n"
+        "[附件2] 类型:图片 文件名:b.jpg 尺寸:300x400 大小:20KB "
+        "URL:https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=F2&rkey=R4&spec=0\n"
+    )
+    asyncio.run(
+        relay.on_qq_event(
+            "GROUP_MESSAGE_CREATE",
+            {
+                "id": "QQ-FWD-1",
+                "group_openid": "G",
+                "author": {"member_openid": "U1", "username": "玄晖allen"},
+                "content": raw,
+            },
+        )
+    )
+    assert len(session.requested) == 2
+    assert all(kwargs.get("allow_redirects") is False for _, kwargs in session.requested)
+    assert [name for _, _, name, _ in uploaded] == ["a.jpg", "b.jpg"]
+    assert len(relay.matrix.sent) == 3
+    assert relay.matrix.sent[0][2]["msgtype"] == "m.text"
+    assert relay.matrix.sent[0][2]["body"] == "[群聊的聊天记录]\n> 玄晖allen: 字形不符"
+    assert relay.matrix.sent[1][2]["msgtype"] == "m.image"
+    assert relay.matrix.sent[1][2]["url"] == "mxc://example.org/1"
+    assert relay.matrix.sent[1][2]["info"]["w"] == 100
+    assert relay.matrix.sent[2][2]["msgtype"] == "m.image"
+    assert relay.matrix.sent[2][2]["url"] == "mxc://example.org/2"
+    store.close()

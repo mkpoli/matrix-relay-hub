@@ -16,6 +16,10 @@ from .config import QQConfig
 log = logging.getLogger(__name__)
 
 RATE_LIMIT_CODES = {1100100, 304044, 304045, 304046, 304047, 304048, 304049, 304050}
+TOKEN_TIMEOUT = aiohttp.ClientTimeout(total=20)
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
+UPLOAD_TIMEOUT = aiohttp.ClientTimeout(total=60)
+HEARTBEAT_SEND_TIMEOUT = 15.0
 
 
 def _b64(data: bytes) -> str:
@@ -64,6 +68,7 @@ class QQClient:
             async with self.session.post(
                 f"{self.cfg.api_base}/app/getAppAccessToken",
                 json={"appId": self.cfg.app_id, "clientSecret": self.cfg.app_secret},
+                timeout=TOKEN_TIMEOUT,
             ) as response:
                 data = await response.json(content_type=None)
             if not isinstance(data, dict) or not data.get("access_token"):
@@ -77,6 +82,7 @@ class QQClient:
 
     async def request(self, method: str, path: str, **kwargs) -> dict:
         last_error: Exception | None = None
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         for attempt in range(2):
             token = await self.access_token(force=attempt > 0)
             headers = {"Authorization": f"QQBot {token}"}
@@ -142,7 +148,10 @@ class QQClient:
             "srv_send_msg": False,
         }
         response = await self.request(
-            "POST", f"/v2/groups/{group_openid}/files", json=payload
+            "POST",
+            f"/v2/groups/{group_openid}/files",
+            json=payload,
+            timeout=UPLOAD_TIMEOUT,
         )
         return response["file_info"]
 
@@ -189,12 +198,15 @@ class QQClient:
             try:
                 token = await self.access_token()
                 url = await self.gateway_url()
+                connected_ok = False
                 async with self.session.ws_connect(
                     url, heartbeat=None, max_msg_size=32 * 1024 * 1024
                 ) as ws:
                     hello = await ws.receive_json(timeout=30)
-                    interval = hello["d"]["heartbeat_interval"] / 1000
-                    state = {"seq": seq}
+                    interval = float((hello.get("d") or {}).get("heartbeat_interval") or 0) / 1000
+                    if interval <= 0:
+                        raise RuntimeError("gateway hello missing heartbeat_interval")
+                    state = {"seq": seq, "acked": True}
                     heartbeat = asyncio.create_task(
                         self._heartbeat(ws, interval, state)
                     )
@@ -244,6 +256,7 @@ class QQClient:
                                 event_type = payload.get("t")
                                 if event_type == "READY":
                                     session_id = payload["d"].get("session_id")
+                                    connected_ok = True
                                     backoff = 1
                                     user = payload["d"].get("user", {})
                                     log.info(
@@ -251,8 +264,19 @@ class QQClient:
                                         user.get("username"),
                                         user.get("id"),
                                     )
+                                elif event_type == "RESUMED":
+                                    connected_ok = True
+                                    backoff = 1
+                                    log.info("gateway session resumed")
                                 elif event_type:
                                     self._events.put_nowait((event_type, payload["d"]))
+                            elif op == 11:
+                                state["acked"] = True
+                            elif op == 1:
+                                await asyncio.wait_for(
+                                    ws.send_json({"op": 1, "d": state["seq"]}),
+                                    timeout=HEARTBEAT_SEND_TIMEOUT,
+                                )
                             elif op == 9:
                                 log.info("gateway session invalid, reconnecting")
                                 session_id = None
@@ -265,7 +289,11 @@ class QQClient:
                         heartbeat.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await heartbeat
-                backoff = 1
+                if connected_ok:
+                    backoff = 1
+                else:
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -277,9 +305,22 @@ class QQClient:
         try:
             while True:
                 await asyncio.sleep(interval)
-                await ws.send_json({"op": 1, "d": state["seq"]})
-        except (asyncio.CancelledError, aiohttp.ClientError, ConnectionError):
-            pass
+                if not state["acked"]:
+                    log.warning("gateway heartbeat ACK missed; closing connection")
+                    with contextlib.suppress(Exception):
+                        await ws.close()
+                    return
+                state["acked"] = False
+                await asyncio.wait_for(
+                    ws.send_json({"op": 1, "d": state["seq"]}),
+                    timeout=HEARTBEAT_SEND_TIMEOUT,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("gateway heartbeat failed: %s", exc)
+            with contextlib.suppress(Exception):
+                await ws.close()
 
     async def _dispatch(self) -> None:
         while True:

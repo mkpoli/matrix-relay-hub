@@ -3303,3 +3303,80 @@ def test_qq_forwarded_record_downloads_and_uploads_trusted_images(tmp_path):
     assert relay.matrix.sent[2][2]["msgtype"] == "m.image"
     assert relay.matrix.sent[2][2]["url"] == "mxc://example.org/2"
     store.close()
+
+
+def test_qq_forwarded_record_handles_relative_redirect_html_rejection_and_failure_notice(tmp_path):
+    class FakeContent:
+        def __init__(self, body: bytes):
+            self._body = body
+
+        async def iter_chunked(self, size: int):
+            for i in range(0, len(self._body), size):
+                yield self._body[i : i + size]
+
+    class FakeResp:
+        def __init__(self, status: int, body: bytes, content_type: str = "image/jpeg", location: str = ""):
+            self.status = status
+            self.content = FakeContent(body)
+            self.content_length = len(body)
+            self.headers = {"content-type": content_type}
+            if location:
+                self.headers["location"] = location
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class RedirectAndErrorSession:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        def get(self, url, **kwargs):
+            self.calls.append(url)
+            if url.endswith("fileid=F1&rkey=R1"):
+                return FakeResp(302, b"", location="/cdn/final.jpg")
+            if url == "https://multimedia.nt.qq.com.cn/cdn/final.jpg":
+                return FakeResp(200, b"\xff\xd8\xff\xe0ok", "image/jpeg")
+            # CDN returns HTTP 200 HTML error page for F2 -> must be rejected and reported.
+            return FakeResp(200, b"<html>expired</html>", "text/html; charset=utf-8")
+
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    relay._incoming = ROOM
+    session = RedirectAndErrorSession()
+    relay.matrix.session = session
+    uploaded: list[str] = []
+
+    async def fake_upload(data, content_type, filename, user_id):
+        uploaded.append(filename)
+        return f"mxc://example.org/{len(uploaded)}"
+
+    relay.matrix.upload = fake_upload
+    raw = (
+        "[群聊的聊天记录]\n"
+        "=== 消息 1 ===\n"
+        "[消息内容] test\n"
+        "[发送者] Alice\n"
+        "[附件1] 类型:图片 文件名:ok.jpg URL:https://multimedia.nt.qq.com.cn/download?fileid=F1&rkey=R1\n"
+        "[附件2] 类型:图片 文件名:expired.jpg URL:https://multimedia.nt.qq.com.cn/download?fileid=F2&rkey=R2\n"
+    )
+    asyncio.run(
+        relay.on_qq_event(
+            "GROUP_MESSAGE_CREATE",
+            {
+                "id": "QQ-FWD-2",
+                "group_openid": "G",
+                "author": {"member_openid": "U1", "username": "Alice"},
+                "content": raw,
+            },
+        )
+    )
+    assert uploaded == ["ok.jpg"]
+    assert "https://multimedia.nt.qq.com.cn/cdn/final.jpg" in session.calls
+    assert any(
+        msg[2].get("msgtype") == "m.text" and "[附件下载失败: expired.jpg]" in msg[2].get("body", "")
+        for msg in relay.matrix.sent
+    )
+    store.close()

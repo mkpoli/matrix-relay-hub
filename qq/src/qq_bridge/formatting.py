@@ -9,7 +9,7 @@ import mimetypes
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from urllib.parse import parse_qsl, unquote, urlparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse
 
 SPACE_RE = re.compile(r"[ \t]*")
 FACE_RE = re.compile(r'<faceType=(\d+),faceId="([^"]*)"?,ext="([^"]*)"\s*/?>')
@@ -166,11 +166,12 @@ def is_trusted_qq_media_url(url: str) -> bool:
     """Return True only for HTTPS URLs hosted on Tencent QQ's media domains."""
     try:
         parsed = urlparse(url)
+        port = parsed.port
     except ValueError:
         return False
     if parsed.scheme != "https" or parsed.username or parsed.password:
         return False
-    if parsed.port not in (None, 443):
+    if port not in (None, 443):
         return False
     host = (parsed.hostname or "").lower().rstrip(".")
     if not host:
@@ -192,7 +193,7 @@ def normalize_media_url_key(url: str) -> str:
         for k, v in parse_qsl(parsed.query, keep_blank_values=True)
         if k.lower() not in _VOLATILE_URL_PARAMS
     )
-    query = "&".join(f"{k}={v}" for k, v in stable_params)
+    query = urlencode(stable_params)
     return f"{parsed.scheme.lower()}://{(parsed.hostname or '').lower()}{parsed.path}?{query}"
 
 
@@ -209,16 +210,24 @@ def _guess_forwarded_mime(kind: str, filename: str) -> str:
 
 def _parse_forwarded_attachment(body: str) -> ForwardedAttachment | None:
     url_match = _FORWARD_ATT_URL_RE.search(body)
-    if not url_match:
-        return None
-    url = url_match.group(1).strip()
     kind_match = _FORWARD_ATT_KIND_RE.search(body)
-    kind = kind_match.group(1).strip() if kind_match else "文件"
     name_match = _FORWARD_ATT_NAME_RE.search(body)
+    if not url_match and not kind_match and not name_match:
+        return None
+    url = url_match.group(1).strip() if url_match else ""
+    kind = kind_match.group(1).strip() if kind_match else "文件"
     filename = name_match.group(1).strip() if name_match else "file"
     dim_match = _FORWARD_ATT_DIM_RE.search(body)
-    width = int(dim_match.group(1)) if dim_match else None
-    height = int(dim_match.group(2)) if dim_match else None
+    width: int | None = None
+    height: int | None = None
+    if dim_match:
+        try:
+            w = int(dim_match.group(1))
+            h = int(dim_match.group(2))
+            if 0 < w <= 100_000 and 0 < h <= 100_000:
+                width, height = w, h
+        except ValueError:
+            pass
     return ForwardedAttachment(
         kind=kind,
         filename=filename,
@@ -496,17 +505,25 @@ def render_qq_text(
     if forwarded is not None:
         header, entries = forwarded
         groups: list[tuple[str, list[tuple[str, str]]]] = []
+        download_seen: set[str] = set()
+        download_count = 0
         for sender, raw_item, atts in entries:
             item_plain, item_html = _render_qq_inline(
                 raw_item, names, bots, domain, face_images, sticker_image=sticker_image
             )
-            untrusted_labels = [
-                f"[{att.kind}: {att.filename}]"
-                for att in atts
-                if not is_trusted_qq_media_url(att.url)
-            ]
-            if untrusted_labels:
-                suffix = " ".join(untrusted_labels)
+            inline_labels: list[str] = []
+            for att in atts:
+                if att.url and is_trusted_qq_media_url(att.url):
+                    key = normalize_media_url_key(att.url)
+                    if key in download_seen:
+                        continue
+                    if download_count < MAX_FORWARDED_ATTACHMENTS:
+                        download_seen.add(key)
+                        download_count += 1
+                        continue
+                inline_labels.append(f"[{att.kind}: {att.filename}]")
+            if inline_labels:
+                suffix = " ".join(inline_labels)
                 item_plain = f"{item_plain}\n{suffix}" if item_plain else suffix
                 item_html = (
                     f"{item_html}<br/>{_escape(suffix)}"

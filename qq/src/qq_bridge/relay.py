@@ -12,6 +12,7 @@ import re
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urljoin
 
 from . import twitter
 from .config import Config
@@ -30,7 +31,7 @@ from .formatting import (
     strip_leading_mentions,
     strip_reply_fallback,
 )
-from .matrix import MatrixClient, MatrixError, MediaTooLarge
+from .matrix import MatrixClient, MatrixError, MediaTooLarge, _read_capped
 from .qq import QQClient, QQError
 from .ratelimit import RateLimiter
 from .sources import source_tag
@@ -1682,15 +1683,16 @@ class Relay:
             content, data.get("mentions")
         )
         if forwarded_attachments:
-            existing_urls = {
-                normalize_media_url_key(str(item.get("url") or ""))
-                for item in attachments
-                if item.get("url")
-            }
+            existing_by_url: dict[str, dict] = {}
+            for item in attachments:
+                if item.get("url"):
+                    existing_by_url[normalize_media_url_key(str(item["url"]))] = item
             for item in forwarded_attachments:
                 key = normalize_media_url_key(str(item.get("url") or ""))
-                if key not in existing_urls:
-                    existing_urls.add(key)
+                if key in existing_by_url:
+                    existing_by_url[key]["trusted_qq_media"] = True
+                else:
+                    existing_by_url[key] = item
                     attachments.append(item)
 
         face_images = await self._resolve_faces(content)
@@ -1728,11 +1730,22 @@ class Relay:
                     break
 
         image_delivered = 0
+        failed_forwarded: list[str] = []
+        forwarded_deadline = time.monotonic() + 60.0
         for attachment in attachments:
-            att_reply = None if (attachment.get("trusted_qq_media") and text_sent) else reply_to
+            is_forwarded_att = bool(attachment.get("trusted_qq_media"))
+            att_reply = None if (is_forwarded_att and text_sent) else reply_to
+            timeout_s: float | None = None
+            if is_forwarded_att:
+                remaining = forwarded_deadline - time.monotonic()
+                if remaining <= 0:
+                    failed_forwarded.append(str(attachment.get("filename") or "file"))
+                    log.warning("forwarded attachment budget exhausted; skipping %s", attachment.get("filename"))
+                    continue
+                timeout_s = min(20.0, remaining)
             try:
                 event_id = await self._send_attachment(
-                    room_id, ghost, attachment, reply_to=att_reply
+                    room_id, ghost, attachment, reply_to=att_reply, timeout=timeout_s
                 )
                 if event_id:
                     if str(attachment.get("content_type") or "").startswith("image/"):
@@ -1741,6 +1754,19 @@ class Relay:
                         sent.append(event_id)
             except Exception as exc:
                 log.warning("cannot relay attachment: %s", exc)
+                if is_forwarded_att:
+                    failed_forwarded.append(str(attachment.get("filename") or "file"))
+
+        if failed_forwarded:
+            failed_note = " ".join(f"[附件下载失败: {name}]" for name in failed_forwarded)
+            try:
+                event_id = await self.matrix.send_message(
+                    room_id, ghost, {"msgtype": "m.text", "body": failed_note}
+                )
+                if not sent:
+                    sent.append(event_id)
+            except Exception as exc:
+                log.warning("cannot send forwarded attachment failure notice: %s", exc)
 
         if sticker_fallback and image_delivered < image_attachments:
             fallback = sticker_fallback if text_sent else fallback_body
@@ -2011,6 +2037,7 @@ class Relay:
         attachment: dict,
         *,
         reply_to: str | None = None,
+        timeout: float | None = None,
     ) -> str | None:
         url = attachment.get("url") or attachment.get("voice_wav_url")
         if not url:
@@ -2027,20 +2054,31 @@ class Relay:
         for _hop in range(3):
             if trusted_only and not is_trusted_qq_media_url(current_url):
                 raise RuntimeError("refusing untrusted forwarded attachment URL")
-            get_kwargs = {"allow_redirects": False} if trusted_only else {}
+            get_kwargs: dict = {}
+            if trusted_only:
+                get_kwargs["allow_redirects"] = False
+            if timeout is not None:
+                get_kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
             async with self.matrix.session.get(current_url, **get_kwargs) as response:
                 if trusted_only and response.status in (301, 302, 303, 307, 308):
                     location = response.headers.get("location") or ""
-                    if not location or not is_trusted_qq_media_url(location):
+                    resolved = urljoin(current_url, location) if location else ""
+                    if not resolved or not is_trusted_qq_media_url(resolved):
                         raise RuntimeError("refusing redirect to untrusted attachment URL")
-                    current_url = location
+                    current_url = resolved
                     continue
                 if response.status >= 400:
                     raise RuntimeError(f"attachment download failed: HTTP {response.status}")
                 resp_content_type = (
                     (response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
                 )
-                data = await response.read()
+                try:
+                    if hasattr(response, "content"):
+                        data = await _read_capped(response, MAX_MEDIA_DOWNLOAD)
+                    else:
+                        data = await response.read()
+                except MediaTooLarge as exc:
+                    raise RuntimeError("attachment is too large") from exc
                 break
         else:
             raise RuntimeError("too many redirects while downloading attachment")
@@ -2048,6 +2086,13 @@ class Relay:
             raise RuntimeError("attachment download returned empty body")
         if len(data) > MAX_MEDIA_DOWNLOAD:
             raise RuntimeError("attachment is too large")
+        if (
+            trusted_only
+            and content_type.startswith(("image/", "video/", "audio/"))
+            and resp_content_type
+            and resp_content_type.startswith(("text/", "application/json", "application/xml"))
+        ):
+            raise RuntimeError(f"unexpected response content-type {resp_content_type} for {content_type}")
         if resp_content_type and (
             resp_content_type.startswith(("image/", "video/", "audio/"))
             or content_type == "application/octet-stream"

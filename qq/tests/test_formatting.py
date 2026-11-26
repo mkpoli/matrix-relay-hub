@@ -497,3 +497,26 @@ def test_qq_forwarded_chat_record_deduplicates_volatile_rkey_attachments_and_str
     ubody, _ = render_qq_text(untrusted_raw, [], "example.org")
     assert "127.0.0.1" not in ubody
     assert "[图片: x.jpg]" in ubody
+
+    # Mixed valid + URL-less trailing attachment does not leak rkey, malformed port does not crash,
+    # query params do not collide, and attachments beyond cap 16 keep filename labels.
+    from qq_bridge.formatting import normalize_media_url_key
+
+    assert not is_trusted_qq_media_url("https://qpic.cn:badport/a.jpg")
+    assert normalize_media_url_key("https://qpic.cn/f?id=one%26page%3Dtwo") != normalize_media_url_key(
+        "https://qpic.cn/f?id=one&page=two"
+    )
+    mixed = (
+        "[群聊的聊天记录]\n=== 消息 1 ===\n[消息内容] hi\n[发送者] Alice\n"
+        "[附件1] 类型:图片 文件名:one.jpg URL:https://qpic.cn/one?rkey=secret\n"
+        "[附件2] 类型:文件 文件名:missing.txt\n"
+    )
+    assert len(extract_forwarded_attachments(mixed)) == 1
+    mbody, _ = render_qq_text(mixed, [], "example.org")
+    assert "rkey=secret" not in mbody and "[文件: missing.txt]" in mbody
+
+    many = "[群聊的聊天记录]\n=== 消息 1 ===\n[消息内容] hi\n[发送者] Alice\n" + "".join(
+        f"[附件{i}] 类型:图片 文件名:{i}.jpg URL:https://qpic.cn/{i}\n" for i in range(1, 18)
+    )
+    assert len(extract_forwarded_attachments(many)) == 16
+    assert "[图片: 17.jpg]" in render_qq_text(many, [], "example.org")[0]

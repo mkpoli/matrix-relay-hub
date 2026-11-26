@@ -89,6 +89,13 @@ CREATE TABLE IF NOT EXISTS media_progress (
     done INTEGER NOT NULL DEFAULT 0,
     ts INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS member_avatars (
+    member_openid TEXT PRIMARY KEY,
+    avatar_key TEXT NOT NULL,
+    mxc TEXT NOT NULL,
+    updated INTEGER NOT NULL
+);
 """
 
 
@@ -131,6 +138,26 @@ class Store:
             (group_openid, member_openid),
         ).fetchone()
         return row["username"] if row else None
+
+    def member_avatar(self, member_openid: str) -> tuple[str, str, int] | None:
+        row = self.conn.execute(
+            "SELECT avatar_key, mxc, updated FROM member_avatars WHERE member_openid = ?",
+            (member_openid,),
+        ).fetchone()
+        return (row["avatar_key"], row["mxc"], int(row["updated"])) if row else None
+
+    def set_member_avatar(self, member_openid: str, avatar_key: str, mxc: str) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO member_avatars(member_openid, avatar_key, mxc, updated)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(member_openid) DO UPDATE SET
+                avatar_key = excluded.avatar_key,
+                mxc = excluded.mxc,
+                updated = excluded.updated
+            """,
+            (member_openid, avatar_key, mxc, int(time.time())),
+        )
 
     # -- messages ---------------------------------------------------------
 

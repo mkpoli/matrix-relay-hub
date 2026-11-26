@@ -3849,4 +3849,60 @@ def test_qq_voice_prefers_wav_url_and_attaches_asr_transcript_caption(tmp_path):
     assert payload["filename"] == "note.wav"
     assert payload["info"]["mimetype"] == "audio/wav"
     assert "org.matrix.msc3245.voice" in payload
+
+    # Scheme-relative voice_wav_url, audio/silk MIME, extensionless name, and 404 fallback to raw SILK.
+    class FallbackVoiceSession:
+        def __init__(self):
+            self.urls: list[str] = []
+
+        def get(self, url, **kwargs):
+            self.urls.append(url)
+            if url.endswith("fail.wav"):
+                resp = FakeResp(b"", "text/plain")
+                resp.status = 404
+                return resp
+            return FakeResp(b"audio-bytes", "application/octet-stream")
+
+    fb_session = FallbackVoiceSession()
+    relay.matrix.session = fb_session
+    relay.matrix.sent.clear()
+    uploaded.clear()
+
+    asyncio.run(
+        relay.on_qq_event(
+            "GROUP_MESSAGE_CREATE",
+            {
+                "id": "VOICE-2",
+                "group_openid": "G",
+                "author": {"member_openid": "U1", "username": "Alice"},
+                "content": "",
+                "attachments": [
+                    {
+                        "content_type": "audio/silk",
+                        "filename": "clip",
+                        "url": "https://multimedia.nt.qq.com.cn/orig.silk",
+                        "voice_wav_url": "//multimedia.nt.qq.com.cn/ok.wav",
+                        "asr_refer_text": "第二条",
+                    },
+                    {
+                        "content_type": "voice",
+                        "filename": "n.silk",
+                        "url": "https://multimedia.nt.qq.com.cn/fallback.silk",
+                        "voice_wav_url": "https://multimedia.nt.qq.com.cn/fail.wav",
+                        "asr_refer_text": "回退成功",
+                    },
+                ],
+            },
+        )
+    )
+    assert fb_session.urls == [
+        "https://multimedia.nt.qq.com.cn/ok.wav",
+        "https://multimedia.nt.qq.com.cn/fail.wav",
+        "https://multimedia.nt.qq.com.cn/fallback.silk",
+    ]
+    assert uploaded == [("audio/wav", "clip.wav"), ("audio/silk", "n.silk")]
+    assert relay.matrix.sent[0][2]["body"] == "第二条"
+    assert relay.matrix.sent[0][2]["filename"] == "clip.wav"
+    assert relay.matrix.sent[1][2]["body"] == "回退成功"
+    assert relay.matrix.sent[1][2]["filename"] == "n.silk"
     store.close()

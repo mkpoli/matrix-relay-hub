@@ -1698,21 +1698,32 @@ def test_bridge_bot_reactions_are_ignored_while_puppet_reactions_pass(tmp_path):
     qq = FakeQQ()
     relay, store = make_relay(tmp_path, qq)
     store.add_message("Q9", "G", ROOM, "$orig", "REF9", "matrix")
-    for idx, bot in enumerate(
-        (
-            "@heisenbridge:example.org",
-            "@appservice-irc:example.org",
-            "@discordbot:example.org",
-            "@telegrambot:example.org",
-            "@wecombot:example.org",
-        )
-    ):
-        asyncio.run(
-            relay.handle_matrix_event(
-                reaction_event(target="$orig", key="🔗", sender=bot, event_id=f"$bot{idx}")
+    bot_events = [
+        reaction_event(target="$orig", key="🔗", sender=bot, event_id=f"$bot{idx}")
+        for idx, bot in enumerate(
+            (
+                "@heisenbridge:example.org",
+                "@appservice-irc:example.org",
+                "@discordbot:example.org",
+                "@telegrambot:example.org",
+                "@wecombot:example.org",
             )
         )
-    assert relay._queue.empty()
+    ]
+    seqs = store.accept_transaction("t-bots", bot_events)
+    for seq, ev in zip(seqs, bot_events, strict=True):
+        relay.incoming.put_nowait((seq, ev))
+    asyncio.run(_run_loops(relay, lambda: not _pending(store)))
+    assert qq.sent == []
+
+    # Non-notice messages from a bridge bot still relay (filter is reaction-only).
+    asyncio.run(
+        relay.handle_matrix_event(
+            text_event("bridge hello", sender="@heisenbridge:example.org", event_id="$botmsg")
+        )
+    )
+    msg_job = relay._queue.get_nowait()
+    assert msg_job["text"] == "[I] Alice: bridge hello"
 
     asyncio.run(
         relay.handle_matrix_event(

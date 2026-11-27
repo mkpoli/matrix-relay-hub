@@ -8,7 +8,7 @@ from wecom_bridge.formatting import (
     strip_bot_mention,
     strip_reply_fallback,
 )
-from wecom_bridge.sources import source_tag
+from wecom_bridge.sources import is_network_bot, source_tag
 
 
 def test_chunk_utf8_respects_byte_limit_for_cjk():
@@ -68,8 +68,17 @@ def test_format_reaction_key_and_source_tags():
     )
     assert source_tag("@wecom_alice:example.org") == "W"
     assert source_tag("@wecombot:example.org") == "W"
+    assert source_tag("@appservice-irc:example.org") == "I"
     assert source_tag("@qq_123:example.org") == "Q"
     assert source_tag("@alice:example.org") == "M"
+    assert is_network_bot("@heisenbridge:example.org") is True
+    assert is_network_bot("@appservice-irc:example.org") is True
+    assert is_network_bot("@discordbot:example.org") is True
+    assert is_network_bot("@telegrambot:example.org") is True
+    assert is_network_bot("@qqbot:example.org") is True
+    assert is_network_bot("@wecombot:example.org") is True
+    assert is_network_bot("@discord_42:example.org") is False
+    assert is_network_bot("@alice:example.org") is False
 
 
 def test_sanitize_wecom_markdown_neutralizes_mentions_and_font_tags():

@@ -300,6 +300,16 @@ def test_bidirectional_aibot_relay(tmp_path: Path):
                 "type": "m.reaction",
                 "content": {"m.relates_to": {"rel_type": "m.annotation", "event_id": "$e1", "key": "🎉"}},
             }))
+            # Bridge bot status reactions (e.g. Heisenbridge 🔗) must be ignored and settle cleanly.
+            bot_react = {
+                "event_id": "$bot_react",
+                "room_id": "!dev:example.org",
+                "sender": "@heisenbridge:example.org",
+                "type": "m.reaction",
+                "content": {"m.relates_to": {"rel_type": "m.annotation", "event_id": "$e1", "key": "🔗"}},
+            }
+            bot_seqs = store.accept_transaction("t-bot-react", [bot_react])
+            relay.incoming.put_nowait((bot_seqs[0], bot_react))
             # Echo from our own WeCom ghost must be ignored.
             relay.incoming.put_nowait((None, {
                 "event_id": "$loop",
@@ -313,6 +323,7 @@ def test_bidirectional_aibot_relay(tmp_path: Path):
                 ("chat-1", "[M] [dev] Bob ✎: fixed text"),
                 ("chat-1", "[M] [dev] Bob reacted with 🎉"),
             ]
+            assert store.claim_pending(max_age=3600, max_attempts=5) == []
 
             # 4. Transient WeCom failure retains event in pending queue for retry.
             wecom.fail_next_send = True

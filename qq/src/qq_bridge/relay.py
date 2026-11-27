@@ -35,7 +35,7 @@ from .formatting import (
 from .matrix import MatrixClient, MatrixError, MediaTooLarge, _read_capped
 from .qq import QQClient, QQError
 from .ratelimit import RateLimiter
-from .sources import source_tag
+from .sources import is_network_bot, source_tag
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -755,6 +755,9 @@ class Relay:
         self, event: dict, room_id: str, sender: str, label: str
     ) -> None:
         if not self.cfg.relay_reactions:
+            return
+        if is_network_bot(sender):
+            log.debug("ignoring reaction from bridge bot %s", sender)
             return
         event_id = event.get("event_id", "")
         if event_id and self.store.relayed_qq(event_id):

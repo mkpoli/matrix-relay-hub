@@ -1694,6 +1694,42 @@ def test_duplicate_reaction_is_not_sent_again(tmp_path):
     store.close()
 
 
+def test_bridge_bot_reactions_are_ignored_while_puppet_reactions_pass(tmp_path):
+    qq = FakeQQ()
+    relay, store = make_relay(tmp_path, qq)
+    store.add_message("Q9", "G", ROOM, "$orig", "REF9", "matrix")
+    for idx, bot in enumerate(
+        (
+            "@heisenbridge:example.org",
+            "@appservice-irc:example.org",
+            "@discordbot:example.org",
+            "@telegrambot:example.org",
+            "@wecombot:example.org",
+        )
+    ):
+        asyncio.run(
+            relay.handle_matrix_event(
+                reaction_event(target="$orig", key="🔗", sender=bot, event_id=f"$bot{idx}")
+            )
+        )
+    assert relay._queue.empty()
+
+    asyncio.run(
+        relay.handle_matrix_event(
+            reaction_event(
+                target="$orig",
+                key="👍",
+                sender="@discord_42:example.org",
+                event_id="$human1",
+            )
+        )
+    )
+    job = relay._queue.get_nowait()
+    assert job["text"] == "[D] Alice reacted with 👍"
+    assert job["reference"] == "REF9"
+    store.close()
+
+
 def test_config_loads_relay_reactions(tmp_path):
     from qq_bridge.config import load
 

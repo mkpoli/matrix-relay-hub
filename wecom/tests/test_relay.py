@@ -300,6 +300,14 @@ def test_bidirectional_aibot_relay(tmp_path: Path):
                 "type": "m.reaction",
                 "content": {"m.relates_to": {"rel_type": "m.annotation", "event_id": "$e1", "key": "🎉"}},
             }))
+            # Bridge bot status reactions (e.g. Heisenbridge 🔗) must be ignored.
+            relay.incoming.put_nowait((None, {
+                "event_id": "$bot_react",
+                "room_id": "!dev:example.org",
+                "sender": "@heisenbridge:example.org",
+                "type": "m.reaction",
+                "content": {"m.relates_to": {"rel_type": "m.annotation", "event_id": "$e1", "key": "🔗"}},
+            }))
             # Echo from our own WeCom ghost must be ignored.
             relay.incoming.put_nowait((None, {
                 "event_id": "$loop",
